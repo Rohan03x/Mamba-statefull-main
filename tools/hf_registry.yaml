@@ -1,0 +1,178 @@
+# HF Generator Registry
+# ======================
+#
+# Maps HF module names to their generator implementations and default parameters.
+# Each generator must implement the build() function contract.
+#
+# Generator Contract:
+#   def build(
+#       symbol: str,
+#       horizon: int,
+#       start: str,
+#       end: str,
+#       out_path: str,
+#       raw_source_cfg: dict,
+#       compute_cfg: dict,
+#   ) -> None
+
+version: "1.0"
+
+generators:
+  
+  # Earnings Call Transcript Analysis
+  earnings_transcript_hf:
+    generator: "tools.hf_generators.earnings_transcript_hf"
+    description: "Earnings call transcript analysis using transformer models"
+    default_raw_source_cfg:
+      transcript_dir: "data/transcripts"
+      transcript_format: "parquet"
+      date_col: "date"
+      text_col: "text"
+    default_compute_cfg:
+      model: "yiyanghkust/finbert-tone"
+      batch_size: 4
+      max_length: 512
+      # Two-component, event-aware decay (recommended defaults).
+      # Fast assimilation: half-life ~4 sessions over ~10 sessions.
+      fast_half_life_sessions: 4
+      fast_duration_sessions: 10
+      # Slow narrative persistence: half-life ~35 sessions, hard reset at next earnings event.
+      slow_half_life_sessions: 35
+      fast_weight: 0.65
+      slow_weight: 0.35
+      # Confidence-weighted half-life scaling based on event strength (abs(z)*conf).
+      decay_scale_min: 0.5
+      decay_scale_max: 1.5
+      strength_z_divisor: 2.0
+      # Directional asymmetry (slow tail): bearish persists longer than bullish.
+      neg_slow_half_life_mult: 1.3
+      pos_slow_half_life_mult: 0.85
+      # Conservative alignment: start influence on the next trading session.
+      shift_to_next_session: true
+
+  # News Sentiment (HF)
+  news_sentiment_hf:
+    generator: "tools.hf_generators.news_sentiment_hf"
+    description: "News sentiment signal using HF models (FinBERT or similar)"
+    default_raw_source_cfg:
+      news_dir: "data/news"
+      news_format: "parquet"
+      date_col: "date"
+      text_col: "text"
+    default_compute_cfg:
+      model: "ProsusAI/finbert"
+      batch_size: 16
+      max_length: 512
+    
+  # Document Embedding Novelty Detection
+  doc_embedding_novelty_hf:
+    generator: "tools.hf_generators.doc_embedding_novelty_hf"
+    description: "Document embedding novelty detection using sentence transformers"
+    default_raw_source_cfg:
+      doc_dir: "data/documents"
+      doc_format: "parquet"
+      date_col: "date"
+      text_col: "text"
+    default_compute_cfg:
+      model: "sentence-transformers/all-MiniLM-L6-v2"
+      batch_size: 32
+      lookback_days: 30
+      similarity_threshold: 0.7
+    
+  # Macroeconomic Text Signals Transformer
+  macro_tst_hf:
+    generator: "tools.hf_generators.macro_tst_hf"
+    description: "Macroeconomic text signals using transformer models"
+    default_raw_source_cfg:
+      macro_text_dir: "data/macro_text"
+      macro_format: "parquet"
+      date_col: "date"
+      text_col: "text"
+      category_col: "category"
+    default_compute_cfg:
+      model: "bert-base-uncased"
+      batch_size: 16
+      max_length: 512
+      aggregation: "mean"
+      categories: null  # null = all categories
+      use_gpu: true  # Enable GPU acceleration for transformer models
+
+  # HF Blocks (composite generators built from cached base families)
+  tech_micro_hf:
+    generator: "tools.hf_generators.tech_micro_hf"
+    description: "Technical + microstructure HF block leveraging cached ml/micro/correlation families"
+    default_raw_source_cfg:
+      cache_dir: null  # fallback to prep_families cache root
+    default_compute_cfg:
+      view: "both"
+      materialize_block_cache: true
+
+  forecast_hf:
+    generator: "tools.hf_generators.forecast_hf"
+    description: "Forecast ensemble HF block combining quantile/calibration/ARIMA/TFT caches"
+    default_raw_source_cfg:
+      cache_dir: null
+    default_compute_cfg:
+      view: "both"
+      materialize_block_cache: true
+
+  vol_deriv_hf:
+    generator: "tools.hf_generators.vol_deriv_hf"
+    description: "Volatility + derivatives HF block using garch/cboe/options caches"
+    default_raw_source_cfg:
+      cache_dir: null
+    default_compute_cfg:
+      view: "both"
+      materialize_block_cache: true
+
+  macro_regime_hf:
+    generator: "tools.hf_generators.macro_regime_hf"
+    description: "Macro regime HF block combining macro_tst/regime/multiasset/cross_asset caches"
+    default_raw_source_cfg:
+      cache_dir: null
+    default_compute_cfg:
+      view: "both"
+      materialize_block_cache: true
+
+  fundamental_val_hf:
+    generator: "tools.hf_generators.fundamental_val_hf"
+    description: "Fundamental valuation HF block aggregating fin_g/earnings/dividends caches"
+    default_raw_source_cfg:
+      cache_dir: null
+    default_compute_cfg:
+      view: "both"
+      materialize_block_cache: true
+
+  news_nlp_hf:
+    generator: "tools.hf_generators.news_nlp_hf"
+    description: "News/NLP HF block using finbert, transcript, news_sentiment_HF caches"
+    default_raw_source_cfg:
+      cache_dir: null
+    default_compute_cfg:
+      view: "both"
+      materialize_block_cache: true
+
+# Configuration Notes:
+# --------------------
+# 
+# raw_source_cfg:
+#   - Specifies where to read raw input data (news, transcripts, documents, etc.)
+#   - Must include date filtering to ensure leak-safety
+#   - Paths are relative to project root
+#
+# compute_cfg:
+#   - Specifies model parameters and computation settings
+#   - Models should be HuggingFace model names or local paths
+#   - batch_size: Controls memory usage vs speed tradeoff
+#   - max_length: Max tokens for truncation (model-specific limits)
+#
+# Leak-Safety:
+#   - All generators MUST respect [start, end) date bounds
+#   - No future peeking allowed
+#   - Lookback windows must not include data after split boundary
+#
+# Output Format:
+#   - All generators must write parquet with columns: date, score, conf
+#   - date: pd.Timestamp (sorted, no gaps preferred)
+#   - score: float (signal value, typically normalized)
+#   - conf: float in [0, 1] (confidence/quality measure)

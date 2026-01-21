@@ -1,0 +1,306 @@
+{
+  "name": "Mamba Stateful Training Pipeline",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "daily-schedule",
+      "name": "Daily 2AM Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [250, 500]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Pipeline Configuration\n// Commands run via: docker exec mamba_python_worker python ...\n\nconst config = {\n  // Symbols to process\n  symbols: ($env.DEFAULT_SYMBOLS || 'AAPL,MSFT,NVDA').split(',').map(s => s.trim()),\n  \n  // Horizon (trading days)\n  horizon: parseInt($env.DEFAULT_HORIZON || '63'),\n  \n  // Walk-forward window settings\n  wf_start: $env.WF_START || '2010-07-02',\n  wf_end: $env.WF_END || '2025-07-01',\n  wf_train_years: parseInt($env.WF_TRAIN_YEARS || '5'),\n  wf_step_days: parseInt($env.WF_STEP_DAYS || '126'),\n  \n  // Optuna settings\n  optuna_trials: parseInt($env.OPTUNA_TRIALS || '100'),\n  \n  // Docker exec prefix (runs in python-worker container)\n  docker_exec: 'docker exec mamba_python_worker',\n  \n  // Paths (inside python-worker container)\n  workspace: '/mamba_workspace',\n  python: 'python',\n  \n  // Output paths\n  cache_features: '/mamba_workspace/cache/features',\n  artifacts_stage_a: '/mamba_workspace/artifacts/stage_a',\n  artifacts_optuna: '/mamba_workspace/artifacts/optuna_studies',\n  artifacts_backtests: '/mamba_workspace/artifacts/backtests',\n  \n  // Run ID\n  run_id: new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)\n};\n\nreturn [{ json: config }];"
+      },
+      "id": "pipeline-config",
+      "name": "Pipeline Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 400]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "symbols",
+        "options": {}
+      },
+      "id": "split-symbols",
+      "name": "Split Symbols",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [700, 400]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// STEP 1: dagster_prep_families - Generate feature caches via Dagster\n// Output: cache/features/<SYMBOL>_h<H>_merged.parquet\n\nconst config = $('Pipeline Config').first().json;\nconst symbol = $input.item.json.symbols || $input.item.json;\n\n// Build dagster job execute command for prep_families_job\n// Uses partition key format: symbol=<SYM>|horizon=<H>\nconst partitionKey = `symbol=${symbol}|horizon=${config.horizon}`;\n\nconst dagsterCmd = [\n  `cd ${config.workspace} &&`,\n  `DAGSTER_PREP_WF_START=${config.wf_start}`,\n  `DAGSTER_PREP_WF_END=${config.wf_end}`,\n  `DAGSTER_PREP_WF_TRAIN_YEARS=${config.wf_train_years}`,\n  `DAGSTER_PREP_WF_STEP_DAYS=${config.wf_step_days}`,\n  `DAGSTER_PREP_WRITE_MERGED=yes`,\n  `DAGSTER_PREP_MODE=stage-b`,\n  `${config.python} -m dagster job execute`,\n  `-m dagster_prep_families.definitions`,\n  `-j prep_families_job`,\n  `--partition \"${partitionKey}\"`\n].join(' ');\n\nconst cmd = `${config.docker_exec} bash -c \"${dagsterCmd}\"`;\n\nreturn {\n  json: {\n    symbol: symbol,\n    horizon: config.horizon,\n    step: 'dagster_prep_families',\n    command: cmd,\n    output_path: `${config.cache_features}/${symbol}_h${config.horizon}_merged.parquet`,\n    config: config\n  }\n};"
+      },
+      "id": "build-prep-cmd",
+      "name": "Build Dagster Prep Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.command }}",
+        "options": {
+          "timeout": 14400000
+        }
+      },
+      "id": "run-prep-families",
+      "name": "1. Dagster Prep Families",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1100, 400],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Validate dagster prep_families output\n\nconst input = $input.item.json;\nconst exitCode = $input.item.json.exitCode || 0;\nconst stdout = $input.item.json.stdout || '';\nconst stderr = $input.item.json.stderr || '';\n\nlet success = (exitCode === 0);\nlet errorMessage = '';\n\nif (!success) {\n  errorMessage = stderr.substring(0, 500) || 'dagster prep_families_job failed with non-zero exit';\n}\n\nreturn {\n  json: {\n    ...input,\n    prep_families_success: success,\n    prep_families_error: errorMessage,\n    step: 'validate_prep'\n  }\n};"
+      },
+      "id": "validate-prep-output",
+      "name": "Validate Prep Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.prep_families_success }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "prep-success-gate",
+      "name": "Prep Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1500, 400]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// STEP 2: stage_a_selector.py - Produce best family weights\n// Input: Reads from cache/features/<SYMBOL>_h<H>_merged.parquet\n// Output: artifacts/stage_a/<SYMBOL>_h<H>/family_weights_best.json\n\nconst input = $input.item.json;\nconst config = input.config;\nconst symbol = input.symbol;\n\nconst outdir = `${config.artifacts_stage_a}/${symbol}_h${config.horizon}`;\n\nconst pythonCmd = [\n  `cd ${config.workspace} &&`,\n  `${config.python} tools/stage_a_selector.py`,\n  `--symbol ${symbol}`,\n  `--horizon ${config.horizon}`,\n  `--start ${config.wf_start}`,\n  `--end ${config.wf_end}`,\n  `--wf-start ${config.wf_start}`,\n  `--wf-end ${config.wf_end}`,\n  `--wf-train-years ${config.wf_train_years}`,\n  `--outdir ${outdir}`,\n  `--universe-mode global`,\n  `--selector-method legacy_optuna`,\n  `--proxy-time-adaptive`\n].join(' ');\n\nconst cmd = `${config.docker_exec} bash -c \"${pythonCmd}\"`;\n\nreturn {\n  json: {\n    ...input,\n    step: 'stage_a_selector',\n    command: cmd,\n    stage_a_outdir: outdir,\n    weights_path: `${outdir}/family_weights_best.json`\n  }\n};"
+      },
+      "id": "build-stage-a-cmd",
+      "name": "Build Stage-A Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 300]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.command }}",
+        "options": {
+          "timeout": 7200000
+        }
+      },
+      "id": "run-stage-a",
+      "name": "2. Stage-A Selector",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1900, 300],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Validate Stage-A output\n\nconst input = $input.item.json;\nconst exitCode = $input.item.json.exitCode || 0;\nconst stderr = $input.item.json.stderr || '';\n\nlet success = (exitCode === 0);\nlet errorMessage = '';\n\nif (!success) {\n  errorMessage = stderr.substring(0, 500) || 'stage_a_selector failed';\n}\n\nreturn {\n  json: {\n    ...input,\n    stage_a_success: success,\n    stage_a_error: errorMessage,\n    step: 'validate_stage_a'\n  }\n};"
+      },
+      "id": "validate-stage-a-output",
+      "name": "Validate Stage-A Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2100, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.stage_a_success }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "stage-a-success-gate",
+      "name": "Stage-A Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2300, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// STEP 3: run_stage_b_stateful_phase2.py - Train Mamba model\n// Input: cache/features/<SYMBOL>_h<H>_merged.parquet + family_weights_best.json\n// Output: artifacts/optuna_studies/<study_name>.db\n\nconst input = $input.item.json;\nconst config = input.config;\nconst symbol = input.symbol;\n\nconst studyName = `phase2_v16_full_h${config.horizon}_${symbol}`;\nconst studyDb = `${config.artifacts_optuna}/${studyName}__label_base.db`;\n\nconst pythonCmd = [\n  `cd ${config.workspace} &&`,\n  `${config.python} tools/run_stage_b_stateful_phase2.py`,\n  `--symbol ${symbol}`,\n  `--horizon ${config.horizon}`,\n  `--search-mode full`,\n  `--n-trials ${config.optuna_trials}`,\n  `--study-name ${studyName}`,\n  `--study-db ${studyDb}`,\n  `--phase2-family-weights-path ${input.weights_path}`,\n  `--universe-mode full`,\n  `--preset research`,\n  `--train-start ${config.wf_start}`,\n  `--train-end ${config.wf_end}`\n].join(' ');\n\nconst cmd = `${config.docker_exec} bash -c \"${pythonCmd}\"`;\n\nreturn {\n  json: {\n    ...input,\n    step: 'stage_b_phase2',\n    command: cmd,\n    study_name: studyName,\n    study_db: studyDb\n  }\n};"
+      },
+      "id": "build-stage-b-cmd",
+      "name": "Build Stage-B Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2500, 200]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.command }}",
+        "options": {
+          "timeout": 86400000
+        }
+      },
+      "id": "run-stage-b",
+      "name": "3. Stage-B Phase2 Train",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [2700, 200],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse Stage-B results\n\nconst input = $input.item.json;\nconst exitCode = $input.item.json.exitCode || 0;\nconst stdout = $input.item.json.stdout || '';\nconst stderr = $input.item.json.stderr || '';\n\nlet success = (exitCode === 0);\nlet bestSharpe = null;\nlet bestTrial = null;\nlet errorMessage = '';\n\n// Parse Optuna output\nconst sharpeMatch = stdout.match(/Best value[:\\s]*([\\d.-]+)/i);\nconst trialMatch = stdout.match(/Best trial[:\\s]*(\\d+)/i);\n\nif (sharpeMatch) bestSharpe = parseFloat(sharpeMatch[1]);\nif (trialMatch) bestTrial = parseInt(trialMatch[1]);\n\nif (!success) {\n  errorMessage = stderr.substring(0, 500) || 'Stage-B training failed';\n}\n\nreturn {\n  json: {\n    symbol: input.symbol,\n    horizon: input.horizon,\n    study_name: input.study_name,\n    study_db: input.study_db,\n    merged_parquet: input.output_path,\n    weights_path: input.weights_path,\n    stage_b_success: success,\n    stage_b_error: errorMessage,\n    best_sharpe: bestSharpe,\n    best_trial: bestTrial,\n    run_id: input.config.run_id,\n    step: 'complete'\n  }\n};"
+      },
+      "id": "parse-stage-b-results",
+      "name": "Parse Training Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2900, 200]
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "id": "aggregate-results",
+      "name": "Aggregate All Results",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [3100, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Generate final summary report\n\nconst results = $input.all().map(item => item.json);\n\nconst summary = {\n  run_id: results[0]?.run_id || 'unknown',\n  completed_at: new Date().toISOString(),\n  total_symbols: results.length,\n  successful: results.filter(r => r.stage_b_success !== false).length,\n  failed: results.filter(r => r.stage_b_success === false || r.stage_a_success === false || r.prep_families_success === false).length,\n  results: results.map(r => ({\n    symbol: r.symbol,\n    horizon: r.horizon,\n    success: r.stage_b_success,\n    best_sharpe: r.best_sharpe,\n    best_trial: r.best_trial,\n    error: r.stage_b_error || r.stage_a_error || r.prep_families_error || null\n  }))\n};\n\n// Average Sharpe\nconst validSharpes = summary.results.filter(r => r.best_sharpe !== null).map(r => r.best_sharpe);\nsummary.avg_sharpe = validSharpes.length > 0 \n  ? (validSharpes.reduce((a, b) => a + b, 0) / validSharpes.length).toFixed(4)\n  : null;\n\nreturn [{ json: summary }];"
+      },
+      "id": "generate-report",
+      "name": "Generate Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3300, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Log prep_families failure\nconst input = $input.item.json;\nreturn {\n  json: {\n    symbol: input.symbol,\n    horizon: input.horizon,\n    step: 'prep_families',\n    success: false,\n    error: input.prep_families_error,\n    run_id: input.config?.run_id\n  }\n};"
+      },
+      "id": "log-prep-failure",
+      "name": "Log Prep Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 500]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Log Stage-A failure\nconst input = $input.item.json;\nreturn {\n  json: {\n    symbol: input.symbol,\n    horizon: input.horizon,\n    step: 'stage_a_selector',\n    success: false,\n    error: input.stage_a_error,\n    run_id: input.config?.run_id\n  }\n};"
+      },
+      "id": "log-stage-a-failure",
+      "name": "Log Stage-A Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2500, 400]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Pipeline Config", "type": "main", "index": 0 }]]
+    },
+    "Daily 2AM Trigger": {
+      "main": [[{ "node": "Pipeline Config", "type": "main", "index": 0 }]]
+    },
+    "Pipeline Config": {
+      "main": [[{ "node": "Split Symbols", "type": "main", "index": 0 }]]
+    },
+    "Split Symbols": {
+      "main": [[{ "node": "Build Prep Families Command", "type": "main", "index": 0 }]]
+    },
+    "Build Prep Families Command": {
+      "main": [[{ "node": "1. Prep Families", "type": "main", "index": 0 }]]
+    },
+    "1. Prep Families": {
+      "main": [[{ "node": "Validate Prep Output", "type": "main", "index": 0 }]]
+    },
+    "Validate Prep Output": {
+      "main": [[{ "node": "Prep Success?", "type": "main", "index": 0 }]]
+    },
+    "Prep Success?": {
+      "main": [
+        [{ "node": "Build Stage-A Command", "type": "main", "index": 0 }],
+        [{ "node": "Log Prep Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Stage-A Command": {
+      "main": [[{ "node": "2. Stage-A Selector", "type": "main", "index": 0 }]]
+    },
+    "2. Stage-A Selector": {
+      "main": [[{ "node": "Validate Stage-A Output", "type": "main", "index": 0 }]]
+    },
+    "Validate Stage-A Output": {
+      "main": [[{ "node": "Stage-A Success?", "type": "main", "index": 0 }]]
+    },
+    "Stage-A Success?": {
+      "main": [
+        [{ "node": "Build Stage-B Command", "type": "main", "index": 0 }],
+        [{ "node": "Log Stage-A Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Stage-B Command": {
+      "main": [[{ "node": "3. Stage-B Phase2 Train", "type": "main", "index": 0 }]]
+    },
+    "3. Stage-B Phase2 Train": {
+      "main": [[{ "node": "Parse Training Results", "type": "main", "index": 0 }]]
+    },
+    "Parse Training Results": {
+      "main": [[{ "node": "Aggregate All Results", "type": "main", "index": 0 }]]
+    },
+    "Log Prep Failure": {
+      "main": [[{ "node": "Aggregate All Results", "type": "main", "index": 0 }]]
+    },
+    "Log Stage-A Failure": {
+      "main": [[{ "node": "Aggregate All Results", "type": "main", "index": 0 }]]
+    },
+    "Aggregate All Results": {
+      "main": [[{ "node": "Generate Report", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-01-21T00:00:00.000Z",
+  "versionId": "3"
+}

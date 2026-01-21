@@ -1,0 +1,209 @@
+# ============================================================================
+# n8n Production Setup for Mamba Stateful Training Pipeline
+# ============================================================================
+# This Docker Compose file sets up n8n with:
+# - PostgreSQL backend for workflow persistence
+# - Redis for queue mode (scalable execution)
+# - Direct volume mounts to Mamba workspace
+# - GPU-aware worker configuration
+#
+# Usage:
+#   docker-compose up -d              # Start all services
+#   docker-compose logs -f n8n        # View n8n logs
+#   docker-compose exec n8n /bin/sh   # Shell into n8n container
+#   docker-compose down               # Stop all services
+#
+# Access n8n at: http://localhost:5678
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # PostgreSQL Database (n8n workflow persistence)
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: mamba_n8n_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD:-n8n_secure_password_change_me}
+      POSTGRES_DB: n8n
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mamba_n8n_network
+
+  # --------------------------------------------------------------------------
+  # Redis (Queue mode for scalable execution)
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: mamba_n8n_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mamba_n8n_network
+
+  # --------------------------------------------------------------------------
+  # n8n Main Instance (UI + Webhook receiver)
+  # --------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: mamba_n8n_main
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5678:5678"
+    environment:
+      # Database
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:-n8n_secure_password_change_me}
+      
+      # Queue mode (Redis)
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      
+      # n8n settings
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${TIMEZONE:-UTC}
+      
+      # Security
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-mamba_n8n_password}
+      
+      # Execution settings
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "true"
+      EXECUTIONS_DATA_MAX_AGE: 336  # 14 days in hours
+      
+      # Node settings
+      NODE_FUNCTION_ALLOW_EXTERNAL: "true"
+      NODE_FUNCTION_ALLOW_BUILTIN: "*"
+      
+      # Mamba workspace paths (available in Execute Command nodes)
+      MAMBA_WORKSPACE: /mamba_workspace
+      MAMBA_CACHE: /mamba_workspace/cache
+      MAMBA_ARTIFACTS: /mamba_workspace/artifacts
+      MAMBA_VENV_PYTHON: /mamba_workspace/.venv/bin/python
+      
+    volumes:
+      # n8n data persistence
+      - n8n_data:/home/node/.n8n
+      # Mount Mamba workspace (read-write)
+      - ${MAMBA_WORKSPACE_PATH:-/home/rohan/Main mamba statefull}:/mamba_workspace:rw
+      # Optional: Mount EODHD API key file
+      - ${EODHD_KEY_FILE:-/dev/null}:/secrets/eodhd_api_key:ro
+      # Docker socket and binary for running commands in python-worker
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /usr/bin/docker:/usr/bin/docker:ro
+    networks:
+      - mamba_n8n_network
+
+  # --------------------------------------------------------------------------
+  # n8n Worker (executes workflows in queue mode)
+  # --------------------------------------------------------------------------
+  n8n-worker:
+    image: n8nio/n8n:latest
+    container_name: mamba_n8n_worker
+    restart: unless-stopped
+    depends_on:
+      - n8n
+    command: worker
+    environment:
+      # Database (same as main)
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:-n8n_secure_password_change_me}
+      
+      # Queue mode (Redis)
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      
+      # Worker settings
+      QUEUE_WORKER_LOCK_DURATION: 600000  # 10 min for long-running training
+      QUEUE_WORKER_LOCK_RENEW_TIME: 300000  # Renew every 5 min
+      QUEUE_WORKER_STALLED_INTERVAL: 120000  # Check stalled every 2 min
+      
+      # Node settings
+      NODE_FUNCTION_ALLOW_EXTERNAL: "true"
+      NODE_FUNCTION_ALLOW_BUILTIN: "*"
+      
+      # Mamba workspace paths
+      MAMBA_WORKSPACE: /mamba_workspace
+      MAMBA_CACHE: /mamba_workspace/cache
+      MAMBA_ARTIFACTS: /mamba_workspace/artifacts
+      MAMBA_VENV_PYTHON: /mamba_workspace/.venv/bin/python
+      
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ${MAMBA_WORKSPACE_PATH:-/home/rohan/Main mamba statefull}:/mamba_workspace:rw
+      - ${EODHD_KEY_FILE:-/dev/null}:/secrets/eodhd_api_key:ro
+    networks:
+      - mamba_n8n_network
+    # Uncomment for GPU support (requires nvidia-docker)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # --------------------------------------------------------------------------
+  # Python Worker (runs training scripts via SSH from n8n)
+  # --------------------------------------------------------------------------
+  python-worker:
+    image: python:3.12-slim
+    container_name: mamba_python_worker
+    restart: unless-stopped
+    command: ["tail", "-f", "/dev/null"]
+    working_dir: /mamba_workspace
+    environment:
+      PYTHONPATH: /mamba_workspace
+    volumes:
+      - ${MAMBA_WORKSPACE_PATH:-/home/rohan/Main mamba statefull}:/mamba_workspace:rw
+    networks:
+      - mamba_n8n_network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  n8n_data:
+    driver: local
+
+networks:
+  mamba_n8n_network:
+    driver: bridge

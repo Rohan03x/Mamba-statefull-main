@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Cache and data
+cache/
+data/
+data_cache/
+*.parquet
+*.pkl
+*.h5
+*.hdf5
+
+# Logs and artifacts
+logs/
+artifacts/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+*.key
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dagster
+.dagster_home/
+.tmp_dagster_home_*/
+
+# Database files
+*.db
+
