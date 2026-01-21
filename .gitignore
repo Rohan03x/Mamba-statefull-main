@@ -9,11 +9,9 @@ venv/
 ENV/
 env/
 
-# Cache and data - allow only merged folder
+# Cache - allow only cache/merged/
 cache/*
-!cache/gdelt_global/
-cache/gdelt_global/*
-!cache/gdelt_global/merged/
+!cache/merged/
 data/
 data_cache/
 *.pkl
