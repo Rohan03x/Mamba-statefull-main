@@ -4938,30 +4938,42 @@ def build_panel(
         """
         Options-anchored features using EODHD options data.
         
-        Returns 10 RAW options-anchoring metrics (institutional-grade):
+        FETCH CADENCE: Daily (business days) - missing daily destroys IV/skew value!
         
-        A. IV ANCHORING (3 features):
+        Returns 11 decay-weighted options-anchoring metrics (institutional-grade):
+        
+        A. IV ANCHORING (3 features) - FAST DECAY (half-life 3 days):
            - iv_anchor_pct: Z-score of ATM IV vs 20-day mean/std (overextension detector)
            - iv_percentile_30d: Percentile rank of ATM IV in last 30 days (fear regime)
            - iv_percentile_1yr: Percentile rank of ATM IV in last 1 year (long-term context)
         
-        B. SKEW ANCHORING (3 features):
+        B. SKEW ANCHORING (3 features) - FAST DECAY (half-life 3 days):
            - iv_skew_anchor: OTM put IV - OTM call IV (raw downside fear)
            - iv_skew_zscore: Z-score of skew vs 30-day distribution (skew extremes)
            - risk_reversal_25d: 25-delta put IV - 25-delta call IV (Goldman/JPM standard)
         
-        C. EXPECTED MOVE ANCHORING (2 features):
+        C. EXPECTED MOVE ANCHORING (2 features) - FAST DECAY (half-life 3 days):
            - expected_move_pct: Straddle-implied move as % of spot (event risk)
            - em_vs_real_vol_ratio: Expected move / realized vol (complacency detector)
         
-        D. POSITIONING/SENTIMENT ANCHORING (2 features):
+        D. VOLUME POSITIONING (1 feature) - MEDIUM DECAY (half-life 5 days):
            - put_call_vol_ratio_anchor: EMA(3) of put/call volume (short-term sentiment)
+        
+        E. OI POSITIONING (1 feature) - SLOW DECAY (half-life 20 days):
            - put_call_oi_ratio_anchor: Put OI / call OI (slow-moving hedging demand)
         
-        Source: EODHD Options API
-        Purpose: Institutional-grade options anchoring (used by Goldman, JPM, Susquehanna)
+        F. GOVERNANCE (1 feature):
+           - options_anchoring_days_since_update: Days since last real fetch (freshness)
         
-        NOTE: Returns RAW anchoring metrics. Stage A learns predictive relationships.
+        DECAY WEIGHTING:
+        - FAST (A,B,C): half-life 3 days - IV/skew decays quickly, daily fetch critical
+        - MEDIUM (D): half-life 5 days - Volume reacts around events
+        - SLOW (E): half-life 20 days - OI is structural, but fetch daily for breaks
+        
+        Source: EODHD Options API (daily business day cadence)
+        Purpose: Institutional-grade options anchoring (Goldman/JPM/Susquehanna standard)
+        
+        NOTE: Decay weighting reduces stale data impact. Stage A learns relationships.
         """
         try:
             from src.data_sources.eodhd_provider import get_eodhd_provider
@@ -4993,10 +5005,13 @@ def build_panel(
             # Fetch options snapshots weekly (balance API calls vs data granularity)
             
             date_range = pd.date_range(start=start_str_default, end=end_str_default, freq='D')
-            # IMPORTANT: Use a calendar-anchored weekly schedule so walk-forward windows
-            # share the same sample dates. Using freq='7D' anchors to the window's start
-            # and creates mostly unique dates per window, which can explode EODHD calls.
-            sample_freq = os.getenv('EODHD_OPTIONS_ANCHOR_FREQ', 'W-FRI')
+            # ═══════════════════════════════════════════════════════════
+            # DAILY FETCH CADENCE (per Goldman/JPM institutional practice)
+            # ═══════════════════════════════════════════════════════════
+            # - IV/Skew/Expected Move (FAST): half-life 1-5 days - MUST fetch daily
+            # - Volume ratios (MEDIUM): half-life 3-10 days - fetch daily
+            # - OI ratios (SLOW): half-life 10-30 days - fetch daily for structural breaks
+            sample_freq = os.getenv('EODHD_OPTIONS_ANCHOR_FREQ', 'B')  # Business days (daily)
             sample_dates = pd.date_range(start=start_str_default, end=end_str_default, freq=sample_freq)
 
             # Guardrail: very long coverages can still create ~1000+ snapshots per symbol.
@@ -5190,8 +5205,24 @@ def build_panel(
             features_df = features_df.ffill().bfill()
             
             # ═══════════════════════════════════════════════════════════
-            # CALCULATE ROLLING METRICS (Z-scores, Percentiles, EMAs)
+            # DECAY HALF-LIVES BY FEATURE TYPE (Goldman/JPM cadence)
             # ═══════════════════════════════════════════════════════════
+            # A) IV/Expected Move/Skew (FAST): half-life 3 days
+            # B) Volume-based positioning (MEDIUM): half-life 5 days  
+            # C) Open interest positioning (SLOW): half-life 20 days
+            HALFLIFE_FAST = 3    # IV, skew, expected move
+            HALFLIFE_MEDIUM = 5  # Volume ratios
+            HALFLIFE_SLOW = 20   # OI ratios
+            
+            def _apply_decay_weight(series: pd.Series, halflife_days: int) -> pd.Series:
+                """Apply exponential decay weighting. Recent data matters more."""
+                # Calculate days since last real observation
+                is_real = series.notna() & (series != 0)
+                days_since = (~is_real).cumsum() - (~is_real).cumsum().where(is_real).ffill().fillna(0)
+                # Exponential decay: weight = 0.5^(days/halflife)
+                decay_factor = np.power(0.5, days_since / halflife_days)
+                return series * decay_factor
+            
             # ═══════════════════════════════════════════════════════════
             # CALCULATE ROLLING METRICS (Z-scores, Percentiles, EMAs)
             # ═══════════════════════════════════════════════════════════
@@ -5231,9 +5262,37 @@ def build_panel(
             
             # D. POSITIONING/SENTIMENT
             if 'put_call_vol' in features_df.columns:
-                # EMA(3) of put/call volume ratio
-                features_df['put_call_vol_ratio_anchor'] = features_df['put_call_vol'].ewm(span=3, min_periods=1).mean()
+                # EMA(3) of put/call volume ratio - MEDIUM decay
+                raw_vol_ratio = features_df['put_call_vol'].ewm(span=3, min_periods=1).mean()
+                features_df['put_call_vol_ratio_anchor'] = _apply_decay_weight(raw_vol_ratio, HALFLIFE_MEDIUM)
                 features_df.drop(columns=['put_call_vol'], inplace=True)
+            
+            # Apply decay to OI ratio (SLOW decay - structural positioning)
+            if 'put_call_oi_ratio_anchor' in features_df.columns:
+                features_df['put_call_oi_ratio_anchor'] = _apply_decay_weight(
+                    features_df['put_call_oi_ratio_anchor'], HALFLIFE_SLOW
+                )
+            
+            # Apply FAST decay to IV/skew/expected move features
+            fast_decay_cols = ['iv_anchor_pct', 'iv_percentile_30d', 'iv_percentile_1yr',
+                               'iv_skew_anchor', 'iv_skew_zscore', 'risk_reversal_25d',
+                               'expected_move_pct', 'em_vs_real_vol_ratio']
+            for col in fast_decay_cols:
+                if col in features_df.columns:
+                    features_df[col] = _apply_decay_weight(features_df[col], HALFLIFE_FAST)
+            
+            # ═══════════════════════════════════════════════════════════
+            # GOVERNANCE: Track days_since_update per feature category
+            # ═══════════════════════════════════════════════════════════
+            # Helps downstream models know data freshness
+            if 'atm_iv' in snapshots_df.columns or len(snapshots_df) > 0:
+                # Days since last real options observation
+                real_dates = snapshots_df.index
+                features_df['options_anchoring_days_since_update'] = features_df.index.to_series().apply(
+                    lambda d: min((d - real_dates).days) if len(real_dates) > 0 and d >= real_dates.min() else 999.0
+                ).clip(lower=0).values
+            else:
+                features_df['options_anchoring_days_since_update'] = 999.0
             
             # Clean data
             features_df = features_df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
