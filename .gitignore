@@ -9,11 +9,13 @@ venv/
 ENV/
 env/
 
-# Cache and data
-cache/
+# Cache and data - allow only merged folder
+cache/*
+!cache/gdelt_global/
+cache/gdelt_global/*
+!cache/gdelt_global/merged/
 data/
 data_cache/
-*.parquet
 *.pkl
 *.h5
 *.hdf5
@@ -48,4 +50,3 @@ Thumbs.db
 
 # Database files
 *.db
-
