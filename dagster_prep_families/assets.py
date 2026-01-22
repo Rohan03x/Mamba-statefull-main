@@ -101,6 +101,12 @@ class PrepFamiliesConfig(Config):
     preprocess_role_hint_channels: bool = False
     preprocess_days_since_update_hints: bool = False
 
+    # Role-aware split outputs (mamba vs portfolio)
+    preprocess_write_role_splits: bool = True
+    alt_signals_staleness_k: Optional[float] = None
+
+    mamba_optional_all: bool = False
+
     # Source policy: enforce "real" data at generation time.
     # Set to False to allow proxy/fallback data sources like garch_iv
     enforce_no_proxy_sources: bool = False
@@ -262,6 +268,14 @@ def prep_families_manifest(context) -> str:
     os.environ["PREP_FAMILIES_TIMING_DECAY"] = "1" if bool(cfg.preprocess_timing_decay) else "0"
     os.environ["PREP_FAMILIES_ROLE_HINT_CHANNELS"] = "1" if bool(cfg.preprocess_role_hint_channels) else "0"
     os.environ["PREP_FAMILIES_DAYS_SINCE_UPDATE_HINTS"] = "1" if bool(cfg.preprocess_days_since_update_hints) else "0"
+    os.environ["PREP_FAMILIES_WRITE_ROLE_SPLITS"] = "1" if bool(cfg.preprocess_write_role_splits) else "0"
+    if cfg.alt_signals_staleness_k is not None:
+        os.environ["ALT_SIGNALS_STALENESS_K"] = str(cfg.alt_signals_staleness_k)
+    if bool(cfg.mamba_optional_all):
+        os.environ["ALT_SIGNALS_MAMBA_OPTIONAL"] = "all"
+        os.environ["ARIMA_FORECAST_MAMBA_OPTIONAL"] = "all"
+        os.environ["QUANTILE_FORECAST_MAMBA_STACKING"] = "all"
+        os.environ["CANDLE_MECHANICS_MAMBA_OPTIONAL"] = "all"
 
     allow_wf_override = bool(cfg.allow_wf_override) or (os.environ.get("DAGSTER_PREP_ALLOW_WF_OVERRIDE", "0") == "1")
 

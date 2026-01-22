@@ -2662,6 +2662,7 @@ def build_panel(
             stub = pd.DataFrame(index=date_range)
             stub['earnings_has_data'] = 0.0
             # Core earnings (2-4): Keep surprises only, drop raw levels
+            # NOTE: These are SHIFTED by 1 day in EarningsAnalyzer to prevent leakage
             stub['earnings_eps_surprise_pct'] = 0.0
             stub['earnings_revenue_surprise_pct'] = 0.0
             # Optional: normalized surprises
@@ -2694,6 +2695,10 @@ def build_panel(
             # Anticipation (1): NEW
             stub['earnings_days_to_next_earnings'] = 0.0  # NEW
             
+            # Event stress (2): One-sided RISK signals for portfolio overlays
+            stub['earnings_pre_event_stress'] = 0.0   # exp(-days_to_next / tau_pre)
+            stub['earnings_post_event_stress'] = 0.0  # exp(-days_since / tau_post)
+            
             # Governance columns (required for all families)
             stub['earnings_activity'] = 0.0
             stub['earnings_days_since_update'] = 999.0  # No update
@@ -2710,6 +2715,8 @@ def build_panel(
                 'binary_flags_removed': ['earnings_volatility_flag'],
                 'continuous_replacements': ['earnings_surprise_volatility'],
                 'event_decay_tau': '10-15 trading days',
+                'leakage_prevention': 'Surprise features shifted by 1 day',
+                'event_stress_signals': ['pre_event_stress', 'post_event_stress'],
             }
             return stub
 
@@ -2746,6 +2753,8 @@ def build_panel(
                 'earnings_days_since_earnings',
                 'earnings_event_decay',
                 'earnings_days_to_next_earnings',
+                'earnings_pre_event_stress',
+                'earnings_post_event_stress',
             ]
             for col in canonical_cols:
                 raw = col[len('earnings_'):] if col.startswith('earnings_') else col
@@ -5546,7 +5555,7 @@ def build_panel(
         - dividend_frequency: Structural classifier (quarterly/monthly/irregular), NOT trading signal
         - Structural features belong in FIN_G7, not here
         
-        Total: 7 features (event-focused, hedge-fund grade)
+        Total: 8 features (event-focused, hedge-fund grade)
         """
         def _dividends_has_data_stub(note: str) -> pd.DataFrame:
             date_range = pd.date_range(start=start_str_default, end=end_str_default, freq='D')
@@ -5558,6 +5567,7 @@ def build_panel(
             stub['days_to_ex_dividend'] = 999.0
             stub['ex_dividend_window_strength'] = 0.0
             stub['dividend_event_intensity'] = 0.0
+            stub['dividend_event_stress'] = 0.0  # One-sided RISK signal
             stub['has_data'] = 0.0
             stub.attrs['provenance'] = {
                 'source': 'eodhd_dividends_api',
@@ -5684,16 +5694,27 @@ def build_panel(
                     div_series['dividend_event_intensity'] = (
                         div_series['dividend_amount'] / (price_aligned + 1e-9)
                     ) * div_series['ex_dividend_window_strength']
+                    
+                    # ================================================================
+                    # HEDGE-FUND: Dividend Event Stress (one-sided RISK signal)
+                    # ================================================================
+                    # dividend_event_stress = window_strength × clip(|amount/price|, 0, 0.10)
+                    # Only matters near ex-date; caps extreme special dividends at 10% yield
+                    # This is a RISK signal for overlays (stress → reduce exposure)
+                    div_pct = (div_series['dividend_amount'] / (price_aligned + 1e-9)).abs().clip(upper=0.10)
+                    div_series['dividend_event_stress'] = div_series['ex_dividend_window_strength'] * div_pct * 10.0  # Scale to [0, 1]
                 else:
                     # No price data - use raw amount × window_strength
                     div_series['dividend_event_intensity'] = (
                         div_series['dividend_amount'] * div_series['ex_dividend_window_strength']
                     )
+                    div_series['dividend_event_stress'] = 0.0  # Can't compute without price
             except Exception:
                 # Fallback: raw amount × window_strength
                 div_series['dividend_event_intensity'] = (
                     div_series['dividend_amount'] * div_series['ex_dividend_window_strength']
                 )
+                div_series['dividend_event_stress'] = 0.0
             
             # ================================================================
             # HEDGE-FUND: Cross-sectional yield normalization (z-score)
@@ -5712,7 +5733,8 @@ def build_panel(
             dividends = div_series[[
                 'dividend_amount', 'dividend_yield_est', 'dividend_yield_zscore', 
                 'dividend_frequency', 'days_to_ex_dividend', 
-                'ex_dividend_window_strength', 'dividend_event_intensity'
+                'ex_dividend_window_strength', 'dividend_event_intensity',
+                'dividend_event_stress'
             ]].copy()
 
             dividends['has_data'] = 1.0
@@ -5741,12 +5763,14 @@ def build_panel(
                 'income_metrics': ['dividend_yield_est', 'dividend_yield_zscore'],
                 'structural_classifier': ['dividend_frequency'],
                 'event_timing': ['days_to_ex_dividend', 'ex_dividend_window_strength', 'dividend_event_intensity'],
+                'risk_stress': ['dividend_event_stress'],  # One-sided stress for overlays
             }
             dividends.attrs['governance'] = {
                 'dividend_amount_usage': 'Never standalone, always paired with timing features',
                 'dividend_frequency_usage': 'Structural classifier (quarterly/monthly/irregular), NOT trading signal',
                 'policy_features_location': 'FIN_G7 (dividend_policy_stability, payout_ratio, etc.)',
                 'event_window_philosophy': 'Smooth continuous strength, not binary flags',
+                'dividend_event_stress_usage': 'One-sided RISK signal: window_strength × clip(|amount/price|, 0, 0.10) × 10 → [0,1]',
             }
             return dividends
             
@@ -5921,6 +5945,35 @@ def build_panel(
             for metric_name, value in metrics.items():
                 fin_g1[metric_name] = value
 
+            # ----------------------------------------------------------------
+            # STRESS FEATURES (Jan 2026): Higher = worse (for risk aggregation)
+            # CRITICAL: RoleAwareContext risk_scale uses 1/(1+risk_agg), so
+            # raw ratios where higher=safer would INVERT the meaning.
+            # These stress features ensure "higher unitized value = more risk".
+            # ----------------------------------------------------------------
+            # Liquidity stress: 1 / current_ratio, clipped to [0, 2]
+            # When current_ratio < 1, stress > 1 (danger zone)
+            # When current_ratio > 2, stress < 0.5 (safe)
+            if 'current_ratio' in fin_g1.columns:
+                cr = pd.to_numeric(fin_g1['current_ratio'], errors='coerce').clip(lower=0.1)
+                fin_g1['liquidity_stress'] = np.clip(1.0 / cr, 0.0, 2.0)
+
+            # Quick stress: same logic for quick_ratio
+            if 'quick_ratio' in fin_g1.columns:
+                qr = pd.to_numeric(fin_g1['quick_ratio'], errors='coerce').clip(lower=0.1)
+                fin_g1['quick_stress'] = np.clip(1.0 / qr, 0.0, 2.0)
+
+            # Cash stress: same logic for cash_ratio
+            if 'cash_ratio' in fin_g1.columns:
+                cashr = pd.to_numeric(fin_g1['cash_ratio'], errors='coerce').clip(lower=0.05)
+                fin_g1['cash_stress'] = np.clip(1.0 / cashr, 0.0, 4.0)
+
+            # Liquidity trend stress: negative trend = deterioration = higher stress
+            if 'liquidity_trend_3y' in fin_g1.columns:
+                trend = pd.to_numeric(fin_g1['liquidity_trend_3y'], errors='coerce').fillna(0.0)
+                # Negative trend → positive stress; positive trend → zero stress
+                fin_g1['liquidity_trend_stress'] = np.clip(-trend, 0.0, 1.0)
+
             # Family-scoped has_data: fundamentals are valid whenever available.
             fin_g1["has_data"] = 1.0
             
@@ -6085,6 +6138,34 @@ def build_panel(
             fin_g2 = fin_g2.replace([np.inf, -np.inf], np.nan).ffill()
 
             fin_g2['has_data'] = 1.0
+
+            # ----------------------------------------------------------------
+            # STRESS FEATURES (Jan 2026): Higher = worse (for risk aggregation)
+            # CRITICAL: interest_coverage is HIGHER = SAFER, so we invert it.
+            # Debt ratios (debt_to_equity, etc.) are already higher = worse.
+            # We use robust signed_log1p transforms for exploding ratios.
+            # ----------------------------------------------------------------
+            def _signed_log1p(x: pd.Series) -> pd.Series:
+                """Robust transform: sign(x) * log1p(|x|) for exploding ratios."""
+                return np.sign(x) * np.log1p(np.abs(x))
+
+            # Interest coverage stress: 1 / (1 + max(coverage, 0))
+            # When coverage is high (>5), stress is low (<0.17)
+            # When coverage is low (<2), stress is high (>0.33)
+            # When coverage is negative (distressed), stress = 1.0
+            if 'interest_coverage' in fin_g2.columns:
+                ic = pd.to_numeric(fin_g2['interest_coverage'], errors='coerce').fillna(0.0)
+                fin_g2['interest_coverage_stress'] = np.clip(1.0 / (1.0 + np.maximum(ic, 0.0)), 0.0, 1.0)
+
+            # Robust debt_to_equity (can explode with small/negative equity)
+            if 'debt_to_equity' in fin_g2.columns:
+                dte = pd.to_numeric(fin_g2['debt_to_equity'], errors='coerce').fillna(0.0)
+                fin_g2['debt_to_equity_robust'] = _signed_log1p(dte)
+
+            # Robust net_debt_to_ebitda (can explode with small/negative EBITDA)
+            if 'net_debt_to_ebitda' in fin_g2.columns:
+                nde = pd.to_numeric(fin_g2['net_debt_to_ebitda'], errors='coerce').fillna(0.0)
+                fin_g2['net_debt_to_ebitda_robust'] = _signed_log1p(nde)
             
             # Rescale large magnitude columns (e.g., TOTAL_DEBT)
             rescaled_cols: List[str] = []
@@ -6216,6 +6297,26 @@ def build_panel(
                     fin_g3['turnover_volatility_3y'] = turnover_vol
             
             fin_g3 = fin_g3.replace([np.inf, -np.inf], np.nan).ffill()
+
+            # ----------------------------------------------------------------
+            # STRESS FEATURES (Jan 2026): Higher = worse (for risk aggregation)
+            # Cash Conversion Cycle (CCC) = DSO + DIO - DPO
+            # Higher CCC = more cash tied up in operations = worse
+            # Turnover volatility already higher = worse (instability)
+            # ----------------------------------------------------------------
+            # Cash Conversion Cycle: DSO + DIO - DPO
+            dso = pd.to_numeric(fin_g3.get('dsos', 0), errors='coerce').fillna(0.0)
+            dio = pd.to_numeric(fin_g3.get('dios', 0), errors='coerce').fillna(0.0)
+            dpo = pd.to_numeric(fin_g3.get('dpos', 0), errors='coerce').fillna(0.0)
+            ccc = dso + dio - dpo
+            fin_g3['ccc'] = ccc
+
+            # CCC stress: normalize CCC to [0, 1] range
+            # CCC > 90 days is stressed, CCC < 30 days is healthy
+            # Use sigmoid-like transform: 1 / (1 + exp(-(ccc - 60) / 30))
+            with np.errstate(over='ignore', invalid='ignore'):
+                ccc_centered = (ccc - 60.0) / 30.0
+                fin_g3['ccc_stress'] = np.clip(1.0 / (1.0 + np.exp(-ccc_centered)), 0.0, 1.0)
 
             fin_g3['has_data'] = 1.0
             
@@ -6956,8 +7057,30 @@ def build_panel(
             # KEEP: Regime context (short-term positioning)
             dcf_data['dcf_price_regime'] = price / (bb_mid + 1e-9)
             
-            # REMOVED: dcf_pe_proxy (highly correlated with price_to_fairvalue_1y)
-            # REMOVED: dcf_relative_strength_1m (overlaps with momentum + z-scores)
+            # ============================================================
+            # 1B. LOG ANCHORS + ONE-SIDED STRESS (for portfolio overlays)
+            # ============================================================
+            # Raw ratios are asymmetric and can dominate aggregation
+            # Log versions are symmetric around 0 and better for regime aggregation
+            # CRITICAL: RoleAwareContext treats high values as "stress"
+            #   - Overextension (price >> fair value) → stress (should reduce exposure)
+            #   - Undervaluation (price << fair value) → NOT stress (may be opportunity)
+            
+            # Log price-to-fairvalue (symmetric around 0)
+            dcf_data['dcf_log_p2fv_1y'] = np.log(price / (ema_252 + 1e-9))
+            dcf_data['dcf_log_p2fv_3m'] = np.log(price / (ema_63 + 1e-9))
+            dcf_data['dcf_log_price_regime'] = np.log(price / (bb_mid + 1e-9))
+            
+            # Overextension stress (one-sided: only penalize "too expensive")
+            # Higher value = more overextended = reduce exposure via overlays
+            # cap at 1.0 (corresponds to ~2.7x fair value)
+            log_p2fv_1y = dcf_data['dcf_log_p2fv_1y']
+            dcf_data['dcf_overextension'] = log_p2fv_1y.clip(lower=0).clip(upper=1.0)
+            
+            # Undervaluation (one-sided: directional alpha signal for Mamba)
+            # More negative = more undervalued = potential opportunity
+            # Keep for Mamba; do NOT use in stress aggregation
+            dcf_data['dcf_undervaluation'] = log_p2fv_1y.clip(upper=0).clip(lower=-1.0)
             
             # ============================================================
             # 2. MULTI-HORIZON MOMENTUM (5 features) - HEDGE-FUND: Core alpha
@@ -7063,6 +7186,13 @@ def build_panel(
             upside = (bull_scenario - price) / (price + 1e-9)
             downside = (price - bear_scenario) / (price + 1e-9)
             dcf_data['dcf_scenario_skew'] = (upside - downside) / (upside + downside + 1e-9)
+            
+            # Downside skew stress (one-sided: for portfolio overlays)
+            # CRITICAL: dcf_scenario_skew is directional (-1 to +1)
+            # Negative skew = more downside risk → stress for overlays
+            # Positive skew = more upside → NOT stress
+            # Formula: clip(-scenario_skew, 0, 1)
+            dcf_data['dcf_downside_skew_stress'] = (-dcf_data['dcf_scenario_skew']).clip(0, 1)
             
             # Current position in scenario range
             # 0 = at bear scenario, 0.5 = at fair value, 1 = at bull scenario

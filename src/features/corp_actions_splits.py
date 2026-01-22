@@ -154,7 +154,10 @@ def fetch(
     if splits_df.empty:
         out["corp_actions_splits_post_5d"] = 0.0
         out["corp_actions_splits_post_20d"] = 0.0
-        out["corp_actions_splits_days_since"] = _days_since_last_event(out["corp_actions_splits_flag"], never_value=9999.0)
+        days_since = _days_since_last_event(out["corp_actions_splits_flag"], never_value=9999.0)
+        out["corp_actions_splits_days_since"] = days_since
+        # Bounded recency: no splits means recency → 0 (exp(-252/20) ≈ 0.00)
+        out["corp_actions_splits_recency"] = np.exp(-days_since.clip(upper=252.0) / 20.0)
         out["corp_actions_splits_count_5y"] = 0.0
 
         out = out.loc[(out.index >= sessions[0]) & (out.index <= sessions[-1])].copy()
@@ -192,7 +195,10 @@ def fetch(
         # No parseable events.
         out["corp_actions_splits_post_5d"] = 0.0
         out["corp_actions_splits_post_20d"] = 0.0
-        out["corp_actions_splits_days_since"] = _days_since_last_event(out["corp_actions_splits_flag"], never_value=9999.0)
+        days_since = _days_since_last_event(out["corp_actions_splits_flag"], never_value=9999.0)
+        out["corp_actions_splits_days_since"] = days_since
+        # Bounded recency: no splits means recency → 0 (exp(-252/20) ≈ 0.00)
+        out["corp_actions_splits_recency"] = np.exp(-days_since.clip(upper=252.0) / 20.0)
         out["corp_actions_splits_count_5y"] = 0.0
 
         out = out.loc[(out.index >= sessions[0]) & (out.index <= sessions[-1])].copy()
@@ -220,6 +226,16 @@ def fetch(
     out["corp_actions_splits_days_since"] = days_since
     out["corp_actions_splits_post_5d"] = ((days_since >= 0.0) & (days_since <= float(post_5d_window))).astype(float)
     out["corp_actions_splits_post_20d"] = ((days_since >= 0.0) & (days_since <= float(post_20d_window))).astype(float)
+
+    # -------------------------------------------------------------------------
+    # CRITICAL FIX: Bounded recency intensity in [0,1]
+    # Raw days_since=9999 corrupts RoleAwareContext regime averaging.
+    # Transform: recency = exp(-min(days_since, 252)/20)
+    #   Recent split → ~1, old/no split → ~0
+    # This is safe for averaging and won't inflate regime_agg permanently.
+    # -------------------------------------------------------------------------
+    days_since_capped = days_since.clip(upper=252.0)  # Cap at 1 year
+    out["corp_actions_splits_recency"] = np.exp(-days_since_capped / 20.0)
 
     # Rolling 5y count of split events (time-based, session index is DatetimeIndex).
     out["corp_actions_splits_count_5y"] = (

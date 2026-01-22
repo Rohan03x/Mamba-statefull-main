@@ -337,6 +337,7 @@ HYGIENE_TOKENS = (
     "coverage",
     "is_valid",
     "is_active",
+    "activity",
     "eligible",
     "stale",
     "delist",
@@ -410,6 +411,1454 @@ PREDICTIVE_TOKENS = (
     "carry",
     "relative",
 )
+
+
+# ----------------------------------------------------------------------------
+# Alternative-signals authoritative overrides (Jan 2026 policy)
+# ----------------------------------------------------------------------------
+_ALT_SIGNALS_PREFIX = "alternative_signals_"
+
+_ALT_SIGNALS_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+}
+
+_ALT_SIGNALS_RISK_SUFFIXES = {
+    # Beta / correlation
+    "beta_20d",
+    "beta_change_rate",
+    "beta_vix_interaction",
+    "spy_correlation_20d",
+    "qqq_correlation_20d",
+    "sector_etf_correlation_20d",
+    # Volatility
+    "rv_5d",
+    "rv_10d",
+    "rv_20d",
+    "rv_ratio_5_20",
+    "rv_z_20",
+    "close_to_close_volatility",
+    "open_to_close_volatility",
+    "high_low_volatility_ratio",
+    "intraday_volatility_ratio",
+    # Liquidity / cost
+    "liquidity_stress_pct",
+}
+
+_ALT_SIGNALS_REGIME_SUFFIXES = {
+    # Earnings regime / calendar
+    "days_since_last_earnings",
+    "days_to_next_earnings",
+    "turn_of_month_flag",
+    # Attention levels (policy)
+    "news_volume_count",
+    "google_trends_score",
+}
+
+_ALT_SIGNALS_PREDICTIVE_SUFFIXES = {
+    # Intraday / overnight
+    "intraday_range_pct",
+    "intraday_range_z",
+    "opening_reversal",
+    "closing_ramp",
+    "overnight_return",
+    "overnight_return_z",
+    "gap_up_pct",
+    "gap_down_pct",
+    "gap_vs_vix_interaction",
+    # Volume
+    "relative_volume_20d",
+    "volume_z_20d",
+    "volume_trend_10d",
+    "opening_volume_surge",
+    "buy_volume_proxy",
+    "volume_price_divergence",
+    # Earnings drift
+    "earnings_runup_10d",
+    "post_earnings_drift_5d",
+    # News / sentiment shocks
+    "news_volume_change",
+    "news_volume_z",
+    # Derived signals
+    "trend_acceleration",
+    "mean_reversion_signal",
+}
+
+# ----------------------------------------------------------------------------
+# ARIMA forecast authoritative overrides (Jan 2026 policy)
+# ----------------------------------------------------------------------------
+_ARIMA_PREFIX = "arima_forecast_"
+
+_ARIMA_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+    "arima_log_likelihood",
+    "confidence",
+}
+
+_ARIMA_RISK_SUFFIXES = {
+    "arima_abs_residual",
+    "arima_uncertainty_proxy",
+    "arima_innovation",
+}
+
+_ARIMA_REGIME_SUFFIXES = {
+    "arima_persistence",
+}
+
+_ARIMA_PREDICTIVE_SUFFIXES = {
+    "arima_forecast_1d",
+    "arima_forecast_5d",
+    "arima_residual_zscore",
+    "arima_residual_t",
+    "arima_momentum_indicator",
+}
+
+# ----------------------------------------------------------------------------
+# Quantile forecast + calibration + online learning overrides (Jan 2026 policy)
+# ----------------------------------------------------------------------------
+_QUANTILE_PREFIX = "quantile_forecast_"
+_CALIB_PREFIX = "calibration_"
+_ONLINE_PREFIX = "online_learning_"
+_CANDLE_PREFIX = "candle_mechanics_"
+
+# ----------------------------------------------------------------------------
+# CBOE term structure authoritative overrides (Jan 2026 policy)
+# All cboe_term columns route to portfolio parquet (RISK/REGIME), NOT Mamba.
+# This family provides market stress context for overlays and policy state.
+# ----------------------------------------------------------------------------
+_CBOE_TERM_PREFIX = "cboe_term_"
+
+_CBOE_TERM_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+}
+
+_CBOE_TERM_RISK_SUFFIXES = {
+    # Term slopes (z-scored)
+    "vxst_vix_term_slope",
+    "vix_vxv_term_slope",
+    "vix_vxmt_term_slope",
+    # Advanced normalized features
+    "normalized_term_slope",
+    "vix_term_curvature",
+    "front_back_spread",
+    "panic_premium",
+    # Continuous regime indicators (risk-adjacent)
+    "vix_roll_yield",
+    "vix_ratio_term",
+    "vix_contango_strength",
+    "vol_risk_premium",
+    "vol_risk_premium_pct",
+    "vol_risk_premium_z",
+}
+
+_CBOE_TERM_REGIME_SUFFIXES = {
+    # Change/shock features - regime transition indicators
+    "vix_term_slope_change_1d",
+    "vix_term_slope_change_5d",
+    "vix_curvature_change",
+    "panic_premium_change",
+}
+
+# ----------------------------------------------------------------------------
+# Corp actions splits authoritative overrides (Jan 2026 policy)
+# Critical: days_since=9999 corrupts role-aware averaging. Use bounded recency.
+# ----------------------------------------------------------------------------
+_CORP_SPLITS_PREFIX = "corp_actions_splits_"
+
+_CORP_SPLITS_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+}
+
+_CORP_SPLITS_REGIME_SUFFIXES = {
+    # Event detection (bounded and safe for averaging)
+    "flag",
+    "post_5d",
+    "post_20d",
+    "log_ratio",
+    "count_5y",
+    "recency",  # Bounded [0,1] recency intensity (replaces raw days_since)
+}
+
+_CORP_SPLITS_RISK_SUFFIXES = {
+    # These affect position sizing via risk_scale
+    "ratio",  # Split magnitude can affect microstructure stress
+}
+
+# ----------------------------------------------------------------------------
+# Correlation family authoritative overrides (Jan 2026 policy)
+# Routing: predictive spillovers to Mamba; exposure/regime/instability to portfolio
+# ----------------------------------------------------------------------------
+_CORRELATION_PREFIX = "correlation_"
+
+_CORRELATION_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+}
+
+_CORRELATION_MAMBA_PREDICTIVE_SUFFIXES = {
+    # Spillover / propagation (predictive, goes to Mamba)
+    "lag_corr_1_spy",
+    "lag_corr_5_spy",
+    "lag_corr_1_vxx",
+    "lag_corr_2_vxx",
+    # VIX lag correlations
+    "corr_20_vix_lag1",
+    "corr_60_vix_lag1",
+    "corr_20_vix_lag2",
+    "corr_60_vix_lag2",
+    # Serial structure in returns (autocorrelation)
+    "acf_ret_1",
+    "acf_ret_5",
+}
+
+_CORRELATION_MAMBA_OPTIONAL = {
+    # Optional context (only if you explicitly want conditional alpha)
+    "corr_decoupling_z",
+    "corr_spread_20_60_spy",
+}
+
+_CORRELATION_PORTFOLIO_RISK_SUFFIXES = {
+    # Systematic exposure / hedge effectiveness
+    "corr_20_spy",
+    "corr_60_spy",
+    "corr_20_qqq",
+    "corr_20_vxx",
+    "corr_20_sector",
+    # Correlation volatility
+    "corr_20_spy_vol",
+    "corr_20_vxx_vol",
+}
+
+_CORRELATION_PORTFOLIO_REGIME_SUFFIXES = {
+    # Regime shifts / instability
+    "corr_decoupling_z",
+    "corr_spread_20_60_spy",
+    "corr_20_spy_trend",
+    "corr_20_qqq_trend",
+    "corr_20_vxx_trend",
+    "corr_spread_20_60_qqq",
+    # Cross-feature regime diagnostics
+    "corr_return_vol_20",
+    "corr_return_range_10",
+    "corr_vol_volatility_20",
+    # Vol clustering
+    "acf_absret_1",
+    "acf_vol_1",
+}
+
+# ----------------------------------------------------------------------------
+# Cross-asset family authoritative overrides (Jan 2026 policy)
+# Routing: lead/lag predictors to Mamba; everything else to portfolio
+# CRITICAL: regime-change fields are ABSOLUTE MAGNITUDE for stress aggregation
+# ----------------------------------------------------------------------------
+_CROSS_ASSET_PREFIX = "cross_asset_"
+
+_CROSS_ASSET_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+}
+
+_CROSS_ASSET_MAMBA_PREDICTIVE_SUFFIXES = {
+    # Lead/lag analysis: per-asset timing/leadership patterns (goes to Mamba)
+    "spy_leads_stock_5d",
+    "stock_leads_spy_5d",
+}
+
+_CROSS_ASSET_RISK_SUFFIXES = {
+    # ETF correlations - systematic exposure
+    "spy_corr_20d",
+    "qqq_corr_20d",
+    "sector_etf_corr_20d",
+    # Beta exposure
+    "beta_20d",
+    "beta_volatility_20d",
+    # Volatility relationships
+    "vix_corr_20d",
+    "vix_spread_indicator",
+    "realized_vol_vs_spy_corr",
+    # Rate sensitivity (levels)
+    "tnx_corr_20d",
+    "irx_corr_20d",
+    # Credit/FX
+    "credit_spread_level",
+    "asset_corr_hyg_60",
+    "asset_corr_uup_60",
+    # One-sided stress for overlays
+    "risk_offness",
+}
+
+_CROSS_ASSET_REGIME_SUFFIXES = {
+    # Regime-break detectors (ABSOLUTE MAGNITUDE - non-negative)
+    "beta_change_rate",         # abs(zscore) of beta change
+    "beta_volatility_change",   # abs(pct_change) of beta stability
+    "beta_sign_flip_flag",      # Binary regime shift
+    "tnx_corr_change_5d",       # abs(change) in rate correlation
+    "irx_corr_change_5d",       # abs(change) in rate correlation
+    "cross_asset_coupling_change",  # abs(change) in coupling factor
+    # Composite (directional, for policy state only)
+    "risk_onoff_factor",
+}
+
+# ----------------------------------------------------------------------------
+# DCF family authoritative overrides (Jan 2026 policy)
+# Routing: momentum/z-score predictors to Mamba; anchors/stress to portfolio
+# CRITICAL: overextension and downside_skew_stress are one-sided for overlays
+# ----------------------------------------------------------------------------
+_DCF_PREFIX = "dcf_"
+
+_DCF_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+}
+
+_DCF_MAMBA_PREDICTIVE_SUFFIXES = {
+    # Momentum (alpha signals)
+    "mom_1m",
+    "mom_3m",
+    "mom_12m",
+    "mom_vol_adjusted",
+    "mom_sharped",
+    # Mean-reversion z-scores
+    "zscore_1m",
+    "zscore_3m",
+    # Value-momentum mix
+    "value_momentum_ratio",
+    # Directional alpha signals (NOT stress)
+    "undervaluation",          # One-sided: more negative = more undervalued (opportunity)
+    "scenario_skew",           # Directional: +/- indicates upside/downside asymmetry
+}
+
+_DCF_RISK_SUFFIXES = {
+    # Volatility-adjusted value
+    "vol_adjusted_value",
+    # Scenario uncertainty
+    "scenario_spread",         # Width of valuation uncertainty
+    # One-sided stress for overlays
+    "overextension",           # clip(log_p2fv_1y, 0, 1): high = overextended
+    "downside_skew_stress",    # clip(-scenario_skew, 0, 1): high = downside risk
+}
+
+_DCF_REGIME_SUFFIXES = {
+    # Anchor ratios (raw and log)
+    "price_to_fairvalue_1y",
+    "price_to_fairvalue_3m",
+    "price_regime",
+    "log_p2fv_1y",
+    "log_p2fv_3m",
+    "log_price_regime",
+    # Trend quality
+    "trend_slope_1m",
+    "trend_stability",
+    # Scenario positioning
+    "scenario_position",
+    # Horizon structure
+    "terminal_value_pct",
+}
+
+_QUANTILE_HYGIENE_SUFFIXES = {
+    "has_data",
+    "activity",
+    "days_since_update",
+    "hf_conf",
+}
+
+_QUANTILE_PREDICTIVE_SUFFIXES = {
+    "q50",
+    "q_median_50",
+    "q_skewness_proxy",
+    "q_tilt_direction",
+    "skew",
+    "hf_score",
+}
+
+_QUANTILE_RISK_SUFFIXES = {
+    "q_spread_95_5",
+    "q_vol_forecast",
+    "width",
+    "uncertainty",
+}
+
+
+def _quantile_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    name = str(column or "")
+    if not name.lower().startswith(_QUANTILE_PREFIX):
+        return None
+    suffix = name[len(_QUANTILE_PREFIX):].lower()
+    if suffix in _QUANTILE_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "QF:governance"
+    if suffix in _QUANTILE_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "QF:predictive"
+    if suffix in _QUANTILE_RISK_SUFFIXES:
+        return FeatureRole.RISK, "QF:risk"
+    # Default: keep quantile outputs as policy/regime
+    return FeatureRole.REGIME, "QF:policy"
+
+
+def _calibration_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route calibration columns: freshness→HYGIENE, quality→RISK, status→REGIME.
+    
+    Critical: RoleAwareContext only auto-gates on has_data/days_since_update for HYGIENE.
+    Quality metrics (overall_score, calibration_error, etc.) must be RISK to affect
+    risk_scale = 1/(1+risk_agg). Keeping them as HYGIENE does nothing useful.
+    """
+    name = str(column or "")
+    if not name.lower().startswith(_CALIB_PREFIX):
+        return None
+    suffix = name[len(_CALIB_PREFIX):].lower()
+    
+    # HYGIENE: freshness/availability gates (veto on NaN or stale)
+    if suffix in {"has_data", "activity", "days_since_update"}:
+        return FeatureRole.HYGIENE, "CAL:governance"
+    
+    # RISK: quality metrics that should shrink exposure when degraded
+    # These affect risk_scale = 1/(1+risk_agg) in RoleAwareContext
+    if suffix in {
+        "mean_calibration_error",
+        "overall_score",
+        "interval_error",
+        "quantile_error",
+        "sharpness",
+        "reliability",
+        "calibration_slope",
+        "calibration_intercept",
+        "brier_score",
+        "log_loss",
+        "expected_calibration_error",
+        "maximum_calibration_error",
+    }:
+        return FeatureRole.RISK, "CAL:quality_risk"
+    
+    # REGIME: binary/categorical status flags that modulate regime_multiplier
+    if suffix in {
+        "requires_recalibration",
+        "recalibration_flag",
+        "model_stale",
+        "quality_regime",
+    }:
+        return FeatureRole.REGIME, "CAL:status_regime"
+    
+    # Default: treat unknown calibration columns as RISK (conservative)
+    return FeatureRole.RISK, "CAL:risk_default"
+
+
+def _online_learning_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route online_learning columns: freshness→HYGIENE, trust/accuracy→RISK, drift→REGIME.
+    
+    Critical: These are meta-performance signals. They should NEVER go to Mamba.
+    Trust/accuracy metrics affect risk_scale; drift flags affect regime_multiplier.
+    """
+    name = str(column or "")
+    if not name.lower().startswith(_ONLINE_PREFIX):
+        return None
+    suffix = name[len(_ONLINE_PREFIX):].lower()
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in {"has_data", "activity", "days_since_update"}:
+        return FeatureRole.HYGIENE, "OL:governance"
+    
+    # RISK: trust/accuracy/quality metrics - shrink exposure when model is uncertain
+    if suffix in {
+        "trust_score",
+        "model_confidence",
+        "direction_accuracy",
+        "sign_accuracy",
+        "hit_rate",
+        "accuracy",
+        "quantile_accuracy",
+        "mse",
+        "mae",
+        "sharpe_estimate",
+        "information_ratio",
+        "uncertainty_estimate",
+        "prediction_variance",
+    }:
+        return FeatureRole.RISK, "OL:trust_risk"
+    
+    # REGIME: drift/retrain flags - modulate regime_multiplier
+    if suffix in {
+        "drift_flag",
+        "partial_retrain_flag",
+        "full_retrain_flag",
+        "uncertainty_compression_alert",
+        "regime_shift_detected",
+        "distribution_drift",
+        "concept_drift",
+        "covariate_drift",
+    }:
+        return FeatureRole.REGIME, "OL:drift_regime"
+    
+    # REGIME: regime probabilities (continuous modulation)
+    if suffix in {
+        "regime_prob_bull",
+        "regime_prob_bear",
+        "regime_prob_neutral",
+        "regime_probability",
+    }:
+        return FeatureRole.REGIME, "OL:regime_prob"
+    
+    # Default: treat unknown online_learning columns as RISK (conservative)
+    return FeatureRole.RISK, "OL:risk_default"
+
+
+def _cboe_term_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route cboe_term columns: ALL to portfolio parquet (RISK/REGIME), NONE to Mamba.
+    
+    Critical: cboe_term provides market stress context for overlays and policy state.
+    It should NOT be used as direct alpha in Mamba - tends to become a global risk proxy
+    that the model misuses. Keep it purely for:
+    - risk_scale modulation (RISK columns)
+    - regime_multiplier modulation (REGIME columns)
+    - policy controller state features
+    """
+    name = str(column or "")
+    # Support both prefixed and unprefixed cboe_term column names
+    name_lower = name.lower()
+    
+    # Handle prefixed columns
+    if name_lower.startswith(_CBOE_TERM_PREFIX):
+        suffix = name_lower[len(_CBOE_TERM_PREFIX):]
+    elif name_lower.startswith("cboe_term_"):
+        suffix = name_lower[len("cboe_term_"):]
+    else:
+        # Also handle raw cboe column names (from cboe_term.py output)
+        known_cboe_cols = (
+            _CBOE_TERM_HYGIENE_SUFFIXES
+            | _CBOE_TERM_RISK_SUFFIXES
+            | _CBOE_TERM_REGIME_SUFFIXES
+        )
+        if name_lower in known_cboe_cols:
+            suffix = name_lower
+        else:
+            return None
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _CBOE_TERM_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "CBOE:governance"
+    
+    # RISK: term structure levels, slopes, ratios - affect risk_scale
+    if suffix in _CBOE_TERM_RISK_SUFFIXES:
+        return FeatureRole.RISK, "CBOE:risk"
+    
+    # REGIME: change/shock features - affect regime_multiplier
+    if suffix in _CBOE_TERM_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "CBOE:regime"
+    
+    # Default: unknown cboe_term columns go to RISK (conservative, not Mamba)
+    return FeatureRole.RISK, "CBOE:risk_default"
+
+
+def _corp_actions_splits_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route corp_actions_splits columns with proper bounded recency.
+    
+    Critical: The raw days_since=9999 value corrupts role-aware regime averaging.
+    The feature builder should transform to bounded recency in [0,1]:
+        recency = exp(-min(days_since, 252)/20)
+    
+    Routing:
+    - HYGIENE: has_data, activity, days_since_update (freshness gating)
+    - REGIME: flag, post_5d, post_20d, log_ratio, count_5y, recency (regime modulation)
+    - RISK: ratio (microstructure stress affects position sizing)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_CORP_SPLITS_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_CORP_SPLITS_PREFIX):]
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _CORP_SPLITS_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "SPLITS:governance"
+    
+    # RISK: split magnitude affects microstructure stress
+    if suffix in _CORP_SPLITS_RISK_SUFFIXES:
+        return FeatureRole.RISK, "SPLITS:risk"
+    
+    # REGIME: event detection and post-event windows
+    if suffix in _CORP_SPLITS_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "SPLITS:regime"
+    
+    # Handle the problematic days_since column
+    # This should be transformed to recency, but if raw, treat as REGIME
+    if suffix == "days_since":
+        # WARNING: Raw days_since=9999 will corrupt averaging!
+        # Feature builder should transform to bounded recency.
+        return FeatureRole.REGIME, "SPLITS:days_since_raw_WARNING"
+    
+    # Default: unknown splits columns go to REGIME (conservative)
+    return FeatureRole.REGIME, "SPLITS:regime_default"
+
+
+def _correlation_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route correlation columns: predictive spillovers to Mamba, exposure/regime to portfolio.
+    
+    Routing strategy:
+    - Mamba (PREDICTIVE): lag correlations, VIX lag, return autocorrelations
+    - Portfolio (RISK): systematic exposure, correlation levels
+    - Portfolio (REGIME): decoupling, trends, cross-feature diagnostics, vol clustering
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    # Handle both prefixed and unprefixed column names
+    if name_lower.startswith(_CORRELATION_PREFIX):
+        suffix = name_lower[len(_CORRELATION_PREFIX):]
+    elif name_lower.startswith("corr_") or name_lower.startswith("acf_") or name_lower.startswith("lag_corr_"):
+        suffix = name_lower
+    else:
+        return None
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _CORRELATION_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "CORR:governance"
+    
+    # Check for Mamba predictive spillovers (these go to Mamba parquet)
+    if suffix in _CORRELATION_MAMBA_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "CORR:mamba_spillover"
+    
+    # Check for Mamba optional context
+    # Note: these are also in REGIME, but if explicitly enabled, mark as PREDICTIVE
+    # Environment variable CORRELATION_MAMBA_OPTIONAL can enable these
+    import os
+    corr_opt_raw = os.getenv("CORRELATION_MAMBA_OPTIONAL", "").strip().lower()
+    corr_opt_tokens = {t.strip() for t in corr_opt_raw.split(",") if t.strip()}
+    if suffix in _CORRELATION_MAMBA_OPTIONAL and suffix in corr_opt_tokens:
+        return FeatureRole.PREDICTIVE, "CORR:mamba_optional"
+    
+    # RISK: systematic exposure, correlation levels
+    if suffix in _CORRELATION_PORTFOLIO_RISK_SUFFIXES:
+        return FeatureRole.RISK, "CORR:risk_exposure"
+    
+    # REGIME: regime shifts, instability, cross-feature diagnostics
+    if suffix in _CORRELATION_PORTFOLIO_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "CORR:regime_stability"
+    
+    # Default: treat unknown correlation columns as RISK (conservative, to portfolio)
+    return FeatureRole.RISK, "CORR:risk_default"
+
+
+def _cross_asset_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route cross_asset columns: lead/lag predictors to Mamba, everything else to portfolio.
+    
+    CRITICAL: Regime-change fields are ABSOLUTE MAGNITUDE for proper stress aggregation.
+    RoleAwareContext treats large values as "stress"; signed values confuse the aggregator.
+    
+    Routing:
+    - Mamba (PREDICTIVE): spy_leads_stock_5d, stock_leads_spy_5d (per-asset timing alpha)
+    - Portfolio (RISK): ETF correlations, beta, vol relationships, credit/FX, risk_offness
+    - Portfolio (REGIME): beta_change_rate, beta_volatility_change, rate correlation changes,
+      coupling_change, risk_onoff_factor (for policy state)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    # Handle both prefixed and unprefixed column names
+    if name_lower.startswith(_CROSS_ASSET_PREFIX):
+        suffix = name_lower[len(_CROSS_ASSET_PREFIX):]
+    elif name_lower.startswith("cross_asset_"):
+        suffix = name_lower[len("cross_asset_"):]
+    else:
+        # Check for known unprefixed cross_asset column names
+        known_cols = (
+            _CROSS_ASSET_HYGIENE_SUFFIXES
+            | _CROSS_ASSET_MAMBA_PREDICTIVE_SUFFIXES
+            | _CROSS_ASSET_RISK_SUFFIXES
+            | _CROSS_ASSET_REGIME_SUFFIXES
+        )
+        if name_lower in known_cols:
+            suffix = name_lower
+        else:
+            return None
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _CROSS_ASSET_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "XASSET:governance"
+    
+    # Mamba predictive: lead/lag analysis (per-asset timing alpha)
+    if suffix in _CROSS_ASSET_MAMBA_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "XASSET:mamba_leadlag"
+    
+    # RISK: systematic exposure, one-sided stress signals
+    if suffix in _CROSS_ASSET_RISK_SUFFIXES:
+        return FeatureRole.RISK, "XASSET:risk"
+    
+    # REGIME: regime-break detectors (absolute magnitude) and policy state
+    if suffix in _CROSS_ASSET_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "XASSET:regime"
+    
+    # Default: unknown cross_asset columns go to RISK (conservative, to portfolio)
+    return FeatureRole.RISK, "XASSET:risk_default"
+
+
+def _dcf_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route dcf columns: momentum/z-score predictors to Mamba, anchors/stress to portfolio.
+    
+    CRITICAL: One-sided stress signals for portfolio overlays:
+    - overextension: clip(log_p2fv_1y, 0, 1) — only penalize "too expensive"
+    - downside_skew_stress: clip(-scenario_skew, 0, 1) — only penalize downside asymmetry
+    - undervaluation: clip(log_p2fv_1y, -1, 0) — directional alpha, NOT stress
+    
+    Routing:
+    - Mamba (PREDICTIVE): momentum, z-scores, value_momentum_ratio, undervaluation, scenario_skew
+    - Portfolio (RISK): vol_adjusted_value, scenario_spread, overextension, downside_skew_stress
+    - Portfolio (REGIME): anchor ratios (raw + log), trend quality, scenario_position, terminal_value_pct
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_DCF_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_DCF_PREFIX):]
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _DCF_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "DCF:governance"
+    
+    # Mamba predictive: momentum, z-scores, directional alpha
+    if suffix in _DCF_MAMBA_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "DCF:mamba_alpha"
+    
+    # RISK: one-sided stress signals for overlays
+    if suffix in _DCF_RISK_SUFFIXES:
+        return FeatureRole.RISK, "DCF:risk_stress"
+    
+    # REGIME: anchors, trend quality, scenario positioning
+    if suffix in _DCF_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "DCF:regime"
+    
+    # Default: unknown dcf columns go to REGIME (conservative, to portfolio)
+    return FeatureRole.REGIME, "DCF:regime_default"
+
+
+# ============================================================================
+# Dividends family role overrides (Jan 2026)
+# ============================================================================
+_DIVIDENDS_PREFIX = "dividends_"
+
+_DIVIDENDS_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+})
+
+_DIVIDENDS_PREDICTIVE_SUFFIXES = frozenset({
+    # Only if labels are dividend-adjusted AND shifted
+    "dividend_event_intensity",
+})
+
+_DIVIDENDS_RISK_SUFFIXES = frozenset({
+    # Yield metrics
+    "dividend_yield_est",
+    "dividend_yield_zscore",
+    # One-sided event stress
+    "dividend_event_stress",
+})
+
+_DIVIDENDS_REGIME_SUFFIXES = frozenset({
+    # Event proximity
+    "days_to_ex_dividend",
+    "ex_dividend_window_strength",
+    # Structural
+    "dividend_frequency",
+    "dividend_amount",
+})
+
+
+def _dividends_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route dividends columns: event_intensity to Mamba (conditional), rest to portfolio.
+    
+    CRITICAL: dividend_event_stress is one-sided RISK for overlays:
+    - dividend_event_stress = window_strength × clip(|amount/price|, 0, 0.10) × 10 → [0,1]
+    
+    Routing:
+    - Mamba (PREDICTIVE): dividend_event_intensity (only if labels are adjusted + shifted)
+    - Portfolio (RISK): yield metrics + dividend_event_stress
+    - Portfolio (REGIME): event proximity + structural classifiers
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_DIVIDENDS_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_DIVIDENDS_PREFIX):]
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _DIVIDENDS_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "DIVIDENDS:governance"
+    
+    # Mamba predictive (conditional on label pipeline)
+    if suffix in _DIVIDENDS_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "DIVIDENDS:mamba_conditional"
+    
+    # RISK: yield metrics + one-sided event stress
+    if suffix in _DIVIDENDS_RISK_SUFFIXES:
+        return FeatureRole.RISK, "DIVIDENDS:risk"
+    
+    # REGIME: event proximity + structural
+    if suffix in _DIVIDENDS_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "DIVIDENDS:regime"
+    
+    # Default: unknown dividends columns go to REGIME (conservative, to portfolio)
+    return FeatureRole.REGIME, "DIVIDENDS:regime_default"
+
+
+# ============================================================================
+# Earnings family role overrides (Jan 2026)
+# ============================================================================
+_EARNINGS_PREFIX = "earnings_"
+
+_EARNINGS_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+})
+
+_EARNINGS_MAMBA_PREDICTIVE_SUFFIXES = frozenset({
+    # Core alpha signals (SHIFTED to prevent leakage)
+    "eps_surprise_pct",
+    "revenue_surprise_pct",
+    # Growth trends
+    "eps_growth_qoq",
+    "eps_growth_yoy",
+    "revenue_growth_qoq",
+    "revenue_growth_yoy",
+    # Beat patterns (HIGH ALPHA)
+    "beat_streak",
+    "beat_rate_3y",
+    # Revisions (CRITICAL ALPHA)
+    "revision_breadth",
+    # Event decay (PEAD capture)
+    "event_decay",
+})
+
+_EARNINGS_RISK_SUFFIXES = frozenset({
+    # Uncertainty / volatility
+    "miss_streak",
+    "surprise_volatility",
+    "estimate_dispersion",
+    # One-sided event stress (magnitude-based)
+    "pre_event_stress",
+    "post_event_stress",
+})
+
+_EARNINGS_REGIME_SUFFIXES = frozenset({
+    # Event timing (also useful for policy state)
+    "days_since_earnings",
+    "days_to_next_earnings",
+})
+
+
+def _earnings_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route earnings columns: surprises/growth/revisions to Mamba, stress/dispersion to portfolio.
+    
+    CRITICAL: Leakage prevention
+    - Surprise features (eps_surprise_pct, revenue_surprise_pct) are SHIFTED by 1 day
+    - If day t bar includes earnings reaction, surprise is only known after release
+    
+    CRITICAL: One-sided stress signals for portfolio overlays:
+    - pre_event_stress = exp(-days_to_next / tau_pre) — reduces size before uncertainty
+    - post_event_stress = exp(-days_since / tau_post) — suppresses post-event over-sizing
+    
+    Routing:
+    - Mamba (PREDICTIVE): surprises, growth, beat patterns, revisions, event_decay
+    - Portfolio (RISK): miss_streak, surprise_volatility, estimate_dispersion, event stress
+    - Portfolio (REGIME): event timing (days_since, days_to_next)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_EARNINGS_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_EARNINGS_PREFIX):]
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _EARNINGS_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "EARNINGS:governance"
+    
+    # Mamba predictive: surprises, growth, beat patterns, revisions
+    if suffix in _EARNINGS_MAMBA_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "EARNINGS:mamba_alpha"
+    
+    # RISK: uncertainty + one-sided event stress
+    if suffix in _EARNINGS_RISK_SUFFIXES:
+        return FeatureRole.RISK, "EARNINGS:risk"
+    
+    # REGIME: event timing
+    if suffix in _EARNINGS_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "EARNINGS:regime"
+    
+    # Default: unknown earnings columns go to RISK (conservative, to portfolio)
+    return FeatureRole.RISK, "EARNINGS:risk_default"
+
+
+# ============================================================================
+# Econ events calendar family role overrides (Jan 2026)
+# ============================================================================
+_ECON_EVENTS_PREFIX = "econ_events_calendar_"
+
+_ECON_EVENTS_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+})
+
+# Per-event HYGIENE (surprise_has_forecast_*)
+_ECON_EVENTS_HYGIENE_PATTERNS = frozenset({
+    "surprise_has_forecast_",
+})
+
+# Mamba compact context (shifted, leak-safe)
+_ECON_EVENTS_MAMBA_PREDICTIVE_SUFFIXES = frozenset({
+    # Shifted pulse surprises (signed, for directional context)
+    "pulse_surprise_cpi",
+    "pulse_surprise_fomc",
+    "pulse_surprise_nfp",
+    "pulse_surprise_gdp",
+    "pulse_surprise_pce",
+    "pulse_surprise_unemployment",
+    "pulse_surprise_retail_sales",
+    "pulse_surprise_ism",
+    "pulse_surprise_core_cpi",
+    # Pulse strength (magnitude only)
+    "pulse_strength_cpi",
+    "pulse_strength_fomc",
+    "pulse_strength_nfp",
+    "pulse_strength_gdp",
+    "pulse_strength_pce",
+    "pulse_strength_unemployment",
+    "pulse_strength_retail_sales",
+    "pulse_strength_ism",
+    "pulse_strength_core_cpi",
+    # Bounded proximity (for event imminence)
+    "prox_next_cpi",
+    "prox_next_fomc",
+    "prox_next_nfp",
+    "prox_next_gdp",
+    "prox_next_pce",
+    "prox_next_unemployment",
+    "prox_next_retail_sales",
+    "prox_next_ism",
+    "prox_next_core_cpi",
+})
+
+# Portfolio RISK (stress aggregation, magnitude only)
+_ECON_EVENTS_RISK_SUFFIXES = frozenset({
+    # Composite macro stress for overlays
+    "macro_shock_major",
+    "macro_upcoming_major",
+})
+
+# Portfolio REGIME (regime/policy state)
+_ECON_EVENTS_REGIME_SUFFIXES = frozenset({
+    # Pre/post windows
+    "pre_window_3d_cpi",
+    "pre_window_3d_fomc",
+    "pre_window_3d_nfp",
+    "pre_window_3d_gdp",
+    "pre_window_3d_pce",
+    "pre_window_3d_unemployment",
+    "pre_window_3d_retail_sales",
+    "pre_window_3d_ism",
+    "pre_window_3d_core_cpi",
+    "post_window_3d_cpi",
+    "post_window_3d_fomc",
+    "post_window_3d_nfp",
+    "post_window_3d_gdp",
+    "post_window_3d_pce",
+    "post_window_3d_unemployment",
+    "post_window_3d_retail_sales",
+    "post_window_3d_ism",
+    "post_window_3d_core_cpi",
+    # Pulse occurrence (binary)
+    "pulse_occurrence_cpi",
+    "pulse_occurrence_fomc",
+    "pulse_occurrence_nfp",
+    "pulse_occurrence_gdp",
+    "pulse_occurrence_pce",
+    "pulse_occurrence_unemployment",
+    "pulse_occurrence_retail_sales",
+    "pulse_occurrence_ism",
+    "pulse_occurrence_core_cpi",
+    # Event occurrence (binary)
+    "event_occurrence_cpi",
+    "event_occurrence_fomc",
+    "event_occurrence_nfp",
+    "event_occurrence_gdp",
+    "event_occurrence_pce",
+    "event_occurrence_unemployment",
+    "event_occurrence_retail_sales",
+    "event_occurrence_ism",
+    "event_occurrence_core_cpi",
+    # Recency (bounded, for regime modulation)
+    "recency_last_cpi",
+    "recency_last_fomc",
+    "recency_last_nfp",
+    "recency_last_gdp",
+    "recency_last_pce",
+    "recency_last_unemployment",
+    "recency_last_retail_sales",
+    "recency_last_ism",
+    "recency_last_core_cpi",
+    # Composite signed (directional, for policy state)
+    "macro_surprise_signed",
+})
+
+
+def _econ_events_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route econ_events_calendar columns: compact context to Mamba, regime/risk to portfolio.
+    
+    CRITICAL: 9999 sentinel replacement
+    - Raw days_to_next_* and days_since_last_* columns are DEPRECATED
+    - Use bounded prox_next_* and recency_last_* instead (safe for aggregation)
+    
+    Routing:
+    - Mamba (PREDICTIVE): pulse_surprise_*, pulse_strength_*, prox_next_* (compact context)
+    - Portfolio (RISK): macro_shock_major, macro_upcoming_major (stress aggregation)
+    - Portfolio (REGIME): windows, occurrences, recency, macro_surprise_signed
+    - DEPRECATED (keep but exclude from Mamba): days_to_next_*, days_since_last_*, surprise_z_*
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_ECON_EVENTS_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_ECON_EVENTS_PREFIX):]
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _ECON_EVENTS_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "ECON:governance"
+    
+    # HYGIENE: per-event forecast presence
+    for pattern in _ECON_EVENTS_HYGIENE_PATTERNS:
+        if suffix.startswith(pattern):
+            return FeatureRole.HYGIENE, "ECON:forecast_flag"
+    
+    # Mamba predictive: pulse surprises, pulse strength, bounded proximity
+    if suffix in _ECON_EVENTS_MAMBA_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "ECON:mamba_context"
+    
+    # RISK: composite stress signals
+    if suffix in _ECON_EVENTS_RISK_SUFFIXES:
+        return FeatureRole.RISK, "ECON:risk_stress"
+    
+    # REGIME: windows, occurrences, recency, composites
+    if suffix in _ECON_EVENTS_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "ECON:regime"
+    
+    # Raw days_to_next / days_since_last (DEPRECATED but keep for backward compat)
+    if suffix.startswith("days_to_next_") or suffix.startswith("days_since_last_"):
+        return FeatureRole.REGIME, "ECON:deprecated_days_sentinel"
+    
+    # Surprise z-scores (keep in portfolio, not Mamba by default)
+    if suffix.startswith("surprise_z_") or suffix.startswith("surprise_w_z_"):
+        return FeatureRole.PREDICTIVE, "ECON:surprise_zscore"
+    
+    # Default: unknown econ_events columns go to REGIME (to portfolio)
+    return FeatureRole.REGIME, "ECON:regime_default"
+
+
+# ============================================================================
+# Exchange calendar family role overrides (Jan 2026)
+# ============================================================================
+_EXCHANGE_CALENDAR_PREFIX = "exchange_calendar_"
+
+_EXCHANGE_CALENDAR_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+})
+
+_EXCHANGE_CALENDAR_RISK_SUFFIXES = frozenset({
+    # Composite liquidity stress for position sizing / turnover control
+    "liquidity_stress",
+})
+
+_EXCHANGE_CALENDAR_REGIME_SUFFIXES = frozenset({
+    # Event flags
+    "is_holiday_adjacent",
+    "is_half_day",
+    # Bounded proximity/recency (replace 9999 sentinels)
+    "holiday_prox",
+    "holiday_recency",
+    # Raw days (DEPRECATED but kept for backward compat)
+    "days_to_holiday",
+    "days_since_holiday",
+})
+
+
+def _exchange_calendar_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route exchange_calendar columns: ALL to portfolio, NONE to Mamba.
+    
+    This family provides execution/microstructure regime context. It should influence:
+    - Position sizing conservatism (via liquidity_stress → risk_scale)
+    - Turnover/participation behavior (via policy controller)
+    - Transaction cost assumptions (spreads widen around holidays/half-days)
+    
+    It should NOT be a primary alpha source for Mamba (teaches model mechanical
+    liquidity effects rather than returns).
+    
+    CRITICAL: 9999 sentinel replacement
+    - Raw days_to_holiday / days_since_holiday are DEPRECATED
+    - Use holiday_prox / holiday_recency instead (bounded [0,1])
+    - Use liquidity_stress composite for execution overlays
+    
+    Routing:
+    - Portfolio (RISK): liquidity_stress (affects position sizing via risk_scale)
+    - Portfolio (REGIME): all other columns (event flags, bounded proximity/recency)
+    - Mamba: NONE by default (execution context, not alpha)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_EXCHANGE_CALENDAR_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_EXCHANGE_CALENDAR_PREFIX):]
+    
+    # HYGIENE: freshness/availability gates
+    if suffix in _EXCHANGE_CALENDAR_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "XCAL:governance"
+    
+    # RISK: liquidity stress for position sizing
+    if suffix in _EXCHANGE_CALENDAR_RISK_SUFFIXES:
+        return FeatureRole.RISK, "XCAL:liquidity_risk"
+    
+    # REGIME: event flags, bounded proximity/recency
+    if suffix in _EXCHANGE_CALENDAR_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "XCAL:regime"
+    
+    # Default: unknown exchange_calendar columns go to REGIME (conservative)
+    return FeatureRole.REGIME, "XCAL:regime_default"
+
+
+# ============================================================================
+# FIN_G1 (Liquidity) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G1_PREFIX = "fin_g1_"
+
+_FIN_G1_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+})
+
+_FIN_G1_RISK_SUFFIXES = frozenset({
+    # STRESS features: higher = worse (safe for risk aggregation)
+    "liquidity_stress",
+    "quick_stress",
+    "cash_stress",
+    "liquidity_trend_stress",
+    # Z-score (can indicate stress when negative)
+    "liquidity_zscore_5y",
+})
+
+_FIN_G1_REGIME_SUFFIXES = frozenset({
+    # Trend direction (regime awareness)
+    "liquidity_trend_3y",
+})
+
+# Raw ratios: PREDICTIVE but only for long-horizon Mamba (optional)
+_FIN_G1_RAW_RATIO_SUFFIXES = frozenset({
+    "current_ratio",
+    "quick_ratio",
+    "cash_ratio",
+})
+
+
+def _fin_g1_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g1 (liquidity) columns: stress features to portfolio, raw ratios optional for Mamba.
+    
+    CRITICAL: Raw ratios are HIGHER = SAFER, which inverts RoleAwareContext risk aggregation.
+    Use *_stress features for portfolio risk overlays (higher = worse).
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update
+    - Portfolio (RISK): liquidity_stress, quick_stress, cash_stress, liquidity_trend_stress, liquidity_zscore_5y
+    - Portfolio (REGIME): liquidity_trend_3y
+    - Mamba (PREDICTIVE, optional): current_ratio, quick_ratio, cash_ratio (only if horizon >= 21d)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G1_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G1_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G1_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G1:governance"
+    
+    # RISK: stress features (already inverted, higher = worse)
+    if suffix in _FIN_G1_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G1:liquidity_stress"
+    
+    # REGIME
+    if suffix in _FIN_G1_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "G1:regime"
+    
+    # Raw ratios: PREDICTIVE (for long-horizon Mamba, optional)
+    # Note: routing decision is in prep_families.py; here we mark intent
+    if suffix in _FIN_G1_RAW_RATIO_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G1:raw_ratio_optional"
+    
+    return FeatureRole.REGIME, "G1:regime_default"
+
+
+# ============================================================================
+# FIN_G2 (Leverage) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G2_PREFIX = "fin_g2_"
+
+_FIN_G2_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+})
+
+_FIN_G2_RISK_SUFFIXES = frozenset({
+    # STRESS features: higher = worse (safe for risk aggregation)
+    "interest_coverage_stress",
+    # Raw leverage ratios (already higher = worse direction)
+    "debt_to_equity",
+    "debt_to_assets",
+    "equity_multiplier",
+    "net_debt_to_ebitda",
+    "net_debt_to_fcf",
+    "interest_burden",
+    # Robust transforms
+    "debt_to_equity_robust",
+    "net_debt_to_ebitda_robust",
+    # Z-score (can indicate stress when extreme)
+    "leverage_zscore_5y",
+})
+
+_FIN_G2_REGIME_SUFFIXES = frozenset({
+    # Trend direction (regime awareness)
+    "leverage_trend_3y",
+})
+
+# Raw coverage: PREDICTIVE but needs inversion for portfolio
+_FIN_G2_COVERAGE_SUFFIXES = frozenset({
+    "interest_coverage",  # Higher = safer; use interest_coverage_stress for portfolio
+})
+
+
+def _fin_g2_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g2 (leverage) columns: leverage stress to portfolio, coverage inverted.
+    
+    CRITICAL: interest_coverage is HIGHER = SAFER. Use interest_coverage_stress for portfolio.
+    Debt ratios are already HIGHER = WORSE, so they're safe for risk aggregation.
+    Use robust transforms (signed_log1p) for exploding ratios.
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update
+    - Portfolio (RISK): interest_coverage_stress, debt_to_*, leverage_zscore_5y, robust transforms
+    - Portfolio (REGIME): leverage_trend_3y
+    - Mamba (PREDICTIVE, optional): raw ratios + interest_coverage (only if horizon >= 21d)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G2_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G2_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G2_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G2:governance"
+    
+    # RISK: leverage stress features
+    if suffix in _FIN_G2_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G2:leverage_stress"
+    
+    # REGIME
+    if suffix in _FIN_G2_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "G2:regime"
+    
+    # Coverage: PREDICTIVE (but use _stress variant for portfolio risk)
+    if suffix in _FIN_G2_COVERAGE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G2:coverage_optional"
+    
+    # Dollar amounts
+    if suffix in {"total_debt", "long_term_debt"}:
+        return FeatureRole.REGIME, "G2:debt_levels"
+    
+    return FeatureRole.REGIME, "G2:regime_default"
+
+
+# ============================================================================
+# FIN_G3 (Efficiency) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G3_PREFIX = "fin_g3_"
+
+_FIN_G3_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+})
+
+_FIN_G3_RISK_SUFFIXES = frozenset({
+    # STRESS features: higher = worse (safe for risk aggregation)
+    "ccc_stress",
+    # Turnover volatility (higher = more instability = worse)
+    "turnover_volatility_3y",
+})
+
+_FIN_G3_REGIME_SUFFIXES = frozenset({
+    # Days outstanding (regime/ops-conditioners)
+    "dsos",
+    "dios",
+    "dpos",
+    # Cash conversion cycle (raw)
+    "ccc",
+})
+
+# Raw turnover ratios: industry-structural, need sector normalization for Mamba
+_FIN_G3_TURNOVER_SUFFIXES = frozenset({
+    "asset_turnover",
+    "inventory_turnover",
+    "receivables_turnover",
+    "payables_turnover",
+})
+
+
+def _fin_g3_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g3 (efficiency) columns: stress to portfolio, turnover ratios optional for Mamba.
+    
+    CRITICAL: Efficiency ratios are INDUSTRY-STRUCTURAL. If fed raw, the model may learn
+    "industry ID" rather than alpha. Prefer sector-normalized versions or keep out of Mamba.
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update
+    - Portfolio (RISK): ccc_stress, turnover_volatility_3y
+    - Portfolio (REGIME): dsos, dios, dpos, ccc
+    - Mamba (PREDICTIVE, optional): sector-normalized turnover ratios only
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G3_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G3_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G3_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G3:governance"
+    
+    # RISK: stress features
+    if suffix in _FIN_G3_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G3:efficiency_stress"
+    
+    # REGIME: days outstanding
+    if suffix in _FIN_G3_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "G3:regime"
+    
+    # Raw turnover ratios: PREDICTIVE (but industry-structural, use caution)
+    if suffix in _FIN_G3_TURNOVER_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G3:turnover_optional"
+    
+    return FeatureRole.REGIME, "G3:regime_default"
+
+
+def _candle_mechanics_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    name = str(column or "")
+    if not name.lower().startswith(_CANDLE_PREFIX):
+        return None
+    suffix = name[len(_CANDLE_PREFIX):].lower()
+
+    # Governance
+    if suffix in {"has_data", "activity", "days_since_update", "confidence"}:
+        return FeatureRole.HYGIENE, "CM:governance"
+
+    # Policy / risk / regime
+    if suffix in {
+        "range_atr14",
+        "atr_ratio_14_60",
+        "rv_5",
+        "rv_20",
+        "dir_change",
+        "inside_bar",
+        "outside_bar",
+        "ret_1d",
+        "dow_1",
+        "dow_2",
+        "dow_3",
+        "dow_4",
+        "dow_5",
+        "moy_1",
+        "moy_2",
+        "moy_3",
+        "moy_4",
+        "moy_5",
+        "moy_6",
+        "moy_7",
+        "moy_8",
+        "moy_9",
+        "moy_10",
+        "moy_11",
+        "moy_12",
+    }:
+        return FeatureRole.REGIME, "CM:policy"
+
+    # Predictive default
+    return FeatureRole.PREDICTIVE, "CM:predictive"
+
+
+def _alt_signals_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    name = str(column or "")
+    if not name.lower().startswith(_ALT_SIGNALS_PREFIX):
+        return None
+    suffix = name[len(_ALT_SIGNALS_PREFIX):].lower()
+    if suffix in _ALT_SIGNALS_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "ALT:governance"
+    if suffix in _ALT_SIGNALS_RISK_SUFFIXES:
+        return FeatureRole.RISK, "ALT:risk"
+    if suffix in _ALT_SIGNALS_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "ALT:regime"
+    if suffix in _ALT_SIGNALS_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "ALT:predictive"
+    # Unknown alt-signals columns default to family intent (defer to later rules).
+    return None
+
+
+def _arima_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    name = str(column or "")
+    if not name.lower().startswith(_ARIMA_PREFIX):
+        return None
+    suffix = name[len(_ARIMA_PREFIX):].lower()
+    if suffix in _ARIMA_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "ARIMA:governance"
+    if suffix in _ARIMA_RISK_SUFFIXES:
+        return FeatureRole.RISK, "ARIMA:risk"
+    if suffix in _ARIMA_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "ARIMA:regime"
+    if suffix in _ARIMA_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "ARIMA:predictive"
+    return None
 
 
 def _safe_numeric(series: pd.Series) -> pd.Series:
@@ -517,33 +1966,97 @@ def infer_feature_role_with_reason(
     if column in overrides:
         return overrides[column], "override"
 
+    alt_override = _alt_signals_role_override(column)
+    if alt_override is not None:
+        return alt_override
+
+    arima_override = _arima_role_override(column)
+    if arima_override is not None:
+        return arima_override
+
+    quantile_override = _quantile_role_override(column)
+    if quantile_override is not None:
+        return quantile_override
+
+    calib_override = _calibration_role_override(column)
+    if calib_override is not None:
+        return calib_override
+
+    online_override = _online_learning_role_override(column)
+    if online_override is not None:
+        return online_override
+
+    candle_override = _candle_mechanics_role_override(column)
+    if candle_override is not None:
+        return candle_override
+
+    # CBOE term structure - all columns route to portfolio (RISK/REGIME)
+    cboe_override = _cboe_term_role_override(column)
+    if cboe_override is not None:
+        return cboe_override
+
+    # Corp actions splits - bounded recency, regime/risk overlays
+    splits_override = _corp_actions_splits_role_override(column)
+    if splits_override is not None:
+        return splits_override
+
+    # Correlation - predictive spillovers to Mamba, exposure/regime to portfolio
+    corr_override = _correlation_role_override(column)
+    if corr_override is not None:
+        return corr_override
+
+    # Cross-asset - lead/lag to Mamba, everything else (abs magnitude regime-breaks) to portfolio
+    xasset_override = _cross_asset_role_override(column)
+    if xasset_override is not None:
+        return xasset_override
+
+    # DCF - momentum/z-scores to Mamba, anchors/stress (one-sided) to portfolio
+    dcf_override = _dcf_role_override(column)
+    if dcf_override is not None:
+        return dcf_override
+
+    # Dividends - event_intensity to Mamba (conditional), yield/stress to portfolio
+    dividends_override = _dividends_role_override(column)
+    if dividends_override is not None:
+        return dividends_override
+
+    # Earnings - surprises/growth to Mamba, stress/dispersion to portfolio
+    earnings_override = _earnings_role_override(column)
+    if earnings_override is not None:
+        return earnings_override
+
+    # Econ events calendar - compact context to Mamba, regime/risk to portfolio
+    econ_override = _econ_events_role_override(column)
+    if econ_override is not None:
+        return econ_override
+
+    # Exchange calendar - ALL to portfolio (execution/microstructure context)
+    xcal_override = _exchange_calendar_role_override(column)
+    if xcal_override is not None:
+        return xcal_override
+
+    # FIN_G1 (Liquidity) - stress to portfolio, raw ratios optional for long-horizon Mamba
+    fin_g1_override = _fin_g1_role_override(column)
+    if fin_g1_override is not None:
+        return fin_g1_override
+
+    # FIN_G2 (Leverage) - stress to portfolio, interest_coverage inverted
+    fin_g2_override = _fin_g2_role_override(column)
+    if fin_g2_override is not None:
+        return fin_g2_override
+
+    # FIN_G3 (Efficiency) - stress to portfolio, turnover ratios industry-structural
+    fin_g3_override = _fin_g3_role_override(column)
+    if fin_g3_override is not None:
+        return fin_g3_override
+
     name = str(column).lower()
 
-    # A1: Hygiene / meta (never normalize)
-    if any(tok in name for tok in HYGIENE_TOKENS):
-        return FeatureRole.HYGIENE, "A1:name"
+    # Explicit governance suffixes (structural, not keyword heuristics)
+    if name.endswith("_has_data") or name.endswith("_activity") or name.endswith("_days_since_update") or name.endswith("__days_since_update"):
+        return FeatureRole.HYGIENE, "A1:governance_suffix"
 
-    # A2: Regime / context (probabilities/booleans)
-    if any(tok in name for tok in REGIME_TOKENS):
-        return FeatureRole.REGIME, "A2:name"
-
-    # A3: Risk / uncertainty (note: avoid misclassifying spread_z)
-    risk_name_match = any(tok in name for tok in RISK_TOKENS)
-    if "spread_z" in name:
-        risk_name_match = False
-    if risk_name_match:
-        return FeatureRole.RISK, "A3:name"
-
-    # A4: Predictive
-    if any(tok in name for tok in PREDICTIVE_TOKENS):
-        return FeatureRole.PREDICTIVE, "A4:name"
-
-    # A2b: Boolish heuristic (high confidence) for columns with no matching tokens.
-    # Keep this after keyword matching to avoid hijacking e.g. iv_level-like risk signals.
-    if _is_boolish(series):
-        return FeatureRole.REGIME, "A2:boolish"
-
-    # A5: Fallback to family intent (only for ambiguous features)
+    # Fallback to family intent only.
     return family_primary_intent, f"A5:family_intent:{family_primary_intent.value}"
 
 

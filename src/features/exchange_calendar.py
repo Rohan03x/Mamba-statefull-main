@@ -16,6 +16,15 @@ Features:
 - exchange_calendar_days_since_holiday (calendar days since last holiday; 9999 if none)
 - exchange_calendar_is_half_day (early close session)
 
+Critical fixes (Jan 2026):
+- Replace 9999 sentinels with bounded proximity/recency signals:
+  - holiday_prox = exp(-min(days_to_holiday, 60) / 3)  → peaks near holiday
+  - holiday_recency = exp(-min(days_since_holiday, 60) / 3)  → decays after holiday
+- Add calendar_liquidity_stress composite for position sizing / turnover control:
+  - calendar_liquidity_stress = clip(max(is_half_day, is_holiday_adjacent) + 0.5*holiday_prox + 0.3*holiday_recency, 0, 1)
+
+Routing: Portfolio parquet ONLY (execution/microstructure context, not Mamba alpha)
+
 DST transition flag intentionally omitted (daily panel only).
 """
 
@@ -28,6 +37,34 @@ import pandas as pd
 
 from src.dcf_lab.utils.timealign import nyse_sessions_in_range
 from src.data_sources.eodhd_provider import EODHDProvider
+
+
+# ---------------------------------------------------------------------------
+# Bounded proximity / recency transforms (replace 9999 sentinels)
+# ---------------------------------------------------------------------------
+
+def _holiday_prox(days_to: pd.Series, *, cap: float = 60.0, tau: float = 3.0) -> pd.Series:
+    """Convert days_to_holiday (with 9999 sentinel) to bounded proximity in [0,1].
+
+    Formula: exp(-min(days_to, cap) / tau)
+    - peaks at 1.0 when holiday is today (days_to=0)
+    - decays quickly (tau=3) because holiday effects are very local
+    - 9999 values → effectively 0.0
+    """
+    clamped = days_to.clip(lower=0.0, upper=cap).replace(9999.0, cap).fillna(cap)
+    return np.exp(-clamped / tau)
+
+
+def _holiday_recency(days_since: pd.Series, *, cap: float = 60.0, tau: float = 3.0) -> pd.Series:
+    """Convert days_since_holiday (with 9999 sentinel) to bounded recency in [0,1].
+
+    Formula: exp(-min(days_since, cap) / tau)
+    - peaks at 1.0 when holiday just passed (days_since=0)
+    - decays quickly (tau=3) because post-holiday effects are brief
+    - 9999 values → effectively 0.0
+    """
+    clamped = days_since.clip(lower=0.0, upper=cap).replace(9999.0, cap).fillna(cap)
+    return np.exp(-clamped / tau)
 
 
 def _infer_exchange(symbol: str) -> str:
@@ -172,6 +209,26 @@ def fetch(symbol: str, start: str, end: str, *, exchange: Optional[str] = None) 
     out["exchange_calendar_days_to_holiday"] = days_to
     out["exchange_calendar_days_since_holiday"] = days_since
     out["exchange_calendar_is_half_day"] = is_half
+
+    # -------------------------------------------------------------------------
+    # Bounded proximity/recency (replace 9999 sentinels for safe aggregation)
+    # Holiday effects are very local → tau=3 days
+    # -------------------------------------------------------------------------
+    out["exchange_calendar_holiday_prox"] = _holiday_prox(days_to, cap=60.0, tau=3.0)
+    out["exchange_calendar_holiday_recency"] = _holiday_recency(days_since, cap=60.0, tau=3.0)
+
+    # -------------------------------------------------------------------------
+    # Composite liquidity stress (for position sizing / turnover control)
+    # calendar_liquidity_stress = max(is_half_day, is_holiday_adjacent) + 0.5*holiday_prox + 0.3*holiday_recency
+    # Clipped to [0, 1]
+    # -------------------------------------------------------------------------
+    base_stress = np.maximum(is_half.values.astype(float), is_adj.values.astype(float))
+    prox_contrib = 0.5 * out["exchange_calendar_holiday_prox"].values.astype(float)
+    recency_contrib = 0.3 * out["exchange_calendar_holiday_recency"].values.astype(float)
+    out["exchange_calendar_liquidity_stress"] = pd.Series(
+        np.clip(base_stress + prox_contrib + recency_contrib, 0.0, 1.0),
+        index=sessions
+    )
 
     sources = []
     if eodhd_ok:

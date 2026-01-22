@@ -1,11 +1,11 @@
 """
 HEDGE-FUND GRADE: Earnings Analyzer - Event & Quality Signals
 
-Extracts 14-16 earnings-related features from EODHD fundamentals data:
+Extracts 16-18 earnings-related features from EODHD fundamentals data:
 
 A. Core Earnings (2-4):
-   - eps_surprise_pct: (actual - estimate) / estimate * 100
-   - revenue_surprise_pct: Revenue surprise percentage
+   - eps_surprise_pct: (actual - estimate) / estimate * 100 [SHIFTED by 1 day to prevent leakage]
+   - revenue_surprise_pct: Revenue surprise percentage [SHIFTED by 1 day]
    [OPTIONAL: eps_surprise_z, revenue_surprise_z (rolling 3-5y normalization)]
    REMOVED: eps_actual, eps_estimate, revenue_actual, revenue_estimate
    Reason: Scale issues, not cross-sectionally comparable, encourage memorization
@@ -40,7 +40,18 @@ G. Anticipation (1):
    - days_to_next_earnings: Days until next expected earnings
    (pre-earnings positioning, volatility rises before events)
 
-Total: 14-16 features (optimal size for earnings family)
+H. Event Stress (2) - NEW for portfolio overlays:
+   - earnings_pre_event_stress: exp(-days_to_next / tau_pre), tau_pre~7
+     One-sided RISK signal for reducing size before uncertainty
+   - earnings_post_event_stress: exp(-days_since / tau_post), tau_post~5
+     Suppresses over-sizing during immediate post-event turbulence
+
+Total: 16-18 features (optimal size for earnings family)
+
+LEAKAGE PREVENTION:
+   - Surprise features (eps_surprise_pct, revenue_surprise_pct) are SHIFTED by 1 day
+   - If day t bar includes earnings reaction, surprise is only known after release
+   - Safe rule: surprise at t can only be used for decision at t+1
 
 Data Source: EODHD Fundamentals API
 Update Frequency: Quarterly (within days of earnings release)
@@ -563,6 +574,38 @@ class EarningsAnalyzer:
         # If the day is beyond the last known report, treat as unknown (0)
         days_to_next[pos >= len(event_dates)] = 0.0
         daily['days_to_next_earnings'] = np.clip(days_to_next, 0.0, 120.0)
+
+        # ================================================================
+        # HEDGE-FUND: Pre/Post Event Stress (one-sided RISK signals)
+        # ================================================================
+        # These are magnitude-based stress signals for portfolio overlays.
+        # - pre_event_stress: peaks at event, decays forward (reduces size before uncertainty)
+        # - post_event_stress: suppresses over-sizing during immediate post-event turbulence
+        tau_pre = 7.0   # Days before earnings with elevated stress
+        tau_post = 5.0  # Days after earnings with elevated stress
+        
+        # Pre-event stress: exp(-days_to_next / tau_pre)
+        # Higher when approaching earnings (days_to_next is small)
+        daily['earnings_pre_event_stress'] = np.exp(-daily['days_to_next_earnings'] / tau_pre)
+        
+        # Post-event stress: exp(-days_since / tau_post)
+        # Higher immediately after earnings, decays over ~5 days
+        daily['earnings_post_event_stress'] = np.exp(-days_since / tau_post)
+        
+        # ================================================================
+        # LEAKAGE PREVENTION: Shift surprise features by 1 day
+        # ================================================================
+        # Earnings surprises are known AFTER the release. If day t bar includes
+        # the earnings reaction, then eps_surprise_pct is only known after release.
+        # Safe rule: surprise_feature at t can only be used for decision at t+1.
+        surprise_cols = [
+            'eps_surprise_pct',
+            'revenue_surprise_pct',
+            'surprise_percent',
+        ]
+        for col in surprise_cols:
+            if col in daily.columns:
+                daily[col] = daily[col].shift(1).fillna(0.0)
 
         daily = daily.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
         return daily

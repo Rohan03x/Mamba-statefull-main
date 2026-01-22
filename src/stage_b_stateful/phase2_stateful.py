@@ -23,6 +23,7 @@ from src.stage_b.sequence_models import (
     train_mamba_fold,
 )
 from src.stage_b_stateful.maturity import maturity_cutoff
+from src.portfolio.policy_controller import PolicyAction, PolicyController
 
 
 logger = logging.getLogger(__name__)
@@ -2100,6 +2101,247 @@ def _rolling_realized_vol(net_returns: np.ndarray, *, window: int, trading_days:
     return float(std * np.sqrt(float(trading_days)))
 
 
+def _policy_reward_from_window(
+    *,
+    net_returns: np.ndarray,
+    turnover: np.ndarray,
+    equity: np.ndarray,
+    start: int,
+    end: int,
+    lambda_turnover: float,
+    lambda_drawdown: float,
+) -> float:
+    if end < start:
+        return 0.0
+    s = int(max(0, start))
+    e = int(min(len(net_returns) - 1, end))
+    if e < s:
+        return 0.0
+    r = np.asarray(net_returns[s : e + 1], dtype=float)
+    t = np.asarray(turnover[s : e + 1], dtype=float)
+    eq = np.asarray(equity[s : e + 1], dtype=float)
+    pnl = float(np.sum(np.where(np.isfinite(r), r, 0.0)))
+    turn_mean = float(np.mean(np.where(np.isfinite(t), t, 0.0))) if t.size else 0.0
+    dd = float(_max_drawdown_from_equity(pd.Series(eq))) if eq.size else 0.0
+    return float(pnl - float(lambda_turnover) * turn_mean - float(lambda_drawdown) * dd)
+
+
+def _policy_state_vector(
+    *,
+    i: int,
+    horizon: int,
+    returns_df: pd.DataFrame,
+    net_ret: np.ndarray,
+    turnover: np.ndarray,
+    costs: np.ndarray,
+    equity: np.ndarray,
+    mu_mat: np.ndarray,
+    fwd_ret_mat: np.ndarray,
+    market_regime: pd.Series,
+    state_window: int = 20,
+    sharpe_window: int = 63,
+    calib_window: int = 63,
+    # Portfolio family features from RoleAwareDayContext
+    cboe_panic_premium: float = 0.0,
+    cboe_term_slope: float = 0.0,
+    cboe_vol_risk_premium_z: float = 0.0,
+    calibration_overall_score: float = 1.0,
+    online_trust_score: float = 1.0,
+) -> np.ndarray:
+    """Compute 15-dimensional policy state vector.
+    
+    Dimensions 0-9: Portfolio performance metrics (historical)
+    Dimensions 10-14: Portfolio family features from RoleAwareContext (current market state)
+    
+    This gives the contextual bandit information about both:
+    - How the portfolio has been performing (adapt based on recent results)
+    - Current market stress/quality conditions (adapt based on environment)
+    """
+    # Use only information up to t-1.
+    end = int(max(0, i - 1))
+    if end <= 0:
+        return np.zeros((15,), dtype=float)
+
+    w = int(max(5, state_window))
+    start = int(max(0, end - w + 1))
+    r_hist = np.asarray(net_ret[start : end + 1], dtype=float)
+    t_hist = np.asarray(turnover[start : end + 1], dtype=float)
+    c_hist = np.asarray(costs[start : end + 1], dtype=float)
+
+    realized_vol = float(np.std(r_hist) * np.sqrt(252.0)) if r_hist.size >= 2 else 0.0
+    dd = float(_max_drawdown_from_equity(pd.Series(equity[start : end + 1]))) if end >= start else 0.0
+
+    sw = int(max(10, sharpe_window))
+    s_start = int(max(0, end - sw + 1))
+    r_sh = np.asarray(net_ret[s_start : end + 1], dtype=float)
+    sharpe = float(_annualized_sharpe(pd.Series(r_sh))) if r_sh.size >= 5 else 0.0
+
+    turn_mean = float(np.mean(np.where(np.isfinite(t_hist), t_hist, 0.0))) if t_hist.size else 0.0
+    cost_mean = float(np.mean(np.where(np.isfinite(c_hist), c_hist, 0.0))) if c_hist.size else 0.0
+
+    # Correlation concentration and dispersion from cross-asset returns.
+    try:
+        r_win = returns_df.iloc[start : end + 1].to_numpy(dtype=float)
+        if r_win.shape[0] >= 5:
+            r_win = np.where(np.isfinite(r_win), r_win, 0.0)
+            corr = np.corrcoef(r_win.T)
+            corr = np.where(np.isfinite(corr), corr, 0.0)
+            eigvals = np.linalg.eigvalsh(corr)
+            eigvals = np.where(np.isfinite(eigvals), eigvals, 0.0)
+            top_share = float(np.max(eigvals) / (np.sum(eigvals) + 1e-12)) if eigvals.size else 0.0
+            if corr.shape[0] > 1:
+                avg_corr = float((np.sum(corr) - np.trace(corr)) / (corr.shape[0] * (corr.shape[0] - 1)))
+            else:
+                avg_corr = 0.0
+            disp = float(np.mean(np.std(r_win, axis=1)))
+        else:
+            top_share = 0.0
+            avg_corr = 0.0
+            disp = 0.0
+    except Exception:
+        top_share = 0.0
+        avg_corr = 0.0
+        disp = 0.0
+
+    # Calibration proxy: sign accuracy on matured forward returns.
+    calib_end = int(max(0, end - int(horizon)))
+    calib_start = int(max(0, calib_end - int(max(5, calib_window)) + 1))
+    acc = 0.0
+    if calib_end >= calib_start:
+        mu_hist = np.asarray(mu_mat[calib_start : calib_end + 1], dtype=float)
+        fr_hist = np.asarray(fwd_ret_mat[calib_start : calib_end + 1], dtype=float)
+        m = np.isfinite(mu_hist) & np.isfinite(fr_hist)
+        if np.any(m):
+            mu_s = np.sign(mu_hist[m])
+            fr_s = np.sign(fr_hist[m])
+            acc = float(np.mean(mu_s == fr_s)) if mu_s.size else 0.0
+
+    try:
+        regime_val = float(market_regime.iloc[end]) if end < len(market_regime) else 0.0
+    except Exception:
+        regime_val = 0.0
+
+    # Clip/scale to keep features bounded.
+    # Dims 0-9: Portfolio performance metrics
+    # Dims 10-14: Portfolio family features (CBOE, calibration, online learning)
+    vec = np.asarray(
+        [
+            # Portfolio performance metrics (dims 0-9)
+            float(np.clip(realized_vol, 0.0, 1.0)),
+            float(np.clip(dd, 0.0, 1.0)),
+            float(np.clip(sharpe / 3.0, -1.0, 1.0)),  # Normalize to [-1, 1]
+            float(np.clip(turn_mean, 0.0, 1.0)),
+            float(np.clip(cost_mean, 0.0, 1.0)),
+            float(np.clip(avg_corr, -1.0, 1.0)),
+            float(np.clip(top_share, 0.0, 1.0)),
+            float(np.clip(disp, 0.0, 1.0)),
+            float(np.clip(acc, 0.0, 1.0)),
+            float(np.clip(regime_val / 2.0, 0.0, 1.0)),
+            # Portfolio family features (dims 10-14)
+            float(np.clip(cboe_panic_premium / 3.0, -1.0, 1.0)),  # z-scored, normalize to [-1, 1]
+            float(np.clip(cboe_term_slope / 3.0, -1.0, 1.0)),  # z-scored, normalize to [-1, 1]
+            float(np.clip(cboe_vol_risk_premium_z / 3.0, -1.0, 1.0)),  # z-scored, normalize to [-1, 1]
+            float(np.clip(calibration_overall_score, 0.0, 1.0)),  # Already in [0, 1]
+            float(np.clip(online_trust_score, 0.0, 1.0)),  # Already in [0, 1]
+        ],
+        dtype=float,
+    )
+    return vec
+
+
+def _build_default_policy_actions(
+    *,
+    base_threshold: float,
+    regime_mult_bull: float,
+    regime_mult_bear: float,
+    regime_mult_crisis: float,
+    target_vol: float,
+    turnover_cap: float,
+    max_gross: float,
+    max_net: float,
+    max_name: float,
+    weight_smoothing_alpha: float,
+    vol_scaler: float,
+) -> List[PolicyAction]:
+    base = PolicyAction(
+        name="base",
+        base_threshold=float(base_threshold),
+        regime_mult_bull=float(regime_mult_bull),
+        regime_mult_bear=float(regime_mult_bear),
+        regime_mult_crisis=float(regime_mult_crisis),
+        target_vol=float(target_vol),
+        turnover_cap=float(turnover_cap),
+        max_gross=float(max_gross),
+        max_net=float(max_net),
+        max_name=float(max_name),
+        weight_smoothing_alpha=float(weight_smoothing_alpha),
+        vol_scaler=float(vol_scaler),
+    )
+    # Conservative / aggressive variants.
+    conservative = PolicyAction(
+        name="conservative",
+        base_threshold=float(base_threshold) * 1.2,
+        regime_mult_bull=float(regime_mult_bull) * 1.1,
+        regime_mult_bear=float(regime_mult_bear) * 1.2,
+        regime_mult_crisis=float(regime_mult_crisis) * 1.2,
+        target_vol=float(target_vol) * 0.8,
+        turnover_cap=float(turnover_cap) * 0.8,
+        max_gross=float(max_gross) * 0.8,
+        max_net=float(max_net) * 0.8,
+        max_name=float(max_name) * 0.8,
+        weight_smoothing_alpha=float(min(0.9, max(weight_smoothing_alpha, 0.1))),
+        vol_scaler=float(vol_scaler) * 0.9,
+        quantile_blend_weight=0.1,  # Slightly trust quantile in conservative mode
+    )
+    aggressive = PolicyAction(
+        name="aggressive",
+        base_threshold=float(base_threshold) * 0.85,
+        regime_mult_bull=float(regime_mult_bull) * 0.9,
+        regime_mult_bear=float(regime_mult_bear) * 0.9,
+        regime_mult_crisis=float(regime_mult_crisis) * 0.9,
+        target_vol=float(target_vol) * 1.15,
+        turnover_cap=float(turnover_cap) * 1.2,
+        max_gross=float(max_gross) * 1.15,
+        max_net=float(max_net) * 1.15,
+        max_name=float(max_name) * 1.1,
+        weight_smoothing_alpha=float(max(0.0, weight_smoothing_alpha * 0.7)),
+        vol_scaler=float(vol_scaler) * 1.05,
+        quantile_blend_weight=0.0,  # Pure Mamba in aggressive mode
+    )
+    low_turn = PolicyAction(
+        name="low_turnover",
+        base_threshold=float(base_threshold) * 1.05,
+        regime_mult_bull=float(regime_mult_bull),
+        regime_mult_bear=float(regime_mult_bear),
+        regime_mult_crisis=float(regime_mult_crisis),
+        target_vol=float(target_vol) * 0.95,
+        turnover_cap=float(turnover_cap) * 0.5 if float(turnover_cap) > 0 else 0.0,
+        max_gross=float(max_gross),
+        max_net=float(max_net),
+        max_name=float(max_name),
+        weight_smoothing_alpha=float(min(0.9, max(weight_smoothing_alpha, 0.2))),
+        vol_scaler=float(vol_scaler),
+        quantile_blend_weight=0.15,  # Blend in quantile for stability
+    )
+    # Quantile-focused variant: trust quantile forecast more
+    quantile_trust = PolicyAction(
+        name="quantile_trust",
+        base_threshold=float(base_threshold),
+        regime_mult_bull=float(regime_mult_bull),
+        regime_mult_bear=float(regime_mult_bear),
+        regime_mult_crisis=float(regime_mult_crisis),
+        target_vol=float(target_vol),
+        turnover_cap=float(turnover_cap),
+        max_gross=float(max_gross),
+        max_net=float(max_net),
+        max_name=float(max_name),
+        weight_smoothing_alpha=float(weight_smoothing_alpha),
+        vol_scaler=float(vol_scaler),
+        quantile_blend_weight=0.3,  # Significant quantile blending
+    )
+    return [base, conservative, aggressive, low_turn, quantile_trust]
+
+
 def _compute_close_to_close_returns(price_data: pd.DataFrame) -> pd.Series:
     """Compute close-to-close daily returns from a price DataFrame.
 
@@ -2601,6 +2843,27 @@ def evaluate_phase2_stateful_once(
         thr_bear = float(cfg.get("regime_threshold_bear_mult", 1.5))
         thr_crisis = float(cfg.get("regime_threshold_crisis_mult", 3.0))
 
+        # Optional role-aware overlays (portfolio parquet). Fail open if missing.
+        role_aware_enabled = bool(cfg.get("phase2_role_aware_enabled", True))
+        role_ctx = None
+        if role_aware_enabled:
+            try:
+                from src.portfolio.role_aware_context import RoleAwareContext
+
+                role_parquet_dir = Path(str(cfg.get("phase2_role_aware_parquet_dir", "cache/features")))
+                role_registry_path = cfg.get("phase2_role_aware_registry_path")
+                role_ctx = RoleAwareContext(
+                    symbols=syms,
+                    horizon=int(horizon),
+                    parquet_dir=role_parquet_dir,
+                    strict=bool(cfg.get("phase2_role_aware_strict", False)),
+                    registry_path=Path(str(role_registry_path)) if role_registry_path else None,
+                    data_source=str(cfg.get("phase2_role_aware_data_source", "merged")),
+                )
+            except Exception as e:
+                logger.warning("[phase2.role_aware] failed to initialize: %s", e)
+                role_ctx = None
+
         # Build per-symbol daily returns aligned to union OOS index.
         union_oos_index = pd.DatetimeIndex(prepared.union_oos_index).sort_values()
         returns_cols: List[pd.Series] = []
@@ -2638,6 +2901,61 @@ def evaluate_phase2_stateful_once(
             values=returns_df.to_numpy(dtype=float),
             index=pd.DatetimeIndex(returns_df.index),
         )
+
+        # Forward returns (label) matrix for calibration features.
+        label_col = _phase2_label_column(_phase2_label_id_from_cfg(cfg))
+        fwd_ret_mat = np.full((len(union_oos_index), len(syms)), np.nan, dtype=float)
+        for j, sym in enumerate(syms):
+            try:
+                lbl = prepared.labels_by[sym][label_col].reindex(union_oos_index)
+                fwd_ret_mat[:, j] = pd.to_numeric(lbl, errors="coerce").to_numpy(dtype=float)
+            except Exception:
+                pass
+
+        # Market regime proxy for policy state.
+        try:
+            market_returns = returns_df.mean(axis=1)
+            market_regime = detect_regime(market_returns)
+        except Exception:
+            market_regime = pd.Series(0, index=returns_df.index, dtype=int)
+
+        # Optional policy controller (contextual bandit over knobs).
+        policy_enabled = bool(cfg.get("phase2_policy_controller_enabled", True))
+        policy = None
+        policy_action_history: List[Optional[int]] = [None for _ in range(len(union_oos_index))]
+        policy_state_history: List[Optional[np.ndarray]] = [None for _ in range(len(union_oos_index))]
+        policy_reward_window = int(cfg.get("phase2_policy_reward_window", 10))
+        policy_reward_lambda_turn = float(cfg.get("phase2_policy_reward_lambda_turn", 0.2))
+        policy_reward_lambda_dd = float(cfg.get("phase2_policy_reward_lambda_dd", 0.5))
+        if policy_enabled:
+            try:
+                policy_actions = _build_default_policy_actions(
+                    base_threshold=thr_base,
+                    regime_mult_bull=thr_bull,
+                    regime_mult_bear=thr_bear,
+                    regime_mult_crisis=thr_crisis,
+                    target_vol=target_vol,
+                    turnover_cap=turnover_cap,
+                    max_gross=max_gross,
+                    max_net=max_net,
+                    max_name=max_name,
+                    weight_smoothing_alpha=weight_smoothing_alpha,
+                    vol_scaler=float(cfg.get("phase2_policy_vol_scaler", 1.0)),
+                )
+                policy = PolicyController(
+                    actions=policy_actions,
+                    feature_dim=15,  # 10 portfolio metrics + 5 portfolio family features
+                    method=str(cfg.get("phase2_policy_controller_method", "lin_ts")),
+                    seed=int(cfg.get("phase2_policy_controller_seed", 1337)),
+                    ts_prior_var=float(cfg.get("phase2_policy_ts_prior_var", 1.0)),
+                    ts_noise_var=float(cfg.get("phase2_policy_ts_noise_var", 1.0)),
+                    ewa_eta=float(cfg.get("phase2_policy_ewa_eta", 0.25)),
+                    ewa_temperature=float(cfg.get("phase2_policy_ewa_temperature", 1.0)),
+                    warmup_steps=int(cfg.get("phase2_policy_warmup_days", 20)),
+                )
+            except Exception as e:
+                logger.warning("[phase2.policy] failed to initialize: %s", e)
+                policy = None
 
         # Online update schedule (every U sessions, starting at the first OOS day).
         step = max(1, int(update_sessions))
@@ -3526,6 +3844,106 @@ def evaluate_phase2_stateful_once(
             z = np.divide(mu_vec, sigma_exec + 1e-9)
             z = np.clip(z, -z_clip, z_clip)
 
+            # Apply role-aware overlays (hygiene/risk/regime multipliers).
+            if role_ctx is not None:
+                try:
+                    day_ctx = role_ctx.get_for_day(pd.Timestamp(day))
+                    idx_map = {str(s).upper(): int(j) for j, s in enumerate(day_ctx.symbols)}
+                    risk_scale = np.asarray([day_ctx.risk_scale[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 1.0 for s in syms], dtype=float)
+                    regime_mult = np.asarray([day_ctx.regime_multiplier[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 1.0 for s in syms], dtype=float)
+                    hygiene_ok = np.asarray([day_ctx.hygiene_ok[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else True for s in syms], dtype=bool)
+                    # Split stress penalty: shrink z when split recently occurred
+                    # z *= (1 - k * split_stress) where split_stress = max(flag, post_5d, post_20d, recency) * |log_ratio|
+                    split_stress = np.asarray([day_ctx.split_stress[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 0.0 for s in syms], dtype=float)
+                    split_penalty_k = float(os.environ.get("PORTFOLIO_SPLIT_STRESS_K", "0.3"))
+                    split_discount = np.clip(1.0 - split_penalty_k * split_stress, 0.1, 1.0)
+                    z = np.where(hygiene_ok, z * risk_scale * regime_mult * split_discount, 0.0)
+                    # Store quantile_z and policy state features for later use
+                    day_quantile_z = np.asarray([day_ctx.quantile_z[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 0.0 for s in syms], dtype=float)
+                    day_cboe_panic = float(day_ctx.cboe_panic_premium)
+                    day_cboe_slope = float(day_ctx.cboe_term_slope)
+                    day_cboe_vrp = float(day_ctx.cboe_vol_risk_premium_z)
+                    day_calib_score = float(day_ctx.calibration_overall_score)
+                    day_online_trust = float(day_ctx.online_trust_score)
+                except Exception:
+                    day_quantile_z = np.zeros(n_assets, dtype=float)
+                    day_cboe_panic = 0.0
+                    day_cboe_slope = 0.0
+                    day_cboe_vrp = 0.0
+                    day_calib_score = 1.0
+                    day_online_trust = 1.0
+            else:
+                day_quantile_z = np.zeros(n_assets, dtype=float)
+                day_cboe_panic = 0.0
+                day_cboe_slope = 0.0
+                day_cboe_vrp = 0.0
+                day_calib_score = 1.0
+                day_online_trust = 1.0
+
+            # Policy controller (contextual bandit) selects knobs for this day.
+            thr_base_day = float(thr_base)
+            thr_bull_day = float(thr_bull)
+            thr_bear_day = float(thr_bear)
+            thr_crisis_day = float(thr_crisis)
+            target_vol_day = float(target_vol)
+            turnover_cap_day = float(turnover_cap)
+            max_gross_day = float(max_gross)
+            max_net_day = float(max_net)
+            max_name_day = float(max_name)
+            weight_smoothing_alpha_day = float(weight_smoothing_alpha)
+            vol_scaler_day = float(cfg.get("phase2_policy_vol_scaler", 1.0))
+            quantile_blend_weight_day = 0.0  # Default: pure Mamba
+
+            if policy is not None:
+                try:
+                    state_vec = _policy_state_vector(
+                        i=i,
+                        horizon=int(horizon),
+                        returns_df=returns_df,
+                        net_ret=net_ret,
+                        turnover=turnover,
+                        costs=costs,
+                        equity=equity,
+                        mu_mat=mu_mat,
+                        fwd_ret_mat=fwd_ret_mat,
+                        market_regime=market_regime,
+                        state_window=int(cfg.get("phase2_policy_state_window", 20)),
+                        sharpe_window=int(cfg.get("phase2_policy_sharpe_window", 63)),
+                        calib_window=int(cfg.get("phase2_policy_calibration_window", 63)),
+                        # Portfolio family features from RoleAwareDayContext
+                        cboe_panic_premium=day_cboe_panic,
+                        cboe_term_slope=day_cboe_slope,
+                        cboe_vol_risk_premium_z=day_cboe_vrp,
+                        calibration_overall_score=day_calib_score,
+                        online_trust_score=day_online_trust,
+                    )
+                    action_idx, action = policy.select_action(state_vec)
+                    policy_action_history[i] = int(action_idx)
+                    policy_state_history[i] = np.asarray(state_vec, dtype=float)
+                    thr_base_day = float(action.base_threshold)
+                    thr_bull_day = float(action.regime_mult_bull)
+                    thr_bear_day = float(action.regime_mult_bear)
+                    thr_crisis_day = float(action.regime_mult_crisis)
+                    target_vol_day = float(action.target_vol)
+                    turnover_cap_day = float(action.turnover_cap)
+                    max_gross_day = float(action.max_gross)
+                    max_net_day = float(action.max_net)
+                    max_name_day = float(action.max_name)
+                    weight_smoothing_alpha_day = float(action.weight_smoothing_alpha)
+                    vol_scaler_day = float(action.vol_scaler)
+                    quantile_blend_weight_day = float(action.quantile_blend_weight)
+                except Exception:
+                    pass
+
+            # Quantile forecast blending (Option 1 from spec):
+            # z = (1 - w_q) * z_mamba + w_q * z_quantile
+            if quantile_blend_weight_day > 0 and np.any(np.abs(day_quantile_z) > 1e-9):
+                w_q = float(np.clip(quantile_blend_weight_day, 0.0, 1.0))
+                z = (1.0 - w_q) * z + w_q * day_quantile_z
+
+            if np.isfinite(vol_scaler_day) and vol_scaler_day > 0:
+                z = z * float(vol_scaler_day)
+
             if safety_enabled and (not np.all(np.isfinite(z))):
                 # Data/model integrity issue: go flat.
                 logger.error("Phase2 v2 non-finite z detected; forcing flat (%s)", str(day))
@@ -3551,7 +3969,7 @@ def evaluate_phase2_stateful_once(
             z_thr = np.zeros_like(z)
             for j, sym in enumerate(syms):
                 reg = int(regimes_by_sym[sym].reindex([pd.Timestamp(day)]).fillna(0).iloc[0])
-                thr = _regime_threshold_for_label(reg, thr_base, thr_bull, thr_bear, thr_crisis)
+                thr = _regime_threshold_for_label(reg, thr_base_day, thr_bull_day, thr_bear_day, thr_crisis_day)
                 z_thr[j] = z[j] if abs(z[j]) >= float(thr) else 0.0
 
             if diag_enabled:
@@ -3573,9 +3991,9 @@ def evaluate_phase2_stateful_once(
                 logger.error("Phase2 v2 non-finite w_raw detected; forcing flat (%s)", str(day))
                 w_raw = np.zeros(n_assets, dtype=float)
 
-            w = _apply_basic_constraints(w_raw, max_name=max_name, max_gross=max_gross, max_net=max_net)
-            w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol)
-            w = _apply_basic_constraints(w, max_name=max_name, max_gross=max_gross, max_net=max_net)
+            w = _apply_basic_constraints(w_raw, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+            w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol_day)
+            w = _apply_basic_constraints(w, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
 
             # ----------------------------
             # Deterministic HF-grade overlays
@@ -3613,17 +4031,17 @@ def evaluate_phase2_stateful_once(
                 rv = _rolling_realized_vol(net_ret[:i], window=int(vol_window)) if i > 0 else 0.0
                 overlay_rv[i] = float(rv)
                 if np.isfinite(rv) and rv > 0 and np.isfinite(target_vol) and target_vol > 0:
-                    if np.isfinite(vol_kill_mult) and vol_kill_mult > 0 and rv >= float(vol_kill_mult) * float(target_vol):
+                    if np.isfinite(vol_kill_mult) and vol_kill_mult > 0 and rv >= float(vol_kill_mult) * float(target_vol_day):
                         logger.warning(
                             "Phase2 v2 vol kill-switch triggered (rv=%.3f >= %.3f); flattening",
                             rv,
-                            float(vol_kill_mult) * float(target_vol),
+                            float(vol_kill_mult) * float(target_vol_day),
                         )
                         w = np.zeros(n_assets, dtype=float)
                         flattened = 1.0
-                    elif np.isfinite(vol_throttle_mult) and vol_throttle_mult > 0 and rv >= float(vol_throttle_mult) * float(target_vol):
+                    elif np.isfinite(vol_throttle_mult) and vol_throttle_mult > 0 and rv >= float(vol_throttle_mult) * float(target_vol_day):
                         # Scale down to bring realized vol back toward the throttle limit.
-                        scale = float((float(vol_throttle_mult) * float(target_vol)) / (rv + 1e-12))
+                        scale = float((float(vol_throttle_mult) * float(target_vol_day)) / (rv + 1e-12))
                         vol_scale = float(np.clip(scale, 0.0, 1.0))
                         w = w * float(vol_scale)
                 overlay_vol_scale[i] = float(vol_scale)
@@ -3648,12 +4066,12 @@ def evaluate_phase2_stateful_once(
                 )
 
                 # Optional exponential weight smoothing.
-                if np.isfinite(weight_smoothing_alpha) and 0.0 < weight_smoothing_alpha < 1.0:
-                    a = float(weight_smoothing_alpha)
+                if np.isfinite(weight_smoothing_alpha_day) and 0.0 < weight_smoothing_alpha_day < 1.0:
+                    a = float(weight_smoothing_alpha_day)
                     w = a * prev_w + (1.0 - a) * w
 
                 # Turnover budgeting (L1 delta-w cap).
-                w = _project_turnover_budget(prev_w, w, turnover_cap=float(turnover_cap))
+                w = _project_turnover_budget(prev_w, w, turnover_cap=float(turnover_cap_day))
 
                 # Liquidity constraints in USD (requires capital + ADV series).
                 if capital_usd_f > 0 and (
@@ -3712,9 +4130,9 @@ def evaluate_phase2_stateful_once(
                 w = np.where(_eligible_mask, w, 0.0)
 
             # Re-apply core constraints after overlays.
-            w = _apply_basic_constraints(w, max_name=max_name, max_gross=max_gross, max_net=max_net)
-            w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol)
-            w = _apply_basic_constraints(w, max_name=max_name, max_gross=max_gross, max_net=max_net)
+            w = _apply_basic_constraints(w, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+            w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol_day)
+            w = _apply_basic_constraints(w, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
 
             w_mat[i, :] = w
 
@@ -3759,6 +4177,28 @@ def evaluate_phase2_stateful_once(
                 equity[i] = 1.0 * (1.0 + pnl_net)
             else:
                 equity[i] = float(equity[i - 1] * (1.0 + pnl_net))
+
+            # Policy update (delayed reward over a rolling window).
+            if policy is not None and policy_reward_window > 1:
+                try:
+                    window = int(max(2, policy_reward_window))
+                    start_idx = int(i - window + 1)
+                    if start_idx >= 0:
+                        action_idx = policy_action_history[start_idx]
+                        state_vec = policy_state_history[start_idx]
+                        if action_idx is not None and state_vec is not None:
+                            reward = _policy_reward_from_window(
+                                net_returns=net_ret,
+                                turnover=turnover,
+                                equity=equity,
+                                start=start_idx,
+                                end=i,
+                                lambda_turnover=policy_reward_lambda_turn,
+                                lambda_drawdown=policy_reward_lambda_dd,
+                            )
+                            policy.update(action_index=int(action_idx), x=state_vec, reward=float(reward))
+                except Exception:
+                    pass
 
             # Roll covariance forward using today's realized returns.
             cov = _ewma_cov_update(cov, r_vec, cov_lam)

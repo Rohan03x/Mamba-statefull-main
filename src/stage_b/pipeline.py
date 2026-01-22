@@ -1558,16 +1558,49 @@ class StageBPipeline:
 
         Produced by `tools/prep_families.py --write-merged yes` via Feast.
         """
+        variant = os.getenv("STAGE_B_MERGED_PANEL_VARIANT", "auto").strip().lower()
+        if variant in {"alpha"}:
+            variant = "mamba"
+        if variant in {"policy"}:
+            variant = "portfolio"
+
+        order: List[str]
+        if variant == "mamba":
+            order = ["merged_mamba", "merged"]
+        elif variant == "portfolio":
+            order = ["merged_portfolio", "merged"]
+        elif variant == "merged":
+            order = ["merged"]
+        else:
+            # auto: prefer mamba if available, then fall back to merged
+            order = ["merged_mamba", "merged"]
+
         candidates: List[Path] = []
         seen: Set[str] = set()
         for sym in (self.config.symbol.upper(), self.config.symbol.lower()):
-            candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged.parquet"
-            key = str(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(candidate)
+            for token in order:
+                if token == "merged":
+                    candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged.parquet"
+                elif token == "merged_mamba":
+                    candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged_mamba.parquet"
+                elif token == "merged_portfolio":
+                    candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged_portfolio.parquet"
+                else:
+                    continue
+                key = str(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(candidate)
         return candidates
+
+    def _panel_variant_from_path(self, path: Path) -> str:
+        name = str(path.name).lower()
+        if "_merged_mamba" in name:
+            return "mamba"
+        if "_merged_portfolio" in name:
+            return "portfolio"
+        return "merged"
 
     def _split_panel_candidates(self, horizon: int) -> List[Tuple[Path, Path]]:
         """Production-grade split artifacts (numeric-only features + index sidecar).
@@ -1611,6 +1644,7 @@ class StageBPipeline:
         self,
         feature_cols: Sequence[str],
         families: Sequence[str],
+        panel_variant: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Validate cached panel feature columns using contract enforcement.
 
@@ -1618,6 +1652,10 @@ class StageBPipeline:
         - Fail only if required columns are missing or forbidden columns are present.
         - Allow extra columns (log drift for non-meta extras).
         """
+
+        variant = str(panel_variant or "").strip().lower()
+        if variant in {"mamba", "portfolio"}:
+            return True, f"skip_contract:{variant}"
 
         requested = {str(f).lower() for f in (families or [])}
         contract_families = requested.intersection(FAMILY_REQUIRED_COLS.keys())
@@ -1715,7 +1753,8 @@ class StageBPipeline:
                 for c in cols
                 if c not in {"event_timestamp", "date", "symbol", "split"}
             ]
-            ok, reason = self._validate_cached_panel_schema(feature_cols, families)
+            variant = self._panel_variant_from_path(candidate)
+            ok, reason = self._validate_cached_panel_schema(feature_cols, families, panel_variant=variant)
             if not ok:
                 self.logger.warning(
                     "⚠️ Cached panel contract violated for %s H%s (%s) → ignoring %s (no delete)",
@@ -1736,7 +1775,7 @@ class StageBPipeline:
             if not cols:
                 self.logger.warning("⚠️ Cached split panel exists but columns unreadable: %s", feat_path)
                 continue
-            ok, reason = self._validate_cached_panel_schema([str(c) for c in cols], families)
+            ok, reason = self._validate_cached_panel_schema([str(c) for c in cols], families, panel_variant=None)
             if not ok:
                 self.logger.warning(
                     "⚠️ Cached split panel contract violated for %s H%s (%s) → ignoring %s and %s (no delete)",
@@ -1966,7 +2005,8 @@ class StageBPipeline:
                     for c in cols
                     if c not in {"event_timestamp", "date", "symbol", "split"}
                 ]
-                ok, reason = self._validate_cached_panel_schema(feature_cols, families)
+                variant = self._panel_variant_from_path(candidate)
+                ok, reason = self._validate_cached_panel_schema(feature_cols, families, panel_variant=variant)
                 if not ok:
                     self.logger.warning(
                         "⚠️ Merged cached panel contract violated for %s H%s (%s) → ignoring %s (no delete)",
@@ -1988,7 +2028,7 @@ class StageBPipeline:
                 continue
             cols = self._peek_unified_panel_columns(feat_path)
             if cols:
-                ok, reason = self._validate_cached_panel_schema([str(c) for c in cols], families)
+                ok, reason = self._validate_cached_panel_schema([str(c) for c in cols], families, panel_variant=None)
                 if not ok:
                     self.logger.warning(
                         "⚠️ Split cached panel contract violated for %s H%s (%s) → ignoring %s and %s (no delete)",

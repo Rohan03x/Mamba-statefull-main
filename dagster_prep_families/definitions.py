@@ -152,6 +152,9 @@ def _schedule_run_config() -> dict:
         "quality_max_proxy_flag_mean",
         "quality_max_rows",
         "reuse_symbol_only_cache",
+        "preprocess_write_role_splits",
+        "alt_signals_staleness_k",
+        "mamba_optional_all",
     ]:
         env_key = f"DAGSTER_PREP_{k.upper()}"
         v = os.getenv(env_key)

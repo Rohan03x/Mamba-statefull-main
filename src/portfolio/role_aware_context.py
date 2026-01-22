@@ -35,6 +35,16 @@ class RoleAwareDayContext:
     hygiene_ok: np.ndarray  # shape (n_assets,) bool
     risk_scale: np.ndarray  # shape (n_assets,) float in (0,1]
     regime_multiplier: np.ndarray  # shape (n_assets,) float in [0,1]
+    # Quantile forecast blending (Option 1 from spec)
+    quantile_z: np.ndarray  # shape (n_assets,) float, z_q = mu_q / sigma_q
+    # Split stress for execution discipline: max(flag, post_5d, post_20d) * abs(log_ratio)
+    split_stress: np.ndarray  # shape (n_assets,) float in [0, ~2]
+    # Policy controller state features from portfolio families
+    cboe_panic_premium: float = 0.0
+    cboe_term_slope: float = 0.0
+    cboe_vol_risk_premium_z: float = 0.0
+    calibration_overall_score: float = 1.0
+    online_trust_score: float = 1.0
 
 
 def _safe_bool(v: object) -> bool:
@@ -79,7 +89,19 @@ def _first_existing(paths: Sequence[Path]) -> Optional[Path]:
 
 
 class RoleAwareContext:
-    """Loads (features,index,provenance) per symbol and provides per-day overlays."""
+    """Loads (features,index,provenance) per symbol and provides per-day overlays.
+    
+    This module reads the portfolio parquet (not Mamba parquet) and computes:
+    - hygiene_ok: hard veto based on has_data / days_since_update (NaN also vetoes)
+    - risk_scale: 1/(1+risk_agg) from RISK columns using robust normalization
+    - regime_multiplier: 1-regime_agg from REGIME columns
+    
+    For quantile forecast blending, it also provides:
+    - quantile_z: auxiliary z-score from quantile forecast (mu_q/sigma_q)
+    
+    This is used in phase2_stateful.py to apply overlays AFTER z is computed,
+    BEFORE thresholding.
+    """
 
     def __init__(
         self,
@@ -89,7 +111,7 @@ class RoleAwareContext:
         parquet_dir: Path,
         strict: bool = False,
         registry_path: Optional[Path] = None,
-        data_source: str = "merged",  # auto|features|merged
+        data_source: str = "portfolio",  # portfolio|mamba|merged|auto|features
     ) -> None:
         self.symbols = [str(s).upper() for s in symbols]
         self.horizon = int(horizon)
@@ -118,6 +140,21 @@ class RoleAwareContext:
         self._risk_cols: Dict[str, List[str]] = {}
         self._regime_cols: Dict[str, List[str]] = {}
         self._hygiene_cols: Dict[str, List[str]] = {}
+
+        # Quantile forecast columns for z_q blending (Option 1 from spec)
+        self._quantile_mu_col: Dict[str, Optional[str]] = {}  # q50 or q_median_50
+        self._quantile_sigma_col: Dict[str, Optional[str]] = {}  # q_spread_95_5 or q_vol_forecast
+
+        # Policy controller state columns (cross-sectional aggregates)
+        self._cboe_cols: Dict[str, List[str]] = {}  # panic_premium, normalized_term_slope, etc.
+        self._calibration_cols: Dict[str, List[str]] = {}  # overall_score, etc.
+        self._online_cols: Dict[str, List[str]] = {}  # trust_score, etc.
+
+        # Corp actions splits columns for split_stress computation
+        self._splits_cols: Dict[str, List[str]] = {}  # flag, post_5d, post_20d, log_ratio, recency
+
+        # Column → family mapping for per-family staleness thresholds
+        self._col_family: Dict[str, Dict[str, str]] = {}
 
         # Optional per-column normalization stats (p05/p95) for risk/regime aggregation.
         self._col_norm: Dict[str, Dict[str, Tuple[float, float]]] = {}
@@ -188,6 +225,8 @@ class RoleAwareContext:
                 ]
             )
             merged_path = self.parquet_dir / f"{sym}_h{h}_merged.parquet"
+            merged_mamba_path = self.parquet_dir / f"{sym}_h{h}_merged_mamba.parquet"
+            merged_portfolio_path = self.parquet_dir / f"{sym}_h{h}_merged_portfolio.parquet"
 
             # Load provenance from JSON only (CSV was redundant and removed)
             prov = _load_json(prov_path) if prov_path is not None else {}
@@ -215,12 +254,24 @@ class RoleAwareContext:
                 data_path = features_path
             elif self.data_source == "merged":
                 data_path = merged_path if merged_path.exists() else None
+            elif self.data_source == "portfolio":
+                if merged_portfolio_path.exists():
+                    data_path = merged_portfolio_path
+                elif merged_path.exists() and not self.strict:
+                    data_path = merged_path
+            elif self.data_source == "mamba":
+                if merged_mamba_path.exists():
+                    data_path = merged_mamba_path
+                elif merged_path.exists() and not self.strict:
+                    data_path = merged_path
             else:
                 # auto: prefer session-aligned features parquet (it matches *_index.parquet rows).
                 if features_path is not None and features_path.exists():
                     data_path = features_path
                 elif merged_path.exists():
                     data_path = merged_path
+                elif merged_portfolio_path.exists():
+                    data_path = merged_portfolio_path
 
             if data_path is None or not data_path.exists():
                 if self.strict:
@@ -354,6 +405,11 @@ class RoleAwareContext:
                 col_s = str(col)
                 role = str(role_map.get(col_s, "") or "")
                 fam = str(family_map.get(col_s, "") or "")
+
+                # Staleness weights are policy controls; treat as regime/gating.
+                if "stale_weight" in col_s:
+                    role = "regime"
+
                 if not role:
                     role = self._role_from_family_intent(fam)
 
@@ -402,8 +458,50 @@ class RoleAwareContext:
             regime_cols = _uniq([c for c in regime_cols if c in data_df.columns])
             hygiene_cols = _uniq([c for c in hygiene_cols if c in data_df.columns])
 
-            # Subselect for memory.
-            use_cols = _uniq([*risk_cols, *regime_cols, *hygiene_cols])
+            # Identify quantile forecast columns for z_q blending
+            quantile_mu_col = None
+            quantile_sigma_col = None
+            for c in data_df.columns:
+                c_lower = str(c).lower()
+                if c_lower in {"quantile_forecast_q50", "quantile_forecast_q_median_50"}:
+                    quantile_mu_col = str(c)
+                if c_lower in {"quantile_forecast_q_spread_95_5", "quantile_forecast_q_vol_forecast"}:
+                    quantile_sigma_col = str(c)
+            self._quantile_mu_col[sym] = quantile_mu_col
+            self._quantile_sigma_col[sym] = quantile_sigma_col
+
+            # Identify CBOE term structure columns for policy state
+            cboe_cols = [c for c in data_df.columns if str(c).lower().startswith("cboe_term_") or str(c).lower() in {
+                "panic_premium", "normalized_term_slope", "vix_ratio_term", "vol_risk_premium_z",
+                "vix_roll_yield", "vix_contango_strength"
+            }]
+            self._cboe_cols[sym] = cboe_cols
+
+            # Identify calibration columns for policy state
+            calibration_cols = [c for c in data_df.columns if str(c).lower().startswith("calibration_")]
+            self._calibration_cols[sym] = calibration_cols
+
+            # Identify online learning columns for policy state
+            online_cols = [c for c in data_df.columns if str(c).lower().startswith("online_learning_")]
+            self._online_cols[sym] = online_cols
+
+            # Identify corp actions splits columns for split_stress
+            # CRITICAL: Use bounded recency instead of raw days_since
+            splits_cols = [c for c in data_df.columns if str(c).lower().startswith("corp_actions_splits_")]
+            self._splits_cols[sym] = splits_cols
+
+            # Subselect for memory - include quantile/cboe/calibration/online/splits for policy state
+            extra_cols = []
+            if quantile_mu_col:
+                extra_cols.append(quantile_mu_col)
+            if quantile_sigma_col:
+                extra_cols.append(quantile_sigma_col)
+            extra_cols.extend(cboe_cols)
+            extra_cols.extend(calibration_cols)
+            extra_cols.extend(online_cols)
+            extra_cols.extend(splits_cols)
+
+            use_cols = _uniq([*risk_cols, *regime_cols, *hygiene_cols, *extra_cols])
             if not use_cols:
                 # Still keep a small empty matrix.
                 self._feat_cols[sym] = []
@@ -413,6 +511,7 @@ class RoleAwareContext:
                 self._hygiene_cols[sym] = []
                 continue
 
+            use_cols = [c for c in use_cols if c in data_df.columns]
             sub = data_df[use_cols].copy()
             sub = sub.apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
@@ -440,6 +539,73 @@ class RoleAwareContext:
             self._risk_cols[sym] = risk_cols
             self._regime_cols[sym] = regime_cols
             self._hygiene_cols[sym] = hygiene_cols
+            # Store column → family map for per-family staleness thresholds
+            self._col_family[sym] = dict(family_map)
+
+    # -------------------------------------------------------------------------
+    # Per-family staleness thresholds (trading days)
+    # Quarterly families (fin_g*) can go ~120 days between updates legitimately.
+    # Monthly families (some macro) ~30 days. Daily families ~10 days.
+    # -------------------------------------------------------------------------
+    _FAMILY_MAX_DAYS_SINCE_UPDATE: Dict[str, float] = {
+        # Quarterly fundamentals (fin_g1-7, options_anchoring, calibration)
+        "fin_g1": 130.0,
+        "fin_g2": 130.0,
+        "fin_g3": 130.0,
+        "fin_g4": 130.0,
+        "fin_g5": 130.0,
+        "fin_g6": 130.0,
+        "fin_g7": 130.0,
+        "options_anchoring": 130.0,
+        "calibration": 130.0,
+        # Monthly/semi-monthly
+        "google_trends": 45.0,
+        "macro_panel": 45.0,
+        "short_interest": 30.0,
+        "insider_form4": 60.0,
+        # Snapshot families (less frequent, but valid)
+        "dcf": 90.0,
+        "earnings": 120.0,
+        "dividends": 120.0,
+        # Daily families (default)
+        "ohlcv": 10.0,
+        "candle_mechanics": 10.0,
+        "garch_iv": 10.0,
+        "microstructure_intraday": 10.0,
+        "cboe_term": 10.0,
+        "vix_futures": 10.0,
+        "correlation": 10.0,
+        "alternative_signals": 10.0,
+        # Event-driven (can be stale for long periods legitimately)
+        "corp_actions_splits": 365.0,
+        "econ_events_calendar": 10.0,
+        "exchange_calendar": 10.0,
+    }
+
+    def _get_staleness_threshold(self, sym: str, col_name: str) -> float:
+        """Get the max_days_since_update threshold for a column based on its family."""
+        default_max = float(os.getenv("PORTFOLIO_MAX_DAYS_SINCE_UPDATE", "10"))
+        family = self._col_family.get(sym, {}).get(col_name, "")
+        if not family:
+            # Try to infer from column prefix
+            col_lower = str(col_name).lower()
+            for fam in self._FAMILY_MAX_DAYS_SINCE_UPDATE:
+                if col_lower.startswith(f"{fam}_"):
+                    family = fam
+                    break
+        if family and family in self._FAMILY_MAX_DAYS_SINCE_UPDATE:
+            return self._FAMILY_MAX_DAYS_SINCE_UPDATE[family]
+        # Check family metadata for cadence
+        meta = self._family_meta.get(family)
+        if meta is not None:
+            cadence = str(getattr(meta, "update_cadence", "")).strip().lower()
+            if cadence == "quarterly":
+                return 130.0
+            elif cadence == "monthly":
+                return 45.0
+            elif cadence in {"weekly", "daily"}:
+                return 10.0
+        return default_max
 
     def get_for_day(self, day: pd.Timestamp) -> RoleAwareDayContext:
         """Return per-symbol overlays for this session day.
@@ -453,6 +619,15 @@ class RoleAwareContext:
         hygiene_ok = np.ones(n, dtype=bool)
         risk_scale = np.ones(n, dtype=float)
         regime_multiplier = np.ones(n, dtype=float)
+        quantile_z = np.zeros(n, dtype=float)
+        split_stress = np.zeros(n, dtype=float)  # Per-asset split stress for execution discipline
+
+        # Policy state feature collectors (cross-sectional aggregation)
+        cboe_panic_premium_vals: List[float] = []
+        cboe_term_slope_vals: List[float] = []
+        cboe_vol_risk_premium_vals: List[float] = []
+        calibration_score_vals: List[float] = []
+        online_trust_vals: List[float] = []
 
         # Tunables (conservative defaults).
         max_days_since_update = float(os.getenv("PORTFOLIO_MAX_DAYS_SINCE_UPDATE", "10"))
@@ -499,7 +674,9 @@ class RoleAwareContext:
                 # Only treat explicit update-age columns as staleness.
                 # Many families have feature names like *_days_since_add/remove which are NOT freshness.
                 if "days_since_update" in name or name.endswith("__days_since_update"):
-                    if v > max_days_since_update:
+                    # Use per-family staleness threshold (quarterly families get ~130 days, daily ~10)
+                    family_threshold = self._get_staleness_threshold(sym, c)
+                    if v > family_threshold:
                         ok = False
                         break
                 elif "has_data" in name:
@@ -541,13 +718,106 @@ class RoleAwareContext:
                     m = float(np.mean(arr))
                     regime_multiplier[i] = float(1.0 - m) if regime_mode == "one_minus_mean" else float(m)
 
+            # Quantile forecast z_q (Option 1 from spec: blend z_q with z_mamba)
+            mu_col = self._quantile_mu_col.get(sym)
+            sigma_col = self._quantile_sigma_col.get(sym)
+            if mu_col is not None and sigma_col is not None:
+                mu_j = idx_map.get(mu_col)
+                sigma_j = idx_map.get(sigma_col)
+                if mu_j is not None and sigma_j is not None:
+                    mu_q = float(mat[row, mu_j])
+                    sigma_q = float(mat[row, sigma_j])
+                    if np.isfinite(mu_q) and np.isfinite(sigma_q) and sigma_q > 1e-9:
+                        quantile_z[i] = float(mu_q / sigma_q)
+
+            # Policy state: CBOE panic premium
+            for c in self._cboe_cols.get(sym, []):
+                c_lower = str(c).lower()
+                j = idx_map.get(c)
+                if j is None:
+                    continue
+                v = float(mat[row, j])
+                if "panic_premium" in c_lower and np.isfinite(v):
+                    cboe_panic_premium_vals.append(v)
+                if "normalized_term_slope" in c_lower and np.isfinite(v):
+                    cboe_term_slope_vals.append(v)
+                if "vol_risk_premium" in c_lower and np.isfinite(v):
+                    cboe_vol_risk_premium_vals.append(v)
+
+            # Policy state: calibration overall_score
+            for c in self._calibration_cols.get(sym, []):
+                c_lower = str(c).lower()
+                j = idx_map.get(c)
+                if j is None:
+                    continue
+                v = float(mat[row, j])
+                if "overall_score" in c_lower and np.isfinite(v):
+                    calibration_score_vals.append(v)
+
+            # Policy state: online learning trust_score
+            for c in self._online_cols.get(sym, []):
+                c_lower = str(c).lower()
+                j = idx_map.get(c)
+                if j is None:
+                    continue
+                v = float(mat[row, j])
+                if "trust_score" in c_lower and np.isfinite(v):
+                    online_trust_vals.append(v)
+
+            # Split stress: max(flag, post_5d, post_20d) * abs(log_ratio)
+            # This provides a single scalar for explicit execution discipline:
+            #   - inflate sigma: sigma_exec *= (1 + k * split_stress)
+            #   - or shrink z: z *= (1 - k * split_stress)
+            split_flag = 0.0
+            split_post_5d = 0.0
+            split_post_20d = 0.0
+            split_log_ratio = 0.0
+            split_recency = 0.0
+            for c in self._splits_cols.get(sym, []):
+                c_lower = str(c).lower()
+                j = idx_map.get(c)
+                if j is None:
+                    continue
+                v = float(mat[row, j])
+                if not np.isfinite(v):
+                    continue
+                if c_lower.endswith("_flag"):
+                    split_flag = v
+                elif c_lower.endswith("_post_5d"):
+                    split_post_5d = v
+                elif c_lower.endswith("_post_20d"):
+                    split_post_20d = v
+                elif c_lower.endswith("_log_ratio"):
+                    split_log_ratio = v
+                elif c_lower.endswith("_recency"):
+                    split_recency = v
+            # Compute split_stress = max(flag, post_5d, post_20d, recency) * abs(log_ratio)
+            split_event_strength = max(split_flag, split_post_5d, split_post_20d, split_recency)
+            split_stress[i] = float(split_event_strength * abs(split_log_ratio))
+
         # Enforce hygiene last: if vetoed, kill exposure.
         risk_scale = np.where(hygiene_ok, risk_scale, 0.0)
         regime_multiplier = np.where(hygiene_ok, regime_multiplier, 0.0)
+        quantile_z = np.where(hygiene_ok, quantile_z, 0.0)
+        split_stress = np.where(hygiene_ok, split_stress, 0.0)
+
+        # Aggregate policy state features (cross-sectional means)
+        cboe_panic = float(np.mean(cboe_panic_premium_vals)) if cboe_panic_premium_vals else 0.0
+        cboe_slope = float(np.mean(cboe_term_slope_vals)) if cboe_term_slope_vals else 0.0
+        cboe_vrp = float(np.mean(cboe_vol_risk_premium_vals)) if cboe_vol_risk_premium_vals else 0.0
+        calib_score = float(np.mean(calibration_score_vals)) if calibration_score_vals else 1.0
+        online_trust = float(np.mean(online_trust_vals)) if online_trust_vals else 1.0
 
         return RoleAwareDayContext(
             symbols=list(self.symbols),
             hygiene_ok=hygiene_ok,
             risk_scale=risk_scale,
             regime_multiplier=regime_multiplier,
+            quantile_z=quantile_z,
+            split_stress=split_stress,
+            cboe_panic_premium=cboe_panic,
+            cboe_term_slope=cboe_slope,
+            cboe_vol_risk_premium_z=cboe_vrp,
+            calibration_overall_score=calib_score,
+            online_trust_score=online_trust,
         )

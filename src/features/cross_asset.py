@@ -288,12 +288,14 @@ def fetch(symbol: str, start: Optional[str] = None, end: Optional[str] = None, m
             beta_20d = rolling_beta(stock_returns, spy_returns, 20)
             out['beta_20d'] = beta_20d
             
-            # Beta change rate (how fast beta is changing) - WINSORIZED at ±3σ
+            # Beta change rate (how fast beta is changing) - ABSOLUTE MAGNITUDE for regime aggregation
+            # CRITICAL: RoleAwareContext treats large values as "stress"; signed values confuse the aggregator
+            # Store abs(zscore) so that any rapid beta change → higher stress
             beta_change_raw = beta_20d.pct_change(5)
             beta_change_mean = beta_change_raw.rolling(252, min_periods=60).mean()
             beta_change_std = beta_change_raw.rolling(252, min_periods=60).std()
             beta_change_z = (beta_change_raw - beta_change_mean) / (beta_change_std + 1e-9)
-            out['beta_change_rate'] = beta_change_z.clip(-3, 3)
+            out['beta_change_rate'] = np.abs(beta_change_z).clip(0, 3)
             
             # Beta volatility (stability of beta estimates)
             # Calculate volatility of beta over 20-day window
@@ -302,8 +304,9 @@ def fetch(symbol: str, start: Optional[str] = None, end: Optional[str] = None, m
                 beta_vol = beta_20d.rolling(20, min_periods=10).std()
                 out['beta_volatility_20d'] = beta_vol
                 
-                # Beta volatility change (regime break detector)
-                out['beta_volatility_change'] = beta_vol.pct_change(5)
+                # Beta volatility change (regime break detector) - ABSOLUTE MAGNITUDE
+                # Rapid changes in beta stability → regime break, regardless of direction
+                out['beta_volatility_change'] = np.abs(beta_vol.pct_change(5)).clip(0, 5)
             else:
                 out['beta_volatility_20d'] = pd.Series(index=stock_returns.index, dtype=float)
                 out['beta_volatility_change'] = pd.Series(index=stock_returns.index, dtype=float)
@@ -356,15 +359,16 @@ def fetch(symbol: str, start: Optional[str] = None, end: Optional[str] = None, m
             tnx_close = tnx_df['Close'].reindex(stock_returns.index)
             tnx_corr = stock_returns.rolling(20).corr(tnx_close.pct_change())
             out['tnx_corr_20d'] = tnx_corr
-            # Change in rate correlation (regime transition detector)
-            out['tnx_corr_change_5d'] = tnx_corr.diff(5)
+            # Change in rate correlation (regime transition detector) - ABSOLUTE MAGNITUDE
+            # Any shift in rate sensitivity → regime break signal
+            out['tnx_corr_change_5d'] = np.abs(tnx_corr.diff(5)).clip(0, 1)
         
         if irx_df is not None and not irx_df.empty and 'Close' in irx_df.columns:
             irx_close = irx_df['Close'].reindex(stock_returns.index)
             irx_corr = stock_returns.rolling(20).corr(irx_close.pct_change())
             out['irx_corr_20d'] = irx_corr
-            # Change in rate correlation (regime transition detector)
-            out['irx_corr_change_5d'] = irx_corr.diff(5)
+            # Change in rate correlation (regime transition detector) - ABSOLUTE MAGNITUDE
+            out['irx_corr_change_5d'] = np.abs(irx_corr.diff(5)).clip(0, 1)
         
         # ==== F. Credit Spread Dynamics ====
         # Fetch credit ETFs: HYG (high yield) and LQD (investment grade)
@@ -431,9 +435,18 @@ def fetch(symbol: str, start: Optional[str] = None, end: Optional[str] = None, m
             risk_factor = sum(risk_components.values())
             out['risk_onoff_factor'] = risk_factor
             
-            # Change in cross-asset coupling (regime transition detector)
+            # Change in cross-asset coupling (regime transition detector) - ABSOLUTE MAGNITUDE
             # Level tells you where you are, CHANGE tells you when it breaks
-            out['cross_asset_coupling_change'] = risk_factor.diff(5)
+            out['cross_asset_coupling_change'] = np.abs(risk_factor.diff(5)).clip(0, 1)
+            
+            # CRITICAL: risk_offness for portfolio overlays
+            # risk_onoff_factor is directional (high = risk-on); don't feed raw into stress aggregator
+            # risk_offness = one-sided stress signal: higher when market is risk-off
+            # Formula: clip((0.5 - risk_onoff_factor) / scale, 0, 1)
+            # When risk_onoff_factor < 0.5 (risk-off) → positive stress
+            # When risk_onoff_factor >= 0.5 (risk-on) → zero stress (not "negative stress")
+            scale = 0.5  # sensitivity parameter
+            out['risk_offness'] = ((0.5 - risk_factor) / scale).clip(0, 1)
         
         # Forward-fill to handle rolling window NaNs, but preserve data integrity
         # Only fill gaps AFTER we have at least one valid value per column

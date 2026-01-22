@@ -12,6 +12,15 @@ Design goals:
   - Schedule-derived features (days_to_next, days_since_last, pre/post windows) are safe unshifted.
   - Realized surprises are applied on the *next* NYSE session after the release session.
 
+Critical fixes (Jan 2026):
+- Replace 9999 sentinels with bounded proximity/recency signals:
+  - prox_next_* = exp(-min(days_to_next, 252) / 5)  → peaks when event is imminent
+  - recency_last_* = exp(-min(days_since_last, 252) / 10)  → decays after event
+- Add composite macro features for policy state:
+  - macro_upcoming_major = max(prox_next_{fomc, cpi, nfp})
+  - macro_shock_major = max(pulse_strength_{fomc, cpi, nfp})
+  - macro_surprise_signed = importance-weighted sum of pulse surprises
+
 Coverage note:
 - EODHD economic-events coverage starts around 2020.
 - This family is symbol-agnostic (macro), but emitted per-symbol for pipeline consistency.
@@ -134,6 +143,50 @@ def _fetch_eodhd_economic_events_time_sliced(
             )
 
     return _dedupe_eodhd_events(raw)
+
+
+# ---------------------------------------------------------------------------
+# Bounded proximity / recency transforms (replace 9999 sentinels)
+# ---------------------------------------------------------------------------
+# Major event types for composite features
+_MAJOR_EVENT_TYPES = {"fomc", "cpi", "nfp"}
+
+# Importance weights for weighted surprise composites
+_EVENT_IMPORTANCE_WEIGHTS = {
+    "fomc": 3.0,
+    "cpi": 3.0,
+    "nfp": 3.0,
+    "gdp": 2.5,
+    "pce": 2.0,
+    "unemployment": 2.0,
+    "retail_sales": 1.5,
+    "ism": 1.5,
+    "core_cpi": 2.0,
+}
+
+
+def _bounded_proximity(days_to: pd.Series, *, cap: float = 252.0, tau: float = 5.0) -> pd.Series:
+    """Convert days_to_next (with 9999 sentinel) to bounded proximity in [0,1].
+
+    Formula: exp(-min(days_to, cap) / tau)
+    - peaks at 1.0 when days_to=0 (event imminent)
+    - decays to ~0.05 when days_to >= tau*3
+    - 9999 values → effectively 0.0
+    """
+    clamped = days_to.clip(lower=0.0, upper=cap).fillna(cap)
+    return np.exp(-clamped / tau)
+
+
+def _bounded_recency(days_since: pd.Series, *, cap: float = 252.0, tau: float = 10.0) -> pd.Series:
+    """Convert days_since_last (with 9999 sentinel) to bounded recency in [0,1].
+
+    Formula: exp(-min(days_since, cap) / tau)
+    - peaks at 1.0 when days_since=0 (event just happened)
+    - decays to ~0.05 when days_since >= tau*3
+    - 9999 values → effectively 0.0
+    """
+    clamped = days_since.clip(lower=0.0, upper=cap).fillna(cap)
+    return np.exp(-clamped / tau)
 
 
 @dataclass(frozen=True)
@@ -357,6 +410,14 @@ def fetch(
             out[f"econ_events_calendar_pulse_occurrence_{et}"] = 0.0
             out[f"econ_events_calendar_pulse_surprise_{et}"] = 0.0
             out[f"econ_events_calendar_pulse_strength_{et}"] = 0.0
+            # Bounded proximity/recency (replace 9999 sentinels)
+            out[f"econ_events_calendar_prox_next_{et}"] = 0.0
+            out[f"econ_events_calendar_recency_last_{et}"] = 0.0
+
+        # Composite macro features (major events only: fomc, cpi, nfp)
+        out["econ_events_calendar_macro_upcoming_major"] = 0.0
+        out["econ_events_calendar_macro_shock_major"] = 0.0
+        out["econ_events_calendar_macro_surprise_signed"] = 0.0
 
         out.attrs["telemetry"] = {
             "status": status,
@@ -625,6 +686,49 @@ def fetch(
         strength = np.where(occ_now & (~has_fc_now), float(baseline), strength)
         strength = np.where(occ_now & has_fc_now, s_abs, strength)
         out[f"econ_events_calendar_pulse_strength_{et}"] = strength
+
+        # ---------------------------------------------------------------------
+        # Bounded proximity/recency (replace 9999 sentinels for safe aggregation)
+        # prox_next: peaks when event is imminent (tau=5 days)
+        # recency_last: peaks after event, decays over ~2 weeks (tau=10 days)
+        # ---------------------------------------------------------------------
+        out[f"econ_events_calendar_prox_next_{et}"] = _bounded_proximity(d_next, cap=252.0, tau=5.0)
+        out[f"econ_events_calendar_recency_last_{et}"] = _bounded_recency(d_prev, cap=252.0, tau=10.0)
+
+    # -------------------------------------------------------------------------
+    # Composite macro features (aggregate major event signals for policy state)
+    # -------------------------------------------------------------------------
+    major_event_types = [et for et in _MAJOR_EVENT_TYPES if f"econ_events_calendar_prox_next_{et}" in out.columns]
+
+    # macro_upcoming_major: max proximity across major events (fomc, cpi, nfp)
+    if major_event_types:
+        prox_cols = [out[f"econ_events_calendar_prox_next_{et}"] for et in major_event_types]
+        out["econ_events_calendar_macro_upcoming_major"] = pd.concat(prox_cols, axis=1).max(axis=1).fillna(0.0)
+    else:
+        out["econ_events_calendar_macro_upcoming_major"] = 0.0
+
+    # macro_shock_major: max pulse strength across major events
+    if major_event_types:
+        shock_cols = [out[f"econ_events_calendar_pulse_strength_{et}"] for et in major_event_types if f"econ_events_calendar_pulse_strength_{et}" in out.columns]
+        if shock_cols:
+            out["econ_events_calendar_macro_shock_major"] = pd.concat(shock_cols, axis=1).max(axis=1).fillna(0.0)
+        else:
+            out["econ_events_calendar_macro_shock_major"] = 0.0
+    else:
+        out["econ_events_calendar_macro_shock_major"] = 0.0
+
+    # macro_surprise_signed: importance-weighted sum of pulse surprises (for directional macro impulse)
+    all_event_types = [et for et in [spec.key for spec in _EVENT_TYPES] if f"econ_events_calendar_pulse_surprise_{et}" in out.columns]
+    weighted_surprises = []
+    for et in all_event_types:
+        weight = _EVENT_IMPORTANCE_WEIGHTS.get(et, 1.0)
+        pulse_col = f"econ_events_calendar_pulse_surprise_{et}"
+        if pulse_col in out.columns:
+            weighted_surprises.append(out[pulse_col].fillna(0.0) * weight)
+    if weighted_surprises:
+        out["econ_events_calendar_macro_surprise_signed"] = sum(weighted_surprises).fillna(0.0)
+    else:
+        out["econ_events_calendar_macro_surprise_signed"] = 0.0
 
     out.attrs["telemetry"] = {
         "status": "ok",

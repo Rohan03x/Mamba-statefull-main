@@ -1,0 +1,82 @@
+# ==============================================================================
+# Mamba Stateful Phase 2 - Minimal Production Requirements
+# ==============================================================================
+# Pinned versions from working environment (2026-01-22)
+# Install with: pip install -r requirements-lock.txt
+# ==============================================================================
+
+# Core Scientific
+numpy==1.26.4
+pandas==2.3.2
+scipy==1.16.2
+scikit-learn==1.7.2
+statsmodels==0.14.5
+
+# PyTorch (CUDA 12.4)
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0
+triton==3.2.0
+
+# TensorFlow (optional)
+tensorflow==2.20.0
+tf_keras==2.20.1
+keras==3.11.3
+
+# Hugging Face
+transformers==4.56.2
+tokenizers==0.22.1
+datasets==4.1.1
+sentence-transformers==5.1.2
+accelerate==1.10.1
+safetensors==0.6.2
+huggingface-hub==0.35.1
+
+# ML & Optimization
+xgboost==3.0.5
+lightgbm==4.6.0
+optuna==4.5.0
+hyperopt==0.2.7
+ray==2.51.1
+
+# Financial Data
+yfinance==0.2.66
+alpaca-trade-api==3.2.0
+tiingo==0.16.1
+fredapi==0.5.2
+sec-edgar-downloader==5.0.3
+TA-Lib==0.6.7
+arch==8.0.0
+
+# Data Processing
+pyarrow==21.0.0
+joblib==1.5.2
+dill==0.4.0
+multiprocess==0.70.16
+
+# Visualization
+matplotlib==3.10.6
+seaborn==0.13.2
+
+# Web & API
+requests==2.32.5
+aiohttp==3.12.15
+websocket-client==1.8.0
+curl_cffi==0.13.0
+pyrate-limiter==3.9.0
+
+# Config & Validation
+pydantic==2.12.4
+python-dotenv==1.1.1
+PyYAML==6.0.1
+
+# Database
+SQLAlchemy==2.0.43
+alembic==1.16.5
+
+# Utilities
+tqdm==4.67.1
+rich==13.7.1
+click==8.1.6
+beautifulsoup4==4.14.0
+psutil==7.1.0

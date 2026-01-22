@@ -4869,7 +4869,1147 @@ def build_symbol_panel_cache(
         except Exception:
             pass
 
+        # ------------------------------------------------------------------
+        # Role-aware split outputs: Mamba (alpha) vs Portfolio (policy)
+        # ------------------------------------------------------------------
+        write_role_splits = os.getenv("PREP_FAMILIES_WRITE_ROLE_SPLITS", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+
+        mamba_panel: Optional[pd.DataFrame] = None
+        portfolio_panel: Optional[pd.DataFrame] = None
+        mamba_path: Optional[Path] = None
+        portfolio_path: Optional[Path] = None
+
+        if write_role_splits and isinstance(normalized_panel, pd.DataFrame):
+            try:
+                alt_prefix = "alternative_signals_"
+
+                alt_mamba_default = {
+                    "intraday_range_pct",
+                    "intraday_range_z",
+                    "opening_reversal",
+                    "closing_ramp",
+                    "overnight_return_z",
+                    "gap_up_pct",
+                    "gap_down_pct",
+                    "relative_volume_20d",
+                    "volume_z_20d",
+                    "volume_trend_10d",
+                    "opening_volume_surge",
+                    "volume_price_divergence",
+                    "earnings_runup_10d",
+                    "post_earnings_drift_5d",
+                    "news_volume_change",
+                    "news_volume_z",
+                    "trend_acceleration",
+                }
+
+                alt_mamba_optional = {
+                    "overnight_return",
+                    "gap_vs_vix_interaction",
+                    "buy_volume_proxy",
+                    "google_trends_score",
+                    "mean_reversion_signal",
+                }
+
+                alt_portfolio_only = {
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "beta_20d",
+                    "beta_change_rate",
+                    "beta_vix_interaction",
+                    "spy_correlation_20d",
+                    "qqq_correlation_20d",
+                    "sector_etf_correlation_20d",
+                    "rv_5d",
+                    "rv_10d",
+                    "rv_20d",
+                    "rv_ratio_5_20",
+                    "rv_z_20",
+                    "close_to_close_volatility",
+                    "open_to_close_volatility",
+                    "high_low_volatility_ratio",
+                    "intraday_volatility_ratio",
+                    "liquidity_stress_pct",
+                    "days_since_last_earnings",
+                    "days_to_next_earnings",
+                    "turn_of_month_flag",
+                    "news_volume_count",
+                }
+
+                arima_prefix = "arima_forecast_"
+                arima_mamba_default = {
+                    "arima_forecast_1d",
+                    "arima_forecast_5d",
+                    "arima_residual_zscore",
+                }
+                arima_mamba_optional = {
+                    "arima_residual_t",
+                    "arima_momentum_indicator",
+                }
+                arima_portfolio_only = {
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "arima_log_likelihood",
+                    "confidence",
+                    "arima_abs_residual",
+                    "arima_uncertainty_proxy",
+                    "arima_persistence",
+                    "arima_innovation",
+                }
+
+                quantile_prefix = "quantile_forecast_"
+                quantile_mamba_optional = {
+                    "q50",
+                    "q_median_50",
+                    "q_skewness_proxy",
+                    "skew",
+                    "q_tilt_direction",
+                    "hf_score",
+                }
+
+                candle_prefix = "candle_mechanics_"
+                candle_mamba_default = {
+                    "close_pos",
+                    "body_pct_range",
+                    "upper_wick_pct_range",
+                    "lower_wick_pct_range",
+                    "wick_imbalance",
+                    "body_atr14",
+                    "gap_atr14",
+                    "close_vs_prev_close_atr14",
+                    "high_vs_prev_close_atr14",
+                    "low_vs_prev_close_atr14",
+                    "logret_1d",
+                    "ret_5d",
+                    "rng_z_20",
+                    "trend_3",
+                    "trend_5",
+                    "body_z_20",
+                    "dist_to_high_20_atr14",
+                    "dist_to_low_20_atr14",
+                    "dist_to_mean_20_atr14",
+                    "vol_ratio_20",
+                    "vol_log_chg",
+                }
+                candle_mamba_optional = {
+                    "sign_sum_3",
+                    "sign_sum_5",
+                    "inside_bar",
+                    "outside_bar",
+                    "range_atr14",
+                }
+                candle_portfolio_only = {
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    "range_atr14",
+                    "atr_ratio_14_60",
+                    "rv_5",
+                    "rv_20",
+                    "dir_change",
+                    "inside_bar",
+                    "outside_bar",
+                    "ret_1d",
+                    "dow_1",
+                    "dow_2",
+                    "dow_3",
+                    "dow_4",
+                    "dow_5",
+                    "moy_1",
+                    "moy_2",
+                    "moy_3",
+                    "moy_4",
+                    "moy_5",
+                    "moy_6",
+                    "moy_7",
+                    "moy_8",
+                    "moy_9",
+                    "moy_10",
+                    "moy_11",
+                    "moy_12",
+                }
+
+                # ============================================================
+                # UNIFIED MAMBA OPTIONAL COLUMNS (single CLI command)
+                # ============================================================
+                # Format: MAMBA_OPTIONAL_COLUMNS="family:col1,col2;family2:col3,col4"
+                # Example: MAMBA_OPTIONAL_COLUMNS="correlation:corr_decoupling_z;dcf:undervaluation;cross_asset:all"
+                # Special values:
+                #   - "family:all" enables ALL optional columns for that family
+                #   - Column names are suffix only (without family prefix)
+                # 
+                # Supported families:
+                #   - correlation, corp_splits, cross_asset, dcf
+                #   - alt_signals, arima, quantile, candle
+                # ============================================================
+                unified_opt_raw = os.getenv("MAMBA_OPTIONAL_COLUMNS", "").strip().lower()
+                unified_opt_map: Dict[str, set] = {}
+                for segment in unified_opt_raw.split(";"):
+                    segment = segment.strip()
+                    if ":" in segment:
+                        fam, cols = segment.split(":", 1)
+                        fam = fam.strip()
+                        cols_set = {c.strip() for c in cols.split(",") if c.strip()}
+                        if fam not in unified_opt_map:
+                            unified_opt_map[fam] = set()
+                        unified_opt_map[fam].update(cols_set)
+
+                def _unified_mamba_enabled(family: str, suffix: str) -> bool:
+                    """Check if suffix is enabled for family in unified env var."""
+                    fam_opts = unified_opt_map.get(family, set())
+                    return "all" in fam_opts or suffix in fam_opts
+
+                # ------------------------------------------------------------
+                # Corp actions splits: route with bounded recency
+                # CRITICAL: Use corp_actions_splits_recency (bounded [0,1]) instead of
+                # raw days_since=9999 which corrupts role-aware averaging.
+                # Mamba: flag, log_ratio, post_5d, post_20d, recency (rare events, conditioning)
+                # Portfolio: all columns including recency (regime overlays)
+                # ------------------------------------------------------------
+                corp_splits_prefix = "corp_actions_splits_"
+                corp_splits_mamba_optional = {
+                    "flag",
+                    "log_ratio",
+                    "post_5d",
+                    "post_20d",
+                    "recency",
+                }
+                corp_splits_portfolio_only = {
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    "ratio",
+                    "days_since",  # Raw days_since still goes to portfolio but prefer recency
+                    "count_5y",
+                }
+
+                # ------------------------------------------------------------
+                # Correlation: predictive spillovers to Mamba, exposure/regime to portfolio
+                # ------------------------------------------------------------
+                correlation_prefix = "correlation_"
+                correlation_mamba_default = {
+                    # Spillover / propagation (predictive)
+                    "lag_corr_1_spy",
+                    "lag_corr_5_spy",
+                    "lag_corr_1_vxx",
+                    "lag_corr_2_vxx",
+                    # VIX lag correlations
+                    "corr_20_vix_lag1",
+                    "corr_60_vix_lag1",
+                    "corr_20_vix_lag2",
+                    "corr_60_vix_lag2",
+                    # Serial structure in returns (autocorrelation)
+                    "acf_ret_1",
+                    "acf_ret_5",
+                }
+                correlation_mamba_optional = {
+                    # Optional context (only if explicitly enabled)
+                    "corr_decoupling_z",
+                    "corr_spread_20_60_spy",
+                }
+                correlation_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    # RISK: systematic exposure
+                    "corr_20_spy",
+                    "corr_60_spy",
+                    "corr_20_qqq",
+                    "corr_20_vxx",
+                    "corr_20_sector",
+                    "corr_20_spy_vol",
+                    "corr_20_vxx_vol",
+                    # REGIME: regime shifts, instability
+                    "corr_decoupling_z",
+                    "corr_spread_20_60_spy",
+                    "corr_20_spy_trend",
+                    "corr_20_qqq_trend",
+                    "corr_20_vxx_trend",
+                    "corr_spread_20_60_qqq",
+                    "corr_return_vol_20",
+                    "corr_return_range_10",
+                    "corr_vol_volatility_20",
+                    "acf_absret_1",
+                    "acf_vol_1",
+                }
+
+                # Environment variable for optional correlation columns in Mamba
+                # Supports both legacy CORRELATION_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                corr_opt_raw = os.getenv("CORRELATION_MAMBA_OPTIONAL", "").strip().lower()
+                corr_opt_tokens = {t.strip() for t in corr_opt_raw.split(",") if t.strip()}
+
+                def _corr_mamba_enabled(suffix: str) -> bool:
+                    return suffix in corr_opt_tokens or _unified_mamba_enabled("correlation", suffix)
+
+                # Environment variable for optional corp_splits columns in Mamba
+                # Supports both legacy CORP_SPLITS_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                splits_opt_raw = os.getenv("CORP_SPLITS_MAMBA_OPTIONAL", "").strip().lower()
+                splits_opt_tokens = {t.strip() for t in splits_opt_raw.split(",") if t.strip()}
+                splits_opt_all = "all" in splits_opt_tokens
+
+                def _splits_mamba_enabled(suffix: str) -> bool:
+                    return bool(splits_opt_all or suffix in splits_opt_tokens or _unified_mamba_enabled("corp_splits", suffix))
+
+                # ------------------------------------------------------------
+                # Cross-asset: lead/lag predictors to Mamba, everything else to portfolio
+                # CRITICAL: Regime-change fields are ABSOLUTE MAGNITUDE for stress aggregation
+                # ------------------------------------------------------------
+                cross_asset_prefix = "cross_asset_"
+                cross_asset_mamba_default = {
+                    # Lead/lag analysis: per-asset timing/leadership patterns
+                    "spy_leads_stock_5d",
+                    "stock_leads_spy_5d",
+                }
+                cross_asset_mamba_optional = set()  # Currently none
+                cross_asset_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    # RISK: systematic exposure
+                    "spy_corr_20d",
+                    "qqq_corr_20d",
+                    "sector_etf_corr_20d",
+                    "beta_20d",
+                    "beta_volatility_20d",
+                    "vix_corr_20d",
+                    "vix_spread_indicator",
+                    "realized_vol_vs_spy_corr",
+                    "tnx_corr_20d",
+                    "irx_corr_20d",
+                    "credit_spread_level",
+                    "asset_corr_hyg_60",
+                    "asset_corr_uup_60",
+                    "risk_offness",  # One-sided stress for overlays
+                    # REGIME: regime-break detectors (ABSOLUTE MAGNITUDE)
+                    "beta_change_rate",
+                    "beta_volatility_change",
+                    "beta_sign_flip_flag",
+                    "tnx_corr_change_5d",
+                    "irx_corr_change_5d",
+                    "cross_asset_coupling_change",
+                    "risk_onoff_factor",  # Directional, for policy state only
+                }
+
+                # Environment variable for optional cross_asset columns in Mamba
+                # Supports both legacy CROSS_ASSET_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                xasset_opt_raw = os.getenv("CROSS_ASSET_MAMBA_OPTIONAL", "").strip().lower()
+                xasset_opt_tokens = {t.strip() for t in xasset_opt_raw.split(",") if t.strip()}
+
+                def _xasset_mamba_enabled(suffix: str) -> bool:
+                    return suffix in xasset_opt_tokens or _unified_mamba_enabled("cross_asset", suffix)
+
+                # ------------------------------------------------------------
+                # DCF: momentum/z-score predictors to Mamba, anchors/stress to portfolio
+                # CRITICAL: One-sided stress signals (overextension, downside_skew_stress)
+                # ------------------------------------------------------------
+                dcf_prefix = "dcf_"
+                dcf_mamba_default = {
+                    # Momentum (alpha signals)
+                    "mom_1m",
+                    "mom_3m",
+                    "mom_12m",
+                    "mom_vol_adjusted",
+                    "mom_sharped",
+                    # Mean-reversion z-scores
+                    "zscore_1m",
+                    "zscore_3m",
+                    # Value-momentum mix
+                    "value_momentum_ratio",
+                    # Directional alpha signals (NOT stress)
+                    "undervaluation",
+                    "scenario_skew",
+                }
+                dcf_mamba_optional = set()  # Currently none
+                dcf_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    # REGIME: anchor ratios (raw and log)
+                    "price_to_fairvalue_1y",
+                    "price_to_fairvalue_3m",
+                    "price_regime",
+                    "log_p2fv_1y",
+                    "log_p2fv_3m",
+                    "log_price_regime",
+                    # Trend quality
+                    "trend_slope_1m",
+                    "trend_stability",
+                    # Scenario positioning
+                    "scenario_position",
+                    "terminal_value_pct",
+                    # RISK: volatility-adjusted + one-sided stress
+                    "vol_adjusted_value",
+                    "scenario_spread",
+                    "overextension",
+                    "downside_skew_stress",
+                }
+
+                # Environment variable for optional dcf columns in Mamba
+                # Supports both legacy DCF_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                dcf_opt_raw = os.getenv("DCF_MAMBA_OPTIONAL", "").strip().lower()
+                dcf_opt_tokens = {t.strip() for t in dcf_opt_raw.split(",") if t.strip()}
+
+                def _dcf_mamba_enabled(suffix: str) -> bool:
+                    return suffix in dcf_opt_tokens or _unified_mamba_enabled("dcf", suffix)
+
+                # ------------------------------------------------------------
+                # Dividends: event_intensity to Mamba (if labels are adjusted), rest to portfolio
+                # CRITICAL: dividend_event_stress is one-sided RISK for overlays
+                # ------------------------------------------------------------
+                dividends_prefix = "dividends_"
+                dividends_mamba_conditional = {
+                    # Only include if labels are dividend-adjusted AND shifted
+                    "dividend_event_intensity",
+                }
+                dividends_mamba_optional = {
+                    # Optional context (enable via env var if you trust your label pipeline)
+                    "ex_dividend_window_strength",
+                    "days_to_ex_dividend",
+                }
+                dividends_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    # RISK: yield metrics
+                    "dividend_yield_est",
+                    "dividend_yield_zscore",
+                    # RISK: one-sided event stress
+                    "dividend_event_stress",
+                    # REGIME: event proximity
+                    "days_to_ex_dividend",
+                    "ex_dividend_window_strength",
+                    # REGIME: structural
+                    "dividend_frequency",
+                    "dividend_amount",
+                }
+
+                # Environment variable for optional dividends columns in Mamba
+                # Supports both legacy DIVIDENDS_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                div_opt_raw = os.getenv("DIVIDENDS_MAMBA_OPTIONAL", "").strip().lower()
+                div_opt_tokens = {t.strip() for t in div_opt_raw.split(",") if t.strip()}
+                div_opt_all = "all" in div_opt_tokens
+
+                def _div_mamba_enabled(suffix: str) -> bool:
+                    return bool(div_opt_all or suffix in div_opt_tokens or _unified_mamba_enabled("dividends", suffix))
+
+                # ------------------------------------------------------------
+                # Earnings: surprises/growth/revisions/beat-rate to Mamba, stress/dispersion to portfolio
+                # CRITICAL: Surprises are SHIFTED by 1 day in EarningsAnalyzer (leakage prevention)
+                # CRITICAL: pre_event_stress and post_event_stress are one-sided RISK for overlays
+                # ------------------------------------------------------------
+                earnings_prefix = "earnings_"
+                earnings_mamba_default = {
+                    # Core alpha signals (SHIFTED to prevent leakage)
+                    "eps_surprise_pct",
+                    "revenue_surprise_pct",
+                    # Growth trends
+                    "eps_growth_qoq",
+                    "eps_growth_yoy",
+                    "revenue_growth_qoq",
+                    "revenue_growth_yoy",
+                    # Beat patterns (HIGH ALPHA)
+                    "beat_streak",
+                    "beat_rate_3y",
+                    # Revisions (CRITICAL ALPHA)
+                    "revision_breadth",
+                    # Event decay (PEAD capture)
+                    "event_decay",
+                }
+                earnings_mamba_optional = {
+                    # Optional conditioning (enable via env var)
+                    "days_since_earnings",
+                    "days_to_next_earnings",
+                }
+                earnings_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    # RISK: uncertainty / volatility
+                    "miss_streak",
+                    "surprise_volatility",
+                    "estimate_dispersion",
+                    # RISK: one-sided event stress (magnitude-based)
+                    "pre_event_stress",
+                    "post_event_stress",
+                    # REGIME: event timing (also useful for policy state)
+                    "days_since_earnings",
+                    "days_to_next_earnings",
+                }
+
+                # Environment variable for optional earnings columns in Mamba
+                # Supports both legacy EARNINGS_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                earn_opt_raw = os.getenv("EARNINGS_MAMBA_OPTIONAL", "").strip().lower()
+                earn_opt_tokens = {t.strip() for t in earn_opt_raw.split(",") if t.strip()}
+                earn_opt_all = "all" in earn_opt_tokens
+
+                def _earn_mamba_enabled(suffix: str) -> bool:
+                    return bool(earn_opt_all or suffix in earn_opt_tokens or _unified_mamba_enabled("earnings", suffix))
+
+                # ------------------------------------------------------------
+                # CBOE term structure: ALL columns go to portfolio, NONE to Mamba
+                # This family provides market stress context for overlays/policy state
+                # ------------------------------------------------------------
+                cboe_prefix = "cboe_term_"
+                # Raw column names from cboe_term.py (unprefixed)
+                cboe_raw_cols = {
+                    "vxst_vix_term_slope",
+                    "vix_vxv_term_slope",
+                    "vix_vxmt_term_slope",
+                    "normalized_term_slope",
+                    "vix_term_curvature",
+                    "front_back_spread",
+                    "panic_premium",
+                    "vix_roll_yield",
+                    "vix_ratio_term",
+                    "vix_contango_strength",
+                    "vol_risk_premium",
+                    "vol_risk_premium_pct",
+                    "vol_risk_premium_z",
+                    "vix_term_slope_change_1d",
+                    "vix_term_slope_change_5d",
+                    "vix_curvature_change",
+                    "panic_premium_change",
+                }
+
+                # ------------------------------------------------------------
+                # Calibration: ALL columns go to portfolio (quality→RISK, not Mamba)
+                # Meta-performance signals should NEVER be fed to the model being graded
+                # ------------------------------------------------------------
+                calibration_prefix = "calibration_"
+                calibration_portfolio_only = {
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "mean_calibration_error",
+                    "overall_score",
+                    "interval_error",
+                    "quantile_error",
+                    "sharpness",
+                    "reliability",
+                    "calibration_slope",
+                    "calibration_intercept",
+                    "brier_score",
+                    "log_loss",
+                    "expected_calibration_error",
+                    "maximum_calibration_error",
+                    "requires_recalibration",
+                    "recalibration_flag",
+                    "model_stale",
+                    "quality_regime",
+                }
+
+                # ------------------------------------------------------------
+                # Online learning: ALL columns go to portfolio (trust/drift signals)
+                # These are meta-performance signals, not predictive features
+                # ------------------------------------------------------------
+                online_prefix = "online_learning_"
+                online_portfolio_only = {
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "trust_score",
+                    "model_confidence",
+                    "direction_accuracy",
+                    "sign_accuracy",
+                    "hit_rate",
+                    "accuracy",
+                    "quantile_accuracy",
+                    "mse",
+                    "mae",
+                    "sharpe_estimate",
+                    "information_ratio",
+                    "uncertainty_estimate",
+                    "prediction_variance",
+                    "drift_flag",
+                    "partial_retrain_flag",
+                    "full_retrain_flag",
+                    "uncertainty_compression_alert",
+                    "regime_shift_detected",
+                    "distribution_drift",
+                    "concept_drift",
+                    "covariate_drift",
+                    "regime_prob_bull",
+                    "regime_prob_bear",
+                    "regime_prob_neutral",
+                    "regime_probability",
+                }
+
+                # ------------------------------------------------------------
+                # Econ events calendar: selective routing
+                # Compact macro context to Mamba; regime/risk overlays to portfolio
+                # CRITICAL: 9999 sentinels replaced with bounded prox_next_* / recency_last_*
+                # ------------------------------------------------------------
+                econ_events_prefix = "econ_events_calendar_"
+                econ_events_mamba_default = {
+                    # Pulse surprises (shifted, signed, for directional context)
+                    "pulse_surprise_cpi",
+                    "pulse_surprise_fomc",
+                    "pulse_surprise_nfp",
+                    "pulse_surprise_gdp",
+                    "pulse_surprise_pce",
+                    "pulse_surprise_unemployment",
+                    "pulse_surprise_retail_sales",
+                    "pulse_surprise_ism",
+                    "pulse_surprise_core_cpi",
+                    # Pulse strength (magnitude only)
+                    "pulse_strength_cpi",
+                    "pulse_strength_fomc",
+                    "pulse_strength_nfp",
+                    "pulse_strength_gdp",
+                    "pulse_strength_pce",
+                    "pulse_strength_unemployment",
+                    "pulse_strength_retail_sales",
+                    "pulse_strength_ism",
+                    "pulse_strength_core_cpi",
+                    # Bounded proximity (safe for aggregation)
+                    "prox_next_cpi",
+                    "prox_next_fomc",
+                    "prox_next_nfp",
+                    "prox_next_gdp",
+                    "prox_next_pce",
+                    "prox_next_unemployment",
+                    "prox_next_retail_sales",
+                    "prox_next_ism",
+                    "prox_next_core_cpi",
+                }
+                econ_events_mamba_optional = {
+                    # Optional: z-scored surprises (more selective context)
+                    "surprise_z_cpi",
+                    "surprise_z_fomc",
+                    "surprise_z_nfp",
+                    "surprise_z_gdp",
+                    "surprise_z_pce",
+                    "surprise_z_unemployment",
+                    "surprise_z_retail_sales",
+                    "surprise_z_ism",
+                    "surprise_z_core_cpi",
+                }
+                econ_events_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    # RISK: composite stress
+                    "macro_shock_major",
+                    "macro_upcoming_major",
+                    # REGIME: composite signed (for policy state)
+                    "macro_surprise_signed",
+                    # Note: pre_window_*, post_window_*, recency_last_*, event_occurrence_*,
+                    # pulse_occurrence_*, days_to_next_*, days_since_last_* all go to portfolio
+                }
+
+                # Environment variable for optional econ columns in Mamba
+                econ_opt_raw = os.getenv("ECON_EVENTS_MAMBA_OPTIONAL", "").strip().lower()
+                econ_opt_tokens = {t.strip() for t in econ_opt_raw.split(",") if t.strip()}
+                econ_opt_all = "all" in econ_opt_tokens
+
+                def _econ_mamba_enabled(suffix: str) -> bool:
+                    return bool(econ_opt_all or suffix in econ_opt_tokens or _unified_mamba_enabled("econ_events", suffix))
+
+                # ------------------------------------------------------------
+                # Exchange calendar: ALL columns go to portfolio, NONE to Mamba
+                # Execution/microstructure regime context (not alpha)
+                # CRITICAL: 9999 sentinels replaced with bounded holiday_prox / holiday_recency
+                # CRITICAL: liquidity_stress composite for position sizing
+                # ------------------------------------------------------------
+                exchange_calendar_prefix = "exchange_calendar_"
+                exchange_calendar_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    "confidence",
+                    # RISK: liquidity stress for position sizing
+                    "liquidity_stress",
+                    # REGIME: event flags
+                    "is_holiday_adjacent",
+                    "is_half_day",
+                    # REGIME: bounded proximity/recency
+                    "holiday_prox",
+                    "holiday_recency",
+                    # DEPRECATED (keep for backward compat)
+                    "days_to_holiday",
+                    "days_since_holiday",
+                }
+
+                # ------------------------------------------------------------
+                # FIN_G1 (Liquidity): stress to portfolio, raw ratios optional for Mamba
+                # CRITICAL: Raw ratios are HIGHER = SAFER (inverted meaning)
+                # CRITICAL: Use *_stress features for portfolio risk overlays
+                # ------------------------------------------------------------
+                fin_g1_prefix = "fin_g1_"
+                fin_g1_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    # RISK: stress features (higher = worse, safe for aggregation)
+                    "liquidity_stress",
+                    "quick_stress",
+                    "cash_stress",
+                    "liquidity_trend_stress",
+                    "liquidity_zscore_5y",
+                    # REGIME: trend direction
+                    "liquidity_trend_3y",
+                }
+                fin_g1_mamba_optional = {
+                    # Raw ratios: only include if horizon >= 21d
+                    "current_ratio",
+                    "quick_ratio",
+                    "cash_ratio",
+                }
+
+                # Environment variable for optional fin_g1 columns in Mamba
+                fin_g1_opt_raw = os.getenv("FIN_G1_MAMBA_OPTIONAL", "").strip().lower()
+                fin_g1_opt_tokens = {t.strip() for t in fin_g1_opt_raw.split(",") if t.strip()}
+                fin_g1_opt_all = "all" in fin_g1_opt_tokens
+
+                def _fin_g1_mamba_enabled(suffix: str) -> bool:
+                    return bool(fin_g1_opt_all or suffix in fin_g1_opt_tokens or _unified_mamba_enabled("fin_g1", suffix))
+
+                # ------------------------------------------------------------
+                # FIN_G2 (Leverage): stress to portfolio, raw ratios optional for Mamba
+                # CRITICAL: interest_coverage is HIGHER = SAFER (use _stress variant)
+                # CRITICAL: Use robust transforms for exploding debt ratios
+                # ------------------------------------------------------------
+                fin_g2_prefix = "fin_g2_"
+                fin_g2_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    # RISK: stress features (higher = worse)
+                    "interest_coverage_stress",
+                    "debt_to_equity_robust",
+                    "net_debt_to_ebitda_robust",
+                    "leverage_zscore_5y",
+                    # RISK: raw leverage ratios (already higher = worse)
+                    "debt_to_equity",
+                    "debt_to_assets",
+                    "equity_multiplier",
+                    "net_debt_to_ebitda",
+                    "net_debt_to_fcf",
+                    "interest_burden",
+                    # REGIME: debt levels and trend
+                    "total_debt",
+                    "long_term_debt",
+                    "leverage_trend_3y",
+                }
+                fin_g2_mamba_optional = {
+                    # Raw coverage: only include if horizon >= 21d
+                    "interest_coverage",
+                }
+
+                # Environment variable for optional fin_g2 columns in Mamba
+                fin_g2_opt_raw = os.getenv("FIN_G2_MAMBA_OPTIONAL", "").strip().lower()
+                fin_g2_opt_tokens = {t.strip() for t in fin_g2_opt_raw.split(",") if t.strip()}
+                fin_g2_opt_all = "all" in fin_g2_opt_tokens
+
+                def _fin_g2_mamba_enabled(suffix: str) -> bool:
+                    return bool(fin_g2_opt_all or suffix in fin_g2_opt_tokens or _unified_mamba_enabled("fin_g2", suffix))
+
+                # ------------------------------------------------------------
+                # FIN_G3 (Efficiency): stress to portfolio, turnover ratios industry-structural
+                # CRITICAL: Raw turnover ratios are INDUSTRY-STRUCTURAL
+                # CRITICAL: Prefer sector-normalized versions or keep out of Mamba
+                # ------------------------------------------------------------
+                fin_g3_prefix = "fin_g3_"
+                fin_g3_portfolio_only = {
+                    # HYGIENE
+                    "has_data",
+                    "activity",
+                    "days_since_update",
+                    # RISK: stress features (higher = worse)
+                    "ccc_stress",
+                    "turnover_volatility_3y",
+                    # REGIME: days outstanding and CCC
+                    "dsos",
+                    "dios",
+                    "dpos",
+                    "ccc",
+                }
+                fin_g3_mamba_optional = {
+                    # Raw turnover ratios: only include if sector-normalized
+                    "asset_turnover",
+                    "inventory_turnover",
+                    "receivables_turnover",
+                    "payables_turnover",
+                }
+
+                # Environment variable for optional fin_g3 columns in Mamba
+                fin_g3_opt_raw = os.getenv("FIN_G3_MAMBA_OPTIONAL", "").strip().lower()
+                fin_g3_opt_tokens = {t.strip() for t in fin_g3_opt_raw.split(",") if t.strip()}
+                fin_g3_opt_all = "all" in fin_g3_opt_tokens
+
+                def _fin_g3_mamba_enabled(suffix: str) -> bool:
+                    return bool(fin_g3_opt_all or suffix in fin_g3_opt_tokens or _unified_mamba_enabled("fin_g3", suffix))
+
+                # Optional alt-signals columns can be enabled for Mamba via env list.
+                # Supports both legacy ALT_SIGNALS_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                # Example: ALT_SIGNALS_MAMBA_OPTIONAL="overnight_return,gap_vs_vix_interaction"
+                # Example: MAMBA_OPTIONAL_COLUMNS="alt_signals:overnight_return,gap_vs_vix_interaction"
+                opt_raw = os.getenv("ALT_SIGNALS_MAMBA_OPTIONAL", "").strip().lower()
+                opt_tokens = {t.strip() for t in opt_raw.split(",") if t.strip()}
+                opt_all = "all" in opt_tokens
+
+                def _alt_mamba_enabled(suffix: str) -> bool:
+                    return bool(opt_all or suffix in opt_tokens or _unified_mamba_enabled("alt_signals", suffix))
+
+                # Supports both legacy ARIMA_FORECAST_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                arima_opt_raw = os.getenv("ARIMA_FORECAST_MAMBA_OPTIONAL", "").strip().lower()
+                arima_opt_tokens = {t.strip() for t in arima_opt_raw.split(",") if t.strip()}
+                arima_opt_all = "all" in arima_opt_tokens
+
+                def _arima_mamba_enabled(suffix: str) -> bool:
+                    return bool(arima_opt_all or suffix in arima_opt_tokens or _unified_mamba_enabled("arima", suffix))
+
+                # Supports both legacy QUANTILE_FORECAST_MAMBA_STACKING and unified MAMBA_OPTIONAL_COLUMNS
+                quantile_opt_raw = os.getenv("QUANTILE_FORECAST_MAMBA_STACKING", "").strip().lower()
+                quantile_opt_tokens = {t.strip() for t in quantile_opt_raw.split(",") if t.strip()}
+                quantile_opt_all = "all" in quantile_opt_tokens
+
+                def _quantile_mamba_enabled(suffix: str) -> bool:
+                    return bool(quantile_opt_all or suffix in quantile_opt_tokens or _unified_mamba_enabled("quantile", suffix))
+
+                # Supports both legacy CANDLE_MECHANICS_MAMBA_OPTIONAL and unified MAMBA_OPTIONAL_COLUMNS
+                candle_opt_raw = os.getenv("CANDLE_MECHANICS_MAMBA_OPTIONAL", "").strip().lower()
+                candle_opt_tokens = {t.strip() for t in candle_opt_raw.split(",") if t.strip()}
+                candle_opt_all = "all" in candle_opt_tokens
+
+                def _candle_mamba_enabled(suffix: str) -> bool:
+                    return bool(candle_opt_all or suffix in candle_opt_tokens or _unified_mamba_enabled("candle", suffix))
+
+                mamba_cols: List[str] = []
+                portfolio_cols: List[str] = []
+
+                for col in [c for c in normalized_panel.columns if str(c) != "date"]:
+                    col_s = str(col)
+                    col_lower = col_s.lower()
+                    stream = "portfolio"
+
+                    # --------------------------------------------------------
+                    # CBOE term structure: ALL to portfolio, NONE to Mamba
+                    # --------------------------------------------------------
+                    if col_s.startswith(cboe_prefix) or col_lower in cboe_raw_cols:
+                        stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Calibration: ALL to portfolio (meta-performance)
+                    # --------------------------------------------------------
+                    elif col_s.startswith(calibration_prefix):
+                        stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Online learning: ALL to portfolio (meta-performance)
+                    # --------------------------------------------------------
+                    elif col_s.startswith(online_prefix):
+                        stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Alternative signals: selective routing
+                    # --------------------------------------------------------
+                    elif col_s.startswith(alt_prefix):
+                        suffix = col_s[len(alt_prefix):].lower()
+                        if suffix in alt_mamba_default:
+                            stream = "mamba"
+                        elif suffix in alt_mamba_optional and _alt_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # ARIMA forecast: selective routing
+                    # --------------------------------------------------------
+                    elif col_s.startswith(arima_prefix):
+                        suffix = col_s[len(arima_prefix):].lower()
+                        if suffix in arima_mamba_default:
+                            stream = "mamba"
+                        elif suffix in arima_mamba_optional and _arima_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Quantile forecast: portfolio by default (Option 1 from spec)
+                    # --------------------------------------------------------
+                    elif col_s.startswith(quantile_prefix):
+                        suffix = col_s[len(quantile_prefix):].lower()
+                        if suffix in quantile_mamba_optional and _quantile_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Candle mechanics: selective routing
+                    # --------------------------------------------------------
+                    elif col_s.startswith(candle_prefix):
+                        suffix = col_s[len(candle_prefix):].lower()
+                        if suffix in candle_mamba_default:
+                            stream = "mamba"
+                        elif suffix in candle_mamba_optional and _candle_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in candle_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Corp actions splits: selective routing with bounded recency
+                    # CRITICAL: Use recency (bounded [0,1]) for Mamba, not raw days_since
+                    # --------------------------------------------------------
+                    elif col_s.startswith(corp_splits_prefix):
+                        suffix = col_s[len(corp_splits_prefix):].lower()
+                        if suffix in corp_splits_portfolio_only:
+                            stream = "portfolio"
+                        elif suffix in corp_splits_mamba_optional and _splits_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Correlation: predictive spillovers to Mamba, exposure/regime to portfolio
+                    # --------------------------------------------------------
+                    elif col_s.startswith(correlation_prefix) or col_lower.startswith("corr_") or col_lower.startswith("acf_") or col_lower.startswith("lag_corr_"):
+                        # Extract suffix for matching
+                        if col_s.startswith(correlation_prefix):
+                            suffix = col_s[len(correlation_prefix):].lower()
+                        else:
+                            suffix = col_lower
+                        if suffix in correlation_mamba_default:
+                            stream = "mamba"
+                        elif suffix in correlation_mamba_optional and _corr_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in correlation_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Cross-asset: lead/lag predictors to Mamba, everything else to portfolio
+                    # CRITICAL: Regime-change fields are ABSOLUTE MAGNITUDE for stress aggregation
+                    # --------------------------------------------------------
+                    elif col_s.startswith(cross_asset_prefix) or col_lower.startswith("cross_asset_"):
+                        if col_s.startswith(cross_asset_prefix):
+                            suffix = col_s[len(cross_asset_prefix):].lower()
+                        else:
+                            suffix = col_lower[len("cross_asset_"):]
+                        if suffix in cross_asset_mamba_default:
+                            stream = "mamba"
+                        elif suffix in cross_asset_mamba_optional and _xasset_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in cross_asset_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # DCF: momentum/z-score predictors to Mamba, anchors/stress to portfolio
+                    # CRITICAL: One-sided stress signals (overextension, downside_skew_stress)
+                    # --------------------------------------------------------
+                    elif col_s.startswith(dcf_prefix):
+                        suffix = col_s[len(dcf_prefix):].lower()
+                        if suffix in dcf_mamba_default:
+                            stream = "mamba"
+                        elif suffix in dcf_mamba_optional and _dcf_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in dcf_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Dividends: event_intensity to Mamba (conditional), rest to portfolio
+                    # CRITICAL: dividend_event_stress is one-sided RISK for overlays
+                    # --------------------------------------------------------
+                    elif col_s.startswith(dividends_prefix):
+                        suffix = col_s[len(dividends_prefix):].lower()
+                        if suffix in dividends_mamba_conditional and _div_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in dividends_mamba_optional and _div_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in dividends_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Earnings: surprises/growth/revisions to Mamba, stress/dispersion to portfolio
+                    # CRITICAL: Surprises are SHIFTED by 1 day (leakage prevention)
+                    # CRITICAL: pre_event_stress and post_event_stress are one-sided RISK
+                    # --------------------------------------------------------
+                    elif col_s.startswith(earnings_prefix):
+                        suffix = col_s[len(earnings_prefix):].lower()
+                        if suffix in earnings_mamba_default:
+                            stream = "mamba"
+                        elif suffix in earnings_mamba_optional and _earn_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in earnings_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Econ events calendar: compact macro context to Mamba, rest to portfolio
+                    # CRITICAL: Use bounded prox_next_* / recency_last_* (not 9999 sentinels)
+                    # --------------------------------------------------------
+                    elif col_s.startswith(econ_events_prefix):
+                        suffix = col_s[len(econ_events_prefix):].lower()
+                        if suffix in econ_events_mamba_default:
+                            stream = "mamba"
+                        elif suffix in econ_events_mamba_optional and _econ_mamba_enabled(suffix):
+                            stream = "mamba"
+                        elif suffix in econ_events_portfolio_only:
+                            stream = "portfolio"
+                        else:
+                            # Pre/post windows, recency, occurrences, raw days go to portfolio
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Exchange calendar: ALL to portfolio (execution/microstructure context)
+                    # CRITICAL: Use bounded holiday_prox / holiday_recency + liquidity_stress
+                    # --------------------------------------------------------
+                    elif col_s.startswith(exchange_calendar_prefix):
+                        # All exchange_calendar columns go to portfolio by design
+                        stream = "portfolio"
+                    # --------------------------------------------------------
+                    # FIN_G1 (Liquidity): stress to portfolio, raw ratios optional
+                    # CRITICAL: Raw ratios are HIGHER = SAFER (inverted for risk_scale)
+                    # --------------------------------------------------------
+                    elif col_s.startswith(fin_g1_prefix):
+                        suffix = col_s[len(fin_g1_prefix):].lower()
+                        if suffix in fin_g1_portfolio_only:
+                            stream = "portfolio"
+                        elif suffix in fin_g1_mamba_optional and _fin_g1_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            # Unknown fin_g1 columns go to portfolio by default
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # FIN_G2 (Leverage): stress to portfolio, raw ratios optional
+                    # CRITICAL: interest_coverage is HIGHER = SAFER
+                    # --------------------------------------------------------
+                    elif col_s.startswith(fin_g2_prefix):
+                        suffix = col_s[len(fin_g2_prefix):].lower()
+                        if suffix in fin_g2_portfolio_only:
+                            stream = "portfolio"
+                        elif suffix in fin_g2_mamba_optional and _fin_g2_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            # Unknown fin_g2 columns go to portfolio by default
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # FIN_G3 (Efficiency): stress to portfolio, turnover optional
+                    # CRITICAL: Turnover ratios are INDUSTRY-STRUCTURAL
+                    # --------------------------------------------------------
+                    elif col_s.startswith(fin_g3_prefix):
+                        suffix = col_s[len(fin_g3_prefix):].lower()
+                        if suffix in fin_g3_portfolio_only:
+                            stream = "portfolio"
+                        elif suffix in fin_g3_mamba_optional and _fin_g3_mamba_enabled(suffix):
+                            stream = "mamba"
+                        else:
+                            # Unknown fin_g3 columns go to portfolio by default
+                            stream = "portfolio"
+                    # --------------------------------------------------------
+                    # Default: use role_map from feature_roles
+                    # --------------------------------------------------------
+                    else:
+                        role = str(role_map.get(col_s, ""))
+                        stream = "mamba" if role == "predictive" else "portfolio"
+
+                    if stream == "mamba":
+                        mamba_cols.append(col_s)
+                    else:
+                        portfolio_cols.append(col_s)
+
+                # De-dup while preserving order
+                def _uniq(xs: List[str]) -> List[str]:
+                    seen: set[str] = set()
+                    out: List[str] = []
+                    for x in xs:
+                        if x in seen:
+                            continue
+                        seen.add(x)
+                        out.append(x)
+                    return out
+
+                mamba_cols = _uniq(mamba_cols)
+                portfolio_cols = _uniq(portfolio_cols)
+
+                # Ensure total coverage (no leaks, no drops)
+                all_feature_cols = [c for c in normalized_panel.columns if str(c) != "date"]
+                covered = set(mamba_cols).union(set(portfolio_cols))
+                missing = [c for c in all_feature_cols if c not in covered]
+                overlap = set(mamba_cols).intersection(set(portfolio_cols))
+                if missing:
+                    LOGGER.warning("Role split: %d columns unassigned; routing to portfolio by default.", len(missing))
+                    portfolio_cols.extend(missing)
+                    portfolio_cols = _uniq(portfolio_cols)
+                if overlap:
+                    LOGGER.warning("Role split: %d columns assigned to both streams; keeping in portfolio only.", len(overlap))
+                    mamba_cols = [c for c in mamba_cols if c not in overlap]
+
+                # Build split frames
+                base_cols = ["date"] if "date" in normalized_panel.columns else []
+                mamba_panel = normalized_panel[base_cols + mamba_cols].copy()
+                portfolio_panel = normalized_panel[base_cols + portfolio_cols].copy()
+
+                # Apply alternative_signals staleness weight
+                has_col = f"{alt_prefix}has_data"
+                act_col = f"{alt_prefix}activity"
+                days_col = f"{alt_prefix}days_since_update"
+                if has_col in normalized_panel.columns and act_col in normalized_panel.columns and days_col in normalized_panel.columns:
+                    has = pd.to_numeric(normalized_panel[has_col], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+                    activity = pd.to_numeric(normalized_panel[act_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+                    days = pd.to_numeric(normalized_panel[days_col], errors="coerce").fillna(9999.0).clip(lower=0.0)
+                    k_default = float(np.log(2.0) / 2.0)
+                    try:
+                        k = float(os.getenv("ALT_SIGNALS_STALENESS_K", str(k_default)))
+                    except Exception:
+                        k = k_default
+                    w_stale = has * activity * np.exp(-k * days)
+                else:
+                    w_stale = pd.Series(0.0, index=normalized_panel.index)
+
+                # Mamba: apply staleness decay to alternative_signals predictive features only
+                if not mamba_panel.empty:
+                    for col_s in [c for c in mamba_cols if str(c).startswith(alt_prefix)]:
+                        if col_s in mamba_panel.columns:
+                            mamba_panel[col_s] = pd.to_numeric(mamba_panel[col_s], errors="coerce").fillna(0.0) * w_stale
+
+                # Portfolio: expose staleness weight for gating/threshold control
+                if not portfolio_panel.empty:
+                    w_name = f"{alt_prefix}stale_weight"
+                    if w_name not in portfolio_panel.columns:
+                        portfolio_panel[w_name] = pd.to_numeric(w_stale, errors="coerce").fillna(0.0)
+
+                sym_u = str(symbol).upper()
+                h_i = int(horizon)
+                mamba_path = panel_path.with_name(f"{sym_u}_h{h_i}_merged_mamba.parquet")
+                portfolio_path = panel_path.with_name(f"{sym_u}_h{h_i}_merged_portfolio.parquet")
+            except Exception as exc:
+                LOGGER.warning("Role split failed for %s h%d: %s", symbol, int(horizon), exc)
+                mamba_panel = None
+                portfolio_panel = None
+                mamba_path = None
+                portfolio_path = None
+
         normalized_panel.to_parquet(panel_path, index=False)
+
+        # Write split parquets (best-effort; do not fail build)
+        try:
+            if write_role_splits and mamba_panel is not None and mamba_path is not None:
+                mamba_panel.to_parquet(mamba_path, index=False)
+            if write_role_splits and portfolio_panel is not None and portfolio_path is not None:
+                portfolio_panel.to_parquet(portfolio_path, index=False)
+        except Exception as exc:
+            LOGGER.warning("Failed writing role-split panels for %s h%d: %s", symbol, int(horizon), exc)
+
         meta = {
             "symbol": symbol,
             "horizon": horizon,
@@ -4883,6 +6023,8 @@ def build_symbol_panel_cache(
             "provenance_path": str(provenance_path),
             "features_path": str(features_path) if features_path is not None else "",
             "index_path": str(index_path) if index_path is not None else "",
+            "mamba_panel_path": str(mamba_path) if mamba_path is not None else "",
+            "portfolio_panel_path": str(portfolio_path) if portfolio_path is not None else "",
         }
         with open(panel_path.with_suffix(".meta.json"), "w") as handle:
             json.dump(meta, handle, indent=2)
@@ -5810,6 +6952,12 @@ Examples:
         help="Write a single merged parquet per (symbol,horizon) (default: yes)",
     )
     parser.add_argument(
+        "--write-role-splits",
+        choices=["yes", "no"],
+        default="yes",
+        help="Write merged mamba/portfolio parquets alongside merged output (default: yes)",
+    )
+    parser.add_argument(
         "--merged-out",
         type=Path,
         default=None,
@@ -5819,6 +6967,15 @@ Examples:
         "--merged-service",
         default=None,
         help="Feast FeatureService name to fetch into the merged parquet (default: phase2_all_h<H>_v1)",
+    )
+
+    parser.add_argument(
+        "--mamba-optional-all",
+        choices=["yes", "no"],
+        default="no",
+        help=(
+            "Enable all optional Mamba features across families (alt_signals, arima_forecast, quantile_forecast, candle_mechanics)."
+        ),
     )
 
     parser.add_argument(
@@ -5974,6 +7131,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Handle single symbol case (original behavior, no parallelization overhead)
     if len(symbols) == 1:
         try:
+            if args.write_role_splits is not None:
+                os.environ["PREP_FAMILIES_WRITE_ROLE_SPLITS"] = "1" if args.write_role_splits == "yes" else "0"
+            if args.mamba_optional_all == "yes":
+                os.environ["ALT_SIGNALS_MAMBA_OPTIONAL"] = "all"
+                os.environ["ARIMA_FORECAST_MAMBA_OPTIONAL"] = "all"
+                os.environ["QUANTILE_FORECAST_MAMBA_STACKING"] = "all"
+                os.environ["CANDLE_MECHANICS_MAMBA_OPTIONAL"] = "all"
             result = prepare_families(
                 symbol=symbols[0],
                 horizon=args.horizon,
@@ -6012,6 +7176,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def process_symbol(symbol: str) -> tuple[str, bool]:
         """Process a single symbol and return (symbol, success)."""
         try:
+            if args.write_role_splits is not None:
+                os.environ["PREP_FAMILIES_WRITE_ROLE_SPLITS"] = "1" if args.write_role_splits == "yes" else "0"
+            if args.mamba_optional_all == "yes":
+                os.environ["ALT_SIGNALS_MAMBA_OPTIONAL"] = "all"
+                os.environ["ARIMA_FORECAST_MAMBA_OPTIONAL"] = "all"
+                os.environ["QUANTILE_FORECAST_MAMBA_STACKING"] = "all"
+                os.environ["CANDLE_MECHANICS_MAMBA_OPTIONAL"] = "all"
             result = prepare_families(
                 symbol=symbol,
                 horizon=args.horizon,
