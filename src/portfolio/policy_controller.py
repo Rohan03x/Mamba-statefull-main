@@ -541,6 +541,7 @@ def build_default_policy_actions_v2(
             max_net=max_net,
             max_name=max_name,
             quantile_blend_weight=0.0,
+            linear_blend_weight=0.3,  # INDEPENDENT of quantile (moderate linear activation)
             risk_off_duration=0,
             max_leverage_schedule=1.0,
             sector_cap_strength=1.0,
@@ -563,6 +564,7 @@ def build_default_policy_actions_v2(
             max_net=max_net * 0.5,
             max_name=max_name * 0.7,
             quantile_blend_weight=0.2,
+            linear_blend_weight=0.5,  # Higher linear weight when conservative (trust learned model)
             risk_off_duration=0,
             max_leverage_schedule=0.7,
             sector_cap_strength=1.2,
@@ -584,8 +586,7 @@ def build_default_policy_actions_v2(
             max_gross=max_gross * 1.3,
             max_net=max_net * 1.5,
             max_name=max_name * 1.3,
-            quantile_blend_weight=0.0,
-            risk_off_duration=0,
+            quantile_blend_weight=0.0,            linear_blend_weight=0.2,  # Lower linear weight when aggressive (trust Mamba more)            risk_off_duration=0,
             max_leverage_schedule=1.3,
             sector_cap_strength=0.7,
             confidence_floor=0.2,
@@ -607,6 +608,7 @@ def build_default_policy_actions_v2(
             max_net=0.0,
             max_name=0.0,
             quantile_blend_weight=0.0,
+            linear_blend_weight=0.0,  # No linear blend during risk-off
             risk_off_duration=5,
             max_leverage_schedule=0.0,
             sector_cap_strength=1.0,
@@ -629,6 +631,7 @@ def build_default_policy_actions_v2(
             max_net=max_net * 0.5,
             max_name=max_name * 0.6,
             quantile_blend_weight=0.1,
+            linear_blend_weight=0.4,  # Moderate linear weight when reducing exposure
             risk_off_duration=0,
             max_leverage_schedule=0.5,
             sector_cap_strength=1.1,
@@ -651,6 +654,7 @@ def build_default_policy_actions_v2(
             max_net=max_net,
             max_name=max_name,
             quantile_blend_weight=0.7,  # Heavy quantile blend
+            linear_blend_weight=0.6,  # High linear weight (independent decision)
             risk_off_duration=0,
             max_leverage_schedule=0.8,
             sector_cap_strength=1.0,
@@ -673,6 +677,7 @@ def build_default_policy_actions_v2(
             max_net=max_net * 0.5,
             max_name=max_name * 0.8,
             quantile_blend_weight=0.1,
+            linear_blend_weight=0.35,  # Moderate linear weight with tight sectors
             risk_off_duration=0,
             max_leverage_schedule=0.9,
             sector_cap_strength=1.5,  # Strict sector caps

@@ -610,6 +610,13 @@ class LinearCombinerState:
     2. Compute z-space targets when predictions mature (y = r / sigma_exec)
     3. Maintain rolling training window
     4. Refit model at specified intervals with freeze logic
+    
+    Adaptive Quality Thresholds (configurable):
+    - r2_threshold: Minimum R² to activate (default 0.05)
+    - drift_threshold: Max coefficient drift to stay active (default 0.15)
+    - corr_threshold: Min correlation with Mamba (default 0.3)
+    - sign_disagree_threshold: Max sign disagreement rate (default 0.4)
+    - min_stable_updates: Min consecutive good updates (default 3)
     """
     
     # Config
@@ -621,6 +628,13 @@ class LinearCombinerState:
     min_samples: int = 63
     time_decay_halflife: int = 42  # Days for exponential decay (0 = no decay)
     confidence_ewma_alpha: float = 0.1  # EWMA smoothing for confidence tracking
+    
+    # Adaptive quality thresholds (decoupled from hard-coded values)
+    r2_threshold: float = 0.05  # Minimum R² to activate
+    drift_threshold: float = 0.15  # Max coefficient drift before penalty
+    corr_threshold: float = 0.3  # Min correlation with Mamba
+    sign_disagree_threshold: float = 0.4  # Max sign disagreement rate
+    min_stable_updates: int = 3  # Min consecutive good updates
     
     # Components
     feature_builder: LinearFeatureBuilder = field(default_factory=LinearFeatureBuilder)
@@ -999,11 +1013,11 @@ class LinearCombinerState:
         z_lin: np.ndarray,
         z_mamba: np.ndarray,
         *,
-        r_squared_threshold: float = 0.05,
-        drift_threshold: float = 0.15,
-        corr_threshold: float = 0.3,
-        sign_disagree_threshold: float = 0.4,
-        min_stable_updates: int = 3,
+        r_squared_threshold: Optional[float] = None,
+        drift_threshold: Optional[float] = None,
+        corr_threshold: Optional[float] = None,
+        sign_disagree_threshold: Optional[float] = None,
+        min_stable_updates: Optional[int] = None,
     ) -> Tuple[float, Dict[str, Any]]:
         """Compute quality-adaptive blend weight.
         
@@ -1014,18 +1028,25 @@ class LinearCombinerState:
         - Sign disagreement is high
         
         Args:
-            base_weight: Base blend weight from policy (e.g., quantile_blend_weight_day)
+            base_weight: Policy-controlled base weight (DECOUPLED from quantile_blend_weight)
             z_lin: Linear model predictions
             z_mamba: Original Mamba z-scores
-            r_squared_threshold: Minimum acceptable R² (below this → down-weight)
-            drift_threshold: Maximum acceptable drift (above this → down-weight)
-            corr_threshold: Minimum acceptable correlation (below this → down-weight)
-            sign_disagree_threshold: Maximum acceptable sign disagreement (above this → down-weight)
-            min_stable_updates: Require N stable updates before trusting linear model
+            r_squared_threshold: Override instance threshold (None = use self.r2_threshold)
+            drift_threshold: Override instance threshold (None = use self.drift_threshold)
+            corr_threshold: Override instance threshold (None = use self.corr_threshold)
+            sign_disagree_threshold: Override instance threshold (None = use self.sign_disagree_threshold)
+            min_stable_updates: Override instance threshold (None = use self.min_stable_updates)
         
         Returns:
             (adaptive_weight, diagnostics_dict)
         """
+        # Use instance thresholds as defaults, allow runtime overrides
+        r_squared_threshold = r_squared_threshold if r_squared_threshold is not None else self.r2_threshold
+        drift_threshold = drift_threshold if drift_threshold is not None else self.drift_threshold
+        corr_threshold = corr_threshold if corr_threshold is not None else self.corr_threshold
+        sign_disagree_threshold = sign_disagree_threshold if sign_disagree_threshold is not None else self.sign_disagree_threshold
+        min_stable_updates = min_stable_updates if min_stable_updates is not None else self.min_stable_updates
+        
         # Start with base weight
         w = float(base_weight)
         diagnostics = {}
@@ -1223,6 +1244,11 @@ def create_linear_combiner(
     use_sectors: bool = False,
     sector_map: Optional[Dict[str, str]] = None,
     symbols: Sequence[str] = (),
+    r2_threshold: float = 0.05,
+    drift_threshold: float = 0.15,
+    corr_threshold: float = 0.3,
+    sign_disagree_threshold: float = 0.4,
+    min_stable_updates: int = 3,
 ) -> LinearCombinerState:
     """Factory function to create LinearCombinerState with config.
     
@@ -1238,6 +1264,11 @@ def create_linear_combiner(
         use_sectors: Enable sector indicator features
         sector_map: Symbol -> sector mapping (required if use_sectors=True)
         symbols: Symbol list (for feature builder)
+        r2_threshold: Minimum acceptable R² for quality gating (default: 0.05)
+        drift_threshold: Maximum acceptable coefficient drift (default: 0.15)
+        corr_threshold: Minimum acceptable correlation with Mamba (default: 0.3)
+        sign_disagree_threshold: Maximum acceptable sign disagreement (default: 0.4)
+        min_stable_updates: Require N stable updates before trusting model (default: 3)
     
     Returns:
         Configured LinearCombinerState
@@ -1265,4 +1296,9 @@ def create_linear_combiner(
         time_decay_halflife=time_decay_halflife,
         feature_builder=feature_builder,
         model=model,
+        r2_threshold=r2_threshold,
+        drift_threshold=drift_threshold,
+        corr_threshold=corr_threshold,
+        sign_disagree_threshold=sign_disagree_threshold,
+        min_stable_updates=min_stable_updates,
     )
