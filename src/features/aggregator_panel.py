@@ -39,7 +39,13 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-from src.features.family_spec import SYMBOL_ONLY_HF_BLOCKS, default_hf_blocks, families_for_stage
+from src.features.family_spec import (
+    SYMBOL_ONLY_HF_BLOCKS,
+    default_hf_blocks,
+    families_for_stage,
+    resolve_core_columns,
+)
+from src.features.feature_roles import load_family_meta_from_registry
 
 HF_BLOCK_FAMILIES: Tuple[str, ...] = tuple(default_hf_blocks())
 MIN_HF_AGG_BLOCKS = max(3, len(HF_BLOCK_FAMILIES) - 2) if HF_BLOCK_FAMILIES else 0
@@ -97,6 +103,15 @@ try:
     from .candle_mechanics import fetch as fetch_candle_mechanics
 except Exception:
     fetch_candle_mechanics = None  # type: ignore
+
+try:
+    from .event_time_bars import (
+        generate_event_time_features_range,
+        EventBarConfig,
+    )
+except Exception:
+    generate_event_time_features_range = None  # type: ignore
+    EventBarConfig = None  # type: ignore
 
 try:
     from .index_constituents import fetch as fetch_index_constituents
@@ -677,6 +692,28 @@ WRITE_LAGGED_FEATURE_CACHES: bool = os.getenv("WRITE_LAGGED_FEATURE_CACHES", "0"
 
 HF_SYMBOL_ONLY_CANONICAL_HORIZON: int = int(os.getenv("HF_SYMBOL_ONLY_CANONICAL_HORIZON", "63"))
 
+# Shared cache directory for symbol-agnostic families
+SHARED_CACHE_DIR: Path = Path(__file__).resolve().parents[2] / "cache" / "shared"
+
+# Families that use shared cache (symbol/horizon invariant)
+SHARED_CACHE_FAMILIES: frozenset = frozenset({"doc_embedding_novelty_hf", "peer_screener_context"})
+
+
+def _uses_shared_cache_path(family: str) -> bool:
+    """Check if a family uses the shared cache (symbol/horizon invariant)."""
+    fam_lower = str(family).strip().lower()
+    return fam_lower in SHARED_CACHE_FAMILIES
+
+
+def _get_shared_cache_dir(family: str) -> Optional[Path]:
+    """Get the shared cache directory for a family, if applicable."""
+    fam_lower = str(family).strip().lower()
+    if fam_lower == "doc_embedding_novelty_hf":
+        return SHARED_CACHE_DIR / "doc_embedding" / "doc_embedding_novelty_hf"
+    elif fam_lower == "peer_screener_context":
+        return SHARED_CACHE_DIR / "peer_screener" / "peer_screener_context"
+    return None
+
 
 def _uses_symbol_only_cache_path(family: str) -> bool:
     try:
@@ -690,13 +727,25 @@ def _resolve_cache_dir_for_family(cache_dir: Path, symbol: str, horizon: int, fa
     """Resolve where a family's cache files should be read from.
 
     cache_dir may be:
-    - data/local_cache/<symbol>_h<horizon> (common)
+    - cache/symbols/<SYMBOL>/h<horizon> (new Dagster layout)
+    - data/local_cache/<symbol>_h<horizon> (legacy)
     - data/local_cache/<symbol> (symbol-only)
     - data/local_cache (root)
     """
 
     symbol_lower = symbol.lower()
+    symbol_upper = symbol.upper()
     fam_lower = str(family).lower()
+
+    # NEW: Detect Dagster-style cache layout: cache/symbols/{SYMBOL}/h{horizon}
+    # In this layout, files are directly in the folder (not in a subfolder).
+    expected_h_folder = f"h{int(horizon)}"
+    if cache_dir.name == expected_h_folder and cache_dir.parent.name == symbol_upper:
+        # Dagster layout: cache/symbols/AAPL/h63 -> files are here directly
+        if _uses_symbol_only_cache_path(fam_lower):
+            # Symbol-only families: use parent + symbol subdir (cache/symbols/AAPL/aapl)
+            return cache_dir.parent / symbol_lower
+        return cache_dir
 
     if _uses_symbol_only_cache_path(fam_lower):
         # Prefer explicit symbol-only folder if present.
@@ -718,12 +767,21 @@ def _resolve_cache_dir_for_family(cache_dir: Path, symbol: str, horizon: int, fa
     return cache_dir / expected_h
 
 
-def _cache_basename(symbol: str, horizon: int, family: str, split: str) -> str:
+def _cache_basename(symbol: str, horizon: int, family: str, split: Optional[str] = None) -> str:
+    """Return cache file basename.
+    
+    New format (no split): aapl_h63_garch_iv.parquet
+    Legacy format (with split): aapl_h63_garch_iv_train.parquet
+    """
     symbol_lower = symbol.lower()
     fam_lower = str(family).lower()
     if _uses_symbol_only_cache_path(fam_lower):
-        return f"{symbol_lower}_{family}_{split}.parquet"
-    return f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
+        if split:
+            return f"{symbol_lower}_{family}_{split}.parquet"
+        return f"{symbol_lower}_{family}.parquet"
+    if split:
+        return f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
+    return f"{symbol_lower}_h{int(horizon)}_{family}.parquet"
 
 
 def _load_family_cache_frame(
@@ -736,106 +794,165 @@ def _load_family_cache_frame(
     end: Optional[str],
 ) -> Optional[pd.DataFrame]:
     symbol_lower = symbol.lower()
+    
+    # Check shared cache first for symbol-agnostic families (doc_embedding_novelty_hf, peer_screener_context)
+    if _uses_shared_cache_path(family):
+        shared_dir = _get_shared_cache_dir(family)
+        if shared_dir is not None and shared_dir.exists():
+            # Look for consolidated files matching pattern _*_features.parquet
+            pattern = "_*_features.parquet"
+            matching_files = sorted(shared_dir.glob(pattern), reverse=True)
+            for file_path in matching_files:
+                try:
+                    df = pd.read_parquet(file_path)
+                    if df.empty or 'date' not in df.columns:
+                        continue
+                    
+                    df['date'] = pd.to_datetime(df['date'])
+                    if hasattr(df['date'].dt, 'tz') and df['date'].dt.tz is not None:
+                        df['date'] = df['date'].dt.tz_localize(None)
+                    df = df.set_index('date').sort_index()
+                    
+                    # Prefix unprefixed columns with family name
+                    family_prefix = f"{family.lower()}_"
+                    new_columns = {}
+                    for col in df.columns:
+                        col_lower = str(col).lower()
+                        if not col_lower.startswith(family_prefix):
+                            new_columns[col] = f"{family_prefix}{col}"
+                    if new_columns:
+                        df = df.rename(columns=new_columns)
+                    
+                    logger.info(f"✅ {family}: loaded from shared cache ({len(df)} rows, {len(df.columns)} cols)")
+                    return df
+                except Exception as e:
+                    logger.debug(f"Failed to load shared cache {file_path}: {e}")
+                    continue
+    
     resolved_dir = _resolve_cache_dir_for_family(cache_dir, symbol, horizon, family)
     expected_h = f"{symbol_lower}_h{int(horizon)}"
     legacy_dir = cache_dir if cache_dir.name == expected_h else (cache_dir.parent / expected_h if cache_dir.name == symbol_lower else cache_dir / expected_h)
     frames_by_split: Dict[str, pd.DataFrame] = {}
-    splits = ["train", "valid"]
-    for split in splits:
-        split_frames: List[pd.DataFrame] = []
-        base_name = _cache_basename(symbol, horizon, family, split)
-        if view_mode in {"raw", "both"}:
-            lagged_path = resolved_dir / base_name.replace(".parquet", "_features_lagged.parquet")
-            feature_path = resolved_dir / base_name.replace(".parquet", "_features.parquet")
-            # Back-compat: legacy horizon-scoped cache locations for symbol-only families.
-            if _uses_symbol_only_cache_path(family):
-                legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
-                legacy_lagged = legacy_dir / legacy_base.replace(".parquet", "_features_lagged.parquet")
-                legacy_feature = legacy_dir / legacy_base.replace(".parquet", "_features.parquet")
-            else:
-                legacy_lagged = lagged_path
-                legacy_feature = feature_path
-            # Default to non-lagged caches; optionally prefer lagged if explicitly enabled.
-            raw_path = feature_path
-            if WRITE_LAGGED_FEATURE_CACHES and lagged_path.exists():
-                raw_path = lagged_path
-            elif WRITE_LAGGED_FEATURE_CACHES and (not lagged_path.exists()) and legacy_lagged.exists():
-                raw_path = legacy_lagged
-            elif (not feature_path.exists()) and legacy_feature.exists():
-                raw_path = legacy_feature
-            if raw_path.exists():
-                try:
-                    split_frames.append(_normalize_cache_frame(pd.read_parquet(raw_path)))
-                    logger.debug("Loaded raw cache from %s", raw_path.name)
-                except Exception as exc:
-                    logger.debug("Failed to read raw cache %s: %s", raw_path.name, exc)
-        if view_mode in {"summary", "both"}:
-            signal_path = resolved_dir / base_name
-            if _uses_symbol_only_cache_path(family) and (not signal_path.exists()):
-                legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
-                legacy_signal = legacy_dir / legacy_base
-            else:
-                legacy_signal = signal_path
-            if signal_path.exists():
-                try:
-                    split_frames.append(_normalize_cache_frame(pd.read_parquet(signal_path)))
-                except Exception as exc:
-                    logger.debug("Failed to read summary cache %s: %s", signal_path.name, exc)
-            elif legacy_signal is not signal_path and legacy_signal.exists():
-                try:
-                    split_frames.append(_normalize_cache_frame(pd.read_parquet(legacy_signal)))
-                except Exception as exc:
-                    logger.debug("Failed to read legacy summary cache %s: %s", legacy_signal.name, exc)
-        if not split_frames:
-            continue
-        merged = split_frames[0]
-        for block in split_frames[1:]:
-            # Remove columns that already exist in merged to avoid overlap errors
-            overlap = merged.columns.intersection(block.columns)
-            if len(overlap) > 0:
-                logger.debug("Dropping %d overlapping columns from %s: %s", len(overlap), family, list(overlap)[:5])
-                block = block.drop(columns=overlap)
-            if not block.empty and len(block.columns) > 0:
-                merged = merged.join(block, how="outer")
+    
+    # Try loading consolidated (no-split) cache first - preferred for Stage-A mode
+    clean_base_name = _cache_basename(symbol, horizon, family, split=None)
+    clean_feature_path = resolved_dir / clean_base_name.replace(".parquet", "_features.parquet")
+    if clean_feature_path.exists():
+        try:
+            clean_df = _normalize_cache_frame(pd.read_parquet(clean_feature_path))
+            # Use consolidated file as single unified dataset (not duplicated as train/valid)
+            frames_by_split["consolidated"] = clean_df
+            logger.debug("Loaded consolidated (Stage-A) cache from %s", clean_feature_path.name)
+        except Exception as exc:
+            logger.debug("Failed to read consolidated cache %s: %s", clean_feature_path.name, exc)
+    
+    # Fallback to split-specific caches if consolidated cache not found (Stage-B mode)
+    if not frames_by_split:
+        splits = ["train", "valid"]
+        for split in splits:
+            split_frames: List[pd.DataFrame] = []
+            base_name = _cache_basename(symbol, horizon, family, split)
+            if view_mode in {"raw", "both"}:
+                lagged_path = resolved_dir / base_name.replace(".parquet", "_features_lagged.parquet")
+                feature_path = resolved_dir / base_name.replace(".parquet", "_features.parquet")
+                # Back-compat: legacy horizon-scoped cache locations for symbol-only families.
+                if _uses_symbol_only_cache_path(family):
+                    legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
+                    legacy_lagged = legacy_dir / legacy_base.replace(".parquet", "_features_lagged.parquet")
+                    legacy_feature = legacy_dir / legacy_base.replace(".parquet", "_features.parquet")
+                else:
+                    legacy_lagged = lagged_path
+                    legacy_feature = feature_path
+                # Default to non-lagged caches; optionally prefer lagged if explicitly enabled.
+                raw_path = feature_path
+                if WRITE_LAGGED_FEATURE_CACHES and lagged_path.exists():
+                    raw_path = lagged_path
+                elif WRITE_LAGGED_FEATURE_CACHES and (not lagged_path.exists()) and legacy_lagged.exists():
+                    raw_path = legacy_lagged
+                elif (not feature_path.exists()) and legacy_feature.exists():
+                    raw_path = legacy_feature
+                if raw_path.exists():
+                    try:
+                        split_frames.append(_normalize_cache_frame(pd.read_parquet(raw_path)))
+                        logger.debug("Loaded raw cache from %s", raw_path.name)
+                    except Exception as exc:
+                        logger.debug("Failed to read raw cache %s: %s", raw_path.name, exc)
+            if view_mode in {"summary", "both"}:
+                signal_path = resolved_dir / base_name
+                if _uses_symbol_only_cache_path(family) and (not signal_path.exists()):
+                    legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
+                    legacy_signal = legacy_dir / legacy_base
+                else:
+                    legacy_signal = signal_path
+                if signal_path.exists():
+                    try:
+                        split_frames.append(_normalize_cache_frame(pd.read_parquet(signal_path)))
+                    except Exception as exc:
+                        logger.debug("Failed to read summary cache %s: %s", signal_path.name, exc)
+                elif legacy_signal is not signal_path and legacy_signal.exists():
+                    try:
+                        split_frames.append(_normalize_cache_frame(pd.read_parquet(legacy_signal)))
+                    except Exception as exc:
+                        logger.debug("Failed to read legacy summary cache %s: %s", legacy_signal.name, exc)
+            if not split_frames:
+                continue
+            merged = split_frames[0]
+            for block in split_frames[1:]:
+                # Remove columns that already exist in merged to avoid overlap errors
+                overlap = merged.columns.intersection(block.columns)
+                if len(overlap) > 0:
+                    logger.debug("Dropping %d overlapping columns from %s: %s", len(overlap), family, list(overlap)[:5])
+                    block = block.drop(columns=overlap)
+                if not block.empty and len(block.columns) > 0:
+                    merged = merged.join(block, how="outer")
 
-        # Remove legacy placeholder columns from macro_tst_hf caches.
-        # These were previously emitted as generic hf_* columns (not family-prefixed)
-        # and should not appear in merged panels.
-        if str(family).lower() == "macro_tst_hf":
+            # Remove legacy placeholder columns from macro_tst_hf caches.
+            # These were previously emitted as generic hf_* columns (not family-prefixed)
+            # and should not appear in merged panels.
+            if str(family).lower() == "macro_tst_hf":
+                try:
+                    drop_cols = [
+                        c
+                        for c in merged.columns
+                        if str(c).startswith("hf_embed_")
+                        or str(c) in {"hf_macro_score", "hf_confidence", "hf_regime", "hf_volatility"}
+                    ]
+                    if drop_cols:
+                        merged = merged.drop(columns=drop_cols, errors="ignore")
+                except Exception:
+                    pass
+
+            # Some cache writers (notably HF generators) may emit a generic 'has_data' column.
+            # Rename it to a family-scoped flag to avoid collisions with other families.
             try:
-                drop_cols = [
-                    c
-                    for c in merged.columns
-                    if str(c).startswith("hf_embed_")
-                    or str(c) in {"hf_macro_score", "hf_confidence", "hf_regime", "hf_volatility"}
-                ]
-                if drop_cols:
-                    merged = merged.drop(columns=drop_cols, errors="ignore")
+                if "has_data" in merged.columns and f"{family}_has_data" not in merged.columns:
+                    merged = merged.rename(columns={"has_data": f"{family}_has_data"})
             except Exception:
                 pass
-
-        # Some cache writers (notably HF generators) may emit a generic 'has_data' column.
-        # Rename it to a family-scoped flag to avoid collisions with other families.
-        try:
-            if "has_data" in merged.columns and f"{family}_has_data" not in merged.columns:
-                merged = merged.rename(columns={"has_data": f"{family}_has_data"})
-        except Exception:
-            pass
-        frames_by_split[split] = merged
+            frames_by_split[split] = merged
     if not frames_by_split:
         return None
 
-    # Prefer train values on overlapping dates (train is full history; valid is often sparse).
-    df_train = frames_by_split.get("train")
-    df_valid = frames_by_split.get("valid")
-    if df_train is not None and df_valid is not None:
-        union_index = df_train.index.union(df_valid.index)
-        df_train = df_train.reindex(union_index)
-        df_valid = df_valid.reindex(union_index)
-        combined = df_train.combine_first(df_valid).sort_index()
+    # Handle three cases:
+    # 1. Stage-A mode: "consolidated" key contains single unified dataset
+    # 2. Stage-B mode: "train" and "valid" keys contain split datasets
+    # 3. Fallback: concatenate whatever splits are available
+    df_consolidated = frames_by_split.get("consolidated")
+    if df_consolidated is not None:
+        # Stage-A mode: use consolidated dataset directly
+        combined = df_consolidated.sort_index()
     else:
-        combined = pd.concat(list(frames_by_split.values()), axis=0)
-        combined = combined[~combined.index.duplicated(keep="first")].sort_index()
+        # Stage-B mode: prefer train values on overlapping dates
+        df_train = frames_by_split.get("train")
+        df_valid = frames_by_split.get("valid")
+        if df_train is not None and df_valid is not None:
+            union_index = df_train.index.union(df_valid.index)
+            df_train = df_train.reindex(union_index)
+            df_valid = df_valid.reindex(union_index)
+            combined = df_train.combine_first(df_valid).sort_index()
+        else:
+            combined = pd.concat(list(frames_by_split.values()), axis=0)
+            combined = combined[~combined.index.duplicated(keep="first")].sort_index()
 
     start_ts = _normalize_timestamp(start) or combined.index.min()
     end_ts = _normalize_timestamp(end) or combined.index.max()
@@ -949,6 +1066,7 @@ def build_panel(
     window_idx: Optional[int] = None,
     allow_generate_missing_from_cache: bool = False,
 ) -> pd.DataFrame:
+    family_meta_registry = load_family_meta_from_registry()
     def _is_etf_symbol(sym: str) -> bool:
         """Best-effort ETF detector.
 
@@ -1175,9 +1293,96 @@ def build_panel(
             symbol,
         )
     
+    # Helper to load from shared cache (symbol-agnostic families like doc_embedding_novelty_hf)
+    def _load_from_shared_cache(family: str, shared_dir: Path) -> Optional[pd.DataFrame]:
+        """Load pre-generated signal from shared cache for symbol-agnostic families."""
+        start_ts = pd.to_datetime(start or start_str_default)
+        end_ts = pd.to_datetime(end or end_str_default)
+        if hasattr(start_ts, 'tz') and start_ts.tz is not None:
+            start_ts = start_ts.tz_localize(None)
+        if hasattr(end_ts, 'tz') and end_ts.tz is not None:
+            end_ts = end_ts.tz_localize(None)
+        
+        # Look for consolidated files (pattern: _YYYYMMDD_YYYYMMDD_features.parquet)
+        pattern = "_*_features.parquet"
+        matching_files = sorted(shared_dir.glob(pattern), reverse=True) if shared_dir.exists() else []
+        
+        for file_path in matching_files:
+            try:
+                df = pd.read_parquet(file_path)
+                if df.empty or 'date' not in df.columns:
+                    continue
+                
+                df['date'] = pd.to_datetime(df['date'])
+                if hasattr(df['date'].dt, 'tz') and df['date'].dt.tz is not None:
+                    df['date'] = df['date'].dt.tz_localize(None)
+                df = df.set_index('date').sort_index()
+                
+                # Check coverage
+                cache_start = df.index.min()
+                cache_end = df.index.max()
+                requested_days = max(1, (end_ts - start_ts).days)
+                coverage_start = max(start_ts, cache_start)
+                coverage_end = min(end_ts, cache_end)
+                covered_days = (coverage_end - coverage_start).days if coverage_end >= coverage_start else 0
+                coverage_ratio = covered_days / requested_days if requested_days > 0 else 0
+                
+                if coverage_ratio < 0.8:
+                    logger.debug(f"Shared cache for {family} only covers {coverage_ratio:.1%}, skipping")
+                    continue
+                
+                # Filter to requested range
+                df = df[(df.index >= start_ts) & (df.index <= end_ts)]
+                if df.empty:
+                    continue
+                
+                # Prefix unprefixed columns with family name for proper namespacing
+                family_prefix = f"{family.lower()}_"
+                new_columns = {}
+                for col in df.columns:
+                    col_lower = str(col).lower()
+                    if not col_lower.startswith(family_prefix):
+                        new_columns[col] = f"{family_prefix}{col}"
+                if new_columns:
+                    df = df.rename(columns=new_columns)
+                
+                logger.info(f"✅ {family}: loaded from shared cache ({len(df)} rows)")
+                
+                # Load metadata if available
+                meta_path = Path(str(file_path) + '.meta.json')
+                meta_data = {}
+                if meta_path.exists():
+                    try:
+                        with open(meta_path, 'r') as handle:
+                            meta_data = json.load(handle)
+                    except Exception:
+                        pass
+                
+                df.attrs['cache_meta'] = meta_data or {
+                    'family': family,
+                    'source': 'shared_cache',
+                    'cache_start': str(cache_start.date()),
+                    'cache_end': str(cache_end.date()),
+                }
+                return df
+                
+            except Exception as e:
+                logger.debug(f"Failed to load shared cache {file_path}: {e}")
+                continue
+        
+        return None
+    
     # NEW: Helper to load cached signals from prep_families
     def _load_from_cache(family: str) -> Optional[pd.DataFrame]:
         """Load pre-generated signal from local_cache if available."""
+        # Check shared cache first for symbol-agnostic families
+        if _uses_shared_cache_path(family):
+            shared_dir = _get_shared_cache_dir(family)
+            if shared_dir is not None and shared_dir.exists():
+                shared_result = _load_from_shared_cache(family, shared_dir)
+                if shared_result is not None:
+                    return shared_result
+        
         if cache_dir is None:
             return None
         
@@ -1191,7 +1396,6 @@ def build_panel(
 
         # Per-window cache shards are not required; we slice consolidated caches by date.
         
-        # Try train/valid splits (prefer train for full historical data)
         start_ts = pd.to_datetime(start or start_str_default)
         end_ts = pd.to_datetime(end or end_str_default)
         if hasattr(start_ts, 'tz') and start_ts.tz is not None:
@@ -1218,10 +1422,16 @@ def build_panel(
 
         loaded_splits: List[Tuple[str, pd.DataFrame, Dict[str, Any], Dict[str, Any]]] = []
 
-        for split in ['train', 'valid']:
+        # Try consolidated (Stage-A) file first, then legacy split (Stage-B) formats
+        splits_to_try: List[Optional[str]] = [None, 'train', 'valid']
+        
+        for split in splits_to_try:
             candidates: List[Path] = []
             base_name = _cache_basename(symbol, horizon, family, split)
-            legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
+            if split:
+                legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}_{split}.parquet"
+            else:
+                legacy_base = f"{symbol_lower}_h{int(horizon)}_{family}.parquet"
             if view_mode in {"raw", "both"} or stage_prefers_raw_features:
                 if WRITE_LAGGED_FEATURE_CACHES:
                     candidates.append(
@@ -1261,8 +1471,9 @@ def build_panel(
 
                     min_ratio = min_ratio_default if not is_finbert_family else 0.1
                     if coverage_ratio < min_ratio:
+                        split_label = split or 'unified'
                         logger.debug(
-                            f"Cache for {family}/{split} only covers {coverage_ratio:.1%} of requested range, skipping candidate"
+                            f"Cache for {family}/{split_label} only covers {coverage_ratio:.1%} of requested range, skipping candidate"
                         )
                         continue
 
@@ -1306,19 +1517,27 @@ def build_panel(
                     else:
                         cache_kind = 'signals'
 
+                    split_label = split or 'unified'
                     telemetry_payload = {
                         'status': 'ok',
-                        'source': f'cached_{split}',
+                        'source': f'cached_{split_label}',
                         'proxy': False,
                         'cache_path': str(file_path),
                         'coverage_ratio': coverage_ratio,
                         'cache_kind': cache_kind,
                     }
 
-                    loaded_splits.append((split, df, meta_data, telemetry_payload))
+                    loaded_splits.append((split_label, df, meta_data, telemetry_payload))
+                    # If we found unified cache, no need to try train/valid splits
+                    if split is None:
+                        break
                 except Exception as e:
-                    logger.debug(f"Failed to load cache for {family}/{split}: {e}")
+                    split_label = split or 'unified'
+                    logger.debug(f"Failed to load cache for {family}/{split_label}: {e}")
                     continue
+            # If unified cache was found, skip legacy splits
+            if loaded_splits and loaded_splits[0][0] == 'unified':
+                break
 
         if not loaded_splits:
             return None
@@ -1582,27 +1801,113 @@ def build_panel(
         df2.columns = [f"{fam}_{c}" for c in normalized_cols]
         
         # ═══════════════════════════════════════════════════════════════════════════════
-        # GOVERNANCE COLUMN AUTO-INJECTION (Jan 2026)
+        # GOVERNANCE COLUMN CENTRAL COMPUTATION (Jan 2026)
         # ═══════════════════════════════════════════════════════════════════════════════
-        # Every family MUST have 3 governance columns: has_data, activity, days_since_update
-        # These track real updates and are crucial for downstream validation.
+        # Canonical producer for: {family}_has_data, {family}_activity, {family}_days_since_update
+        # Runs for live + cached frames and overwrites any pre-existing values.
         # ═══════════════════════════════════════════════════════════════════════════════
         if not df2.empty:
             has_data_col = f"{fam}_has_data"
             activity_col = f"{fam}_activity"
             days_since_col = f"{fam}_days_since_update"
-            
-            if has_data_col not in df2.columns:
-                df2[has_data_col] = 1.0
-                logger.debug("%s: auto-injected %s=1.0 (governance)", fam, has_data_col)
-            
-            if activity_col not in df2.columns:
-                df2[activity_col] = 1.0
-                logger.debug("%s: auto-injected %s=1.0 (governance)", fam, activity_col)
-            
-            if days_since_col not in df2.columns:
-                df2[days_since_col] = 0.0
-                logger.debug("%s: auto-injected %s=0.0 (governance)", fam, days_since_col)
+
+            core_cols = resolve_core_columns(fam, df2.columns)
+            if not core_cols:
+                # Fallback: any family-prefixed non-governance columns
+                core_cols = [
+                    c for c in df2.columns
+                    if str(c).lower().startswith(f"{fam.lower()}_")
+                    and not str(c).lower().endswith((
+                        "_has_data",
+                        "_activity",
+                        "_days_since_update",
+                        "_confidence",
+                        "_conf",
+                    ))
+                ]
+
+            # has_data: 1 if any core column has non-null, non-zero data
+            if core_cols:
+                core_frame = df2[core_cols]
+                numeric = core_frame.select_dtypes(include=[np.number, "bool"])
+                if not numeric.empty:
+                    has_data = (
+                        numeric.notna().any(axis=1) & (numeric.abs().sum(axis=1) > 0)
+                    ).astype(float)
+                else:
+                    has_data = core_frame.notna().any(axis=1).astype(float)
+            else:
+                has_data = pd.Series(0.0, index=df2.index)
+
+            df2[has_data_col] = has_data
+
+            # days_since_update: prefer source_asof timestamp; fallback to last has_data
+            source_ts = None
+            for key in (f"{fam}:source_asof_ts", f"{fam}:fetch_ts"):
+                if key in (df2.attrs or {}):
+                    source_ts = df2.attrs.get(key)
+                    break
+
+            ts_col = None
+            candidate = f"{fam}_source_asof_ts"
+            if candidate in df2.columns:
+                ts_col = candidate
+
+            if source_ts is not None:
+                asof = pd.to_datetime(source_ts, errors="coerce")
+                days_since = np.maximum((df2.index - asof).days, 0)
+                df2[days_since_col] = pd.Series(days_since, index=df2.index, dtype=float)
+            elif ts_col is not None:
+                asof_series = pd.to_datetime(df2[ts_col], errors="coerce")
+                last_asof = asof_series.ffill()
+                days_since = np.maximum((df2.index.to_series() - last_asof).dt.days, 0)
+                df2[days_since_col] = days_since.fillna(0.0).astype(float)
+            else:
+                eps_abs = 1e-12
+                eps_rel = 1e-6
+                update_mask = None
+                if core_cols:
+                    core_frame = df2[core_cols]
+                    prev_frame = core_frame.shift(1)
+                    change_mask = pd.Series(False, index=df2.index)
+
+                    numeric_cols = core_frame.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+                    if numeric_cols:
+                        cur = core_frame[numeric_cols]
+                        prev = prev_frame[numeric_cols]
+                        diff = (cur - prev).abs()
+                        thresh = eps_abs + eps_rel * prev.abs()
+                        num_changed = diff > thresh
+                        change_mask = change_mask | num_changed.fillna(False).any(axis=1)
+
+                    other_cols = [c for c in core_cols if c not in numeric_cols]
+                    if other_cols:
+                        other_changed = core_frame[other_cols] != prev_frame[other_cols]
+                        change_mask = change_mask | other_changed.fillna(False).any(axis=1)
+
+                    update_mask = (has_data > 0) & change_mask
+
+                if update_mask is not None and bool(update_mask.any()):
+                    last_update = df2.index.to_series().where(update_mask).ffill()
+                else:
+                    last_update = df2.index.to_series().where(has_data > 0).ffill()
+                days_since = (df2.index.to_series() - last_update).dt.days
+                df2[days_since_col] = days_since.fillna(0.0).astype(float)
+
+            # activity: exp decay based on cadence
+            meta = family_meta_registry.get(str(fam), None)
+            cadence_token = str(getattr(meta, "update_cadence", "unknown")).lower() if meta else "unknown"
+            cadence_days = {
+                "daily": 1,
+                "weekly": 7,
+                "monthly": 30,
+                "quarterly": 90,
+                "event": 7,
+                "snapshot": 30,
+            }.get(cadence_token, 1)
+            expected_latency = 0.0
+            tau = max(2.0 * cadence_days, cadence_days + expected_latency)
+            df2[activity_col] = np.exp(-df2[days_since_col].astype(float) / float(tau)).clip(0.0, 1.0)
         
         # Collect attrs if present
         try:
@@ -3182,7 +3487,8 @@ def build_panel(
                 features['sample_size'] = sample_size
                 # Confidence isn't provided by ProbabilityCalibrationSystem; derive a simple sample-size proxy.
                 features['confidence'] = float(np.clip(sample_size / 500.0, 0.0, 1.0))
-                features['has_data'] = 1.0
+                # Use calibration_has_data (not has_data) to match governance expectations
+                features['calibration_has_data'] = 1.0
 
                 sanitized = _sanitize_feature_keys('calibration', features)
                 if not sanitized:
@@ -3195,20 +3501,54 @@ def build_panel(
             if not computed_any:
                 return _calibration_stub(status='dormant:no_features')
 
-            # Ensure schema-stable presence of has_data.
-            if 'has_data' not in out.columns:
-                out['has_data'] = 1.0
+            # Preserve calibration_has_data flag before ffill (don't zero it out)
+            has_data_col = out.get('calibration_has_data')
+            if has_data_col is not None:
+                has_data_preserved = has_data_col.copy()
+            else:
+                has_data_preserved = None
 
             out = out.ffill().fillna(0.0)
+            
+            # Restore has_data flag (ffill forward, but don't zero where it was originally set)
+            if has_data_preserved is not None:
+                out['calibration_has_data'] = has_data_preserved.ffill().fillna(0.0)
             out.attrs['telemetry'] = {'status': 'ok', 'source': 'ProbabilityCalibrationSystem'}
             out.attrs['feature_counts'] = {'generated': len([c for c in out.columns])}
+            
+            # Save materialization date for post-maturity flag computation
+            mat_date_file = Path(cache_dir or Path.cwd()) / 'event_logs' / f'{symbol}_h{horizon}_calibration_materialization.json'
+            mat_date_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(mat_date_file, 'w') as f:
+                    json.dump({'last_materialization': datetime.now().isoformat()}, f)
+            except Exception as e:
+                logger.warning(f"Failed to save calibration materialization date: {e}")
+            
             return out
         except Exception as exc:
             logger.warning("calibration provider failed for %s: %s; emitting has_data=0 stub", symbol, exc)
             return _calibration_stub(status='error', error=str(exc))
 
     def _h_online_learning():
-        """Online learning metrics with MAX ALPHA features from quantile + calibration signals."""
+        """
+        Online learning metrics with MAX ALPHA features from quantile + calibration signals.
+        
+        IMPORTANT ARCHITECTURAL NOTE:
+        ────────────────────────────────────────────────────────────────────────
+        This generator runs at PREP TIME (before Phase-2) and uses quantile-based
+        calibration because Mamba predictions don't exist yet.
+        
+        The features generated here are used AS FEATURES in the panel, not as the
+        authoritative learning gate. The AUTHORITATIVE calibration for learning
+        decisions is the Mamba-based MambaCalibrationTracker in phase2_stateful.py,
+        which tracks Mamba (μ, σ²) predictions vs realized returns at RUNTIME.
+        
+        Hierarchy:
+        - PRIMARY (70-80%): Mamba (μ, σ²) vs realized returns (Phase-2 runtime)
+        - SECONDARY (20-30%): Quantile forecasts (this generator, prep time)
+        ────────────────────────────────────────────────────────────────────────
+        """
         if create_online_learning_system is None:
             logger.debug("online_learning: provider unavailable for %s", symbol)
             return None
@@ -3218,7 +3558,7 @@ def build_panel(
             logger.debug("online_learning: missing quantile forecasts for %s", symbol)
             return None
         
-        # Get calibration metrics for enhanced features
+        # Get calibration metrics for enhanced features (quantile-based at prep time)
         calibration_df = _h_calibration()
         has_calibration = calibration_df is not None and not calibration_df.empty
 
@@ -3267,17 +3607,45 @@ def build_panel(
             drift_sensitivity=0.05,
             update_frequency=5,
         )
+        
+        # Configure event logging
+        event_log_dir = Path(cache_dir or Path.cwd()) / 'event_logs'
+        system.event_log_path = event_log_dir / f'{symbol}_h{horizon}_online_learning_events.jsonl'
+        system.symbol = symbol
+        system.horizon = horizon
 
         snapshots: List[Dict[str, float]] = []
         median_col = next((c for c in quantile_cols if c.endswith('q50')), quantile_cols[0])
 
         for idx, row in merged.iterrows():
+            # Set current data timestamp for event logging
+            system.current_timestamp = idx
+            
             features = np.asarray(row[quantile_cols].values, dtype=float)
             target = float(row['future_return'])
             prediction = float(row.get('quantile_forecast_expected_return', row[median_col]))
 
+            # ─────────────────────────────────────────────────────────────────
+            # Extract calibration quality for learning gate
+            # Use overall_score, confidence, or summary_score as fallbacks
+            # ─────────────────────────────────────────────────────────────────
+            calibration_quality = None
+            if has_calibration:
+                for score_key in ['overall_score', 'calibration_overall_score', 'confidence', 
+                                  'calibration_confidence', 'summary_score', 'calibration_summary_score']:
+                    if score_key in row.index:
+                        val = row[score_key]
+                        if pd.notna(val) and np.isfinite(float(val)):
+                            calibration_quality = float(val)
+                            break
+
             try:
-                adaptation = system.add_sample(features=features, target=target, prediction=prediction)
+                adaptation = system.add_sample(
+                    features=features, 
+                    target=target, 
+                    prediction=prediction,
+                    calibration_quality=calibration_quality,
+                )
             except Exception as exc:
                 logger.debug("online_learning: provider update failed for %s at %s: %s", symbol, idx, exc)
                 continue
@@ -3405,6 +3773,10 @@ def build_panel(
                 online_df = pd.concat([online_df, padding_df]).sort_index()
 
         online_df = online_df.sort_index().ffill()
+        
+        # Add has_data flag to indicate real data (not a stub)
+        online_df['has_data'] = 1.0
+        
         online_df.attrs['telemetry'] = {
             'status': 'ok',
             'source': 'OnlineLearningSystem_MaxAlpha',
@@ -3412,6 +3784,16 @@ def build_panel(
             'alpha_features_enabled': True,
         }
         online_df.attrs['feature_counts'] = {'generated': len(online_df.columns)}
+        
+        # Save materialization date for post-maturity flag computation
+        mat_date_file = Path(cache_dir or Path.cwd()) / 'event_logs' / f'{symbol}_h{horizon}_online_learning_materialization.json'
+        mat_date_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(mat_date_file, 'w') as f:
+                json.dump({'last_materialization': datetime.now().isoformat()}, f)
+        except Exception as e:
+            logger.warning(f"Failed to save materialization date: {e}")
+        
         return online_df
 
     def _h_news_sentiment():
@@ -3639,6 +4021,109 @@ def build_panel(
                 raise
             logger.warning("microstructure failed for %s: %s; emitting stub", symbol, exc)
             return _microstructure_stub(status="error", error=str(exc))
+
+    def _h_event_time_bars():
+        """Event-time bar features (dollar bars, volatility bars) from intraday data.
+        
+        Event-time bars normalize information arrival rate, making each bar
+        approximately equally informative for sequence modeling.
+        
+        Columns generated:
+        - event_time_n_dollar_bars: Number of dollar bars in the day
+        - event_time_dollar_avg_duration_sec: Average bar duration
+        - event_time_dollar_duration_cv: Coefficient of variation of durations
+        - event_time_dollar_arrival_rate: Bars per trading hour
+        - event_time_n_vol_bars: Number of volatility bars
+        - event_time_vol_avg_duration_sec: Average volatility bar duration
+        - event_time_vol_arrival_rate: Vol bars per trading hour
+        - event_time_dollar_vs_vol_ratio: Ratio of dollar to vol bars
+        - etc.
+        """
+        def _event_time_stub(*, status: str, error: Optional[str] = None) -> pd.DataFrame:
+            idx = date_index
+            stub = pd.DataFrame(index=idx)
+            # Stub columns matching the actual feature schema
+            for col in (
+                "event_time_n_dollar_bars",
+                "event_time_dollar_avg_duration_sec",
+                "event_time_dollar_duration_std",
+                "event_time_dollar_duration_cv",
+                "event_time_dollar_max_bar_size",
+                "event_time_dollar_bar_size_skew",
+                "event_time_dollar_arrival_rate",
+                "event_time_dollar_avg_ticks_per_bar",
+                "event_time_n_vol_bars",
+                "event_time_vol_avg_duration_sec",
+                "event_time_vol_duration_std",
+                "event_time_vol_arrival_rate",
+                "event_time_vol_avg_abs_return",
+                "event_time_dollar_vs_vol_ratio",
+                "event_time_has_data",
+                "event_time_dollar_threshold",
+                "event_time_vol_threshold",
+            ):
+                stub[col] = np.nan
+            stub["event_time_has_data"] = 0.0
+            stub.attrs["telemetry"] = {"status": status, "error": error}
+            stub.attrs["feature_counts"] = {"generated": 0}
+            return stub
+
+        if generate_event_time_features_range is None:
+            return _event_time_stub(status="dormant:module_unavailable")
+
+        try:
+            # Parse date range
+            start_ts = pd.Timestamp(start or start_str_default)
+            end_ts = pd.Timestamp(end or end_str_default)
+            
+            # Use default config (can be overridden via environment)
+            k_dollar = float(os.getenv("EVENT_BAR_K_DOLLAR", "1.0"))
+            k_vol = float(os.getenv("EVENT_BAR_K_VOL", "1.0"))
+            
+            config = EventBarConfig(
+                k_dollar=k_dollar,
+                k_vol=k_vol,
+                threshold_lookback_days=20,
+            )
+            
+            # Generate event-time features
+            features_df = generate_event_time_features_range(
+                symbol=symbol,
+                start_date=start_ts,
+                end_date=end_ts,
+                config=config,
+            )
+            
+            if features_df is None or features_df.empty:
+                logger.debug("event_time_bars: No data for %s", symbol)
+                return _event_time_stub(status="dormant:no_data")
+            
+            # Ensure index is DatetimeIndex
+            if not isinstance(features_df.index, pd.DatetimeIndex):
+                features_df.index = pd.to_datetime(features_df.index)
+            
+            # Prefix columns with family name
+            features_df.columns = [f"event_time_bars_{col}" if not col.startswith("event_time_") else col.replace("event_time_", "event_time_bars_") for col in features_df.columns]
+            
+            # Add governance columns
+            features_df["event_time_bars_has_data"] = 1.0
+            features_df["event_time_bars_activity"] = 1.0
+            features_df["event_time_bars_days_since_update"] = 0.0
+            
+            features_df.attrs["telemetry"] = {
+                "status": "ok",
+                "source": "event_time_bars",
+                "generated_features": len(features_df.columns),
+            }
+            features_df.attrs["feature_counts"] = {"generated": len(features_df.columns)}
+            
+            return features_df
+            
+        except Exception as exc:
+            if strict_required:
+                raise
+            logger.warning("event_time_bars failed for %s: %s", symbol, exc)
+            return _event_time_stub(status="error", error=str(exc))
 
     def _h_candle_mechanics():
         """Daily OHLCV-derived candle mechanics (scale-free, leak-safe)."""
@@ -4275,6 +4760,15 @@ def build_panel(
             'samples': len(dataset)
         }
         quantile_df.attrs['feature_counts'] = {'generated': len(quantile_df.columns)}
+
+        # Save materialization date for post-maturity flag computation
+        mat_date_file = Path(cache_dir or Path.cwd()) / 'event_logs' / f'{symbol}_h{horizon}_quantile_forecast_materialization.json'
+        mat_date_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(mat_date_file, 'w') as f:
+                json.dump({'last_materialization': datetime.now().isoformat()}, f)
+        except Exception as e:
+            logger.warning(f"Failed to save quantile_forecast materialization date: {e}")
 
         quantile_forecast_cache = quantile_df
         return quantile_forecast_cache
@@ -5025,10 +5519,11 @@ def build_panel(
 
             # Guardrail: very long coverages can still create ~1000+ snapshots per symbol.
             # Cap the number of API calls by downsampling deterministically.
+            # Set to 0 to disable downsampling (fetch every business day).
             try:
-                max_samples = int(os.getenv('EODHD_OPTIONS_ANCHOR_MAX_SAMPLES', '600'))
+                max_samples = int(os.getenv('EODHD_OPTIONS_ANCHOR_MAX_SAMPLES', '0'))
             except Exception:
-                max_samples = 600
+                max_samples = 0
             if max_samples > 0 and len(sample_dates) > max_samples:
                 step = int(np.ceil(len(sample_dates) / float(max_samples)))
                 sample_dates = sample_dates[::max(1, step)]
@@ -5501,6 +5996,9 @@ def build_panel(
                 
                 # Dynamic confidence
                 'CONFIDENCE': confidence,
+                
+                # Governance columns
+                'has_data': 1.0,
             }, index=close.index)
             
             # Filter to requested date range
@@ -5977,6 +6475,10 @@ def build_panel(
             # Family-scoped has_data: fundamentals are valid whenever available.
             fin_g1["has_data"] = 1.0
             
+            # Track days since last quarterly update (forward-fill from latest_date)
+            latest_update = pd.to_datetime(latest_date)
+            fin_g1['days_since_update'] = np.maximum((fin_g1.index - latest_update).days, 0)
+            
             fin_g1 = fin_g1.replace([np.inf, -np.inf], np.nan).ffill().bfill()
             fin_g1.attrs['provenance'] = {
                 'source': 'eodhd_fundamentals_api',
@@ -6138,6 +6640,10 @@ def build_panel(
             fin_g2 = fin_g2.replace([np.inf, -np.inf], np.nan).ffill()
 
             fin_g2['has_data'] = 1.0
+            
+            # Track days since last quarterly update
+            latest_quarter = df_quarterly.index.max()
+            fin_g2['days_since_update'] = np.maximum((fin_g2.index - latest_quarter).days, 0)
 
             # ----------------------------------------------------------------
             # STRESS FEATURES (Jan 2026): Higher = worse (for risk aggregation)
@@ -6320,6 +6826,10 @@ def build_panel(
 
             fin_g3['has_data'] = 1.0
             
+            # Track days since last quarterly update
+            latest_quarter = df_quarterly.index.max()
+            fin_g3['days_since_update'] = np.maximum((fin_g3.index - latest_quarter).days, 0)
+            
             logger.info(f"✅ EODHD: Built {len(df_quarterly)} quarters → {len(fin_g3)} days efficiency metrics for {symbol}")
             
             fin_g3.attrs['provenance'] = {'source': 'eodhd_fundamentals_api', 'quarters': len(df_quarterly)}
@@ -6426,6 +6936,25 @@ def build_panel(
                 if operating_cash_flow and net_income and net_income != 0:
                     row['cfo_to_net_income'] = operating_cash_flow / net_income
                 
+                # ================================================================
+                # SCALE-FREE CASH FLOW METRICS
+                # Raw OCF/FCF are in dollars and NOT cross-sectionally comparable.
+                # We need normalized versions for risk aggregation.
+                # ================================================================
+                
+                # CFO to Assets: Scale-free cash generation efficiency
+                if operating_cash_flow and total_assets and total_assets != 0:
+                    row['cfo_to_assets'] = operating_cash_flow / total_assets
+                
+                # FCF to Assets: Scale-free free cash flow efficiency
+                if operating_cash_flow and capex and total_assets and total_assets != 0:
+                    free_cash_flow = operating_cash_flow + capex  # capex is negative
+                    row['fcf_to_assets'] = free_cash_flow / total_assets
+                
+                # CFO Margin: OCF / Revenue (like profit margin but cash-based)
+                if operating_cash_flow and revenue and revenue != 0:
+                    row['cfo_margin'] = operating_cash_flow / revenue
+                
                 # Cash Conversion Cycle (if we have days metrics from G3)
                 # CCC = DSO + DIO - DPO
                 # (Will be calculated in G3 if all components available)
@@ -6442,11 +6971,44 @@ def build_panel(
             df_quarterly['date'] = pd.to_datetime(df_quarterly['date'])
             df_quarterly = df_quarterly.set_index('date').sort_index()
             
+            # ================================================================
+            # TIME-SERIES Z-SCORES FOR RISK AGGREGATION
+            # Rolling 3-year z-scores for key cash flow metrics.
+            # Higher = improving cash position vs own history.
+            # For RISK: we compute STRESS features (lower z = more stress).
+            # ================================================================
+            scale_free_cols = ['cfo_to_assets', 'fcf_to_assets', 'cfo_margin', 'fcf_margin']
+            for col in scale_free_cols:
+                if col in df_quarterly.columns:
+                    # Rolling z-score (12 quarters = 3 years)
+                    rolling_mean = df_quarterly[col].rolling(12, min_periods=4).mean()
+                    rolling_std = df_quarterly[col].rolling(12, min_periods=4).std()
+                    df_quarterly[f'{col}_zscore_3y'] = (df_quarterly[col] - rolling_mean) / (rolling_std + 1e-9)
+            
+            # STRESS FEATURES for portfolio risk (higher = worse)
+            # cash_stress: deterioration in cash flow quality
+            if 'cfo_to_assets_zscore_3y' in df_quarterly.columns:
+                # Negative z-score = deteriorating cash flow = STRESS
+                df_quarterly['cash_flow_stress'] = df_quarterly['cfo_to_assets_zscore_3y'].apply(
+                    lambda x: max(0.0, -x) if pd.notna(x) else 0.0
+                )
+            
+            # earnings_quality_stress: high accruals = low quality = stress
+            if 'accruals_ratio' in df_quarterly.columns:
+                # Higher accruals ratio = lower earnings quality = stress
+                df_quarterly['earnings_quality_stress'] = df_quarterly['accruals_ratio'].apply(
+                    lambda x: max(0.0, x) if pd.notna(x) else 0.0
+                )
+            
             date_range = pd.date_range(start=start_str_default, end=end_str_default, freq='D')
             fin_g4 = df_quarterly.reindex(date_range, method='ffill')
             fin_g4 = fin_g4.replace([np.inf, -np.inf], np.nan).ffill()
 
             fin_g4['has_data'] = 1.0
+            
+            # Track days since last quarterly cash flow report
+            latest_quarter = df_quarterly.index.max()
+            fin_g4['days_since_update'] = np.maximum((fin_g4.index - latest_quarter).days, 0)
             
             logger.info(f"✅ G4: Built {len(df_quarterly)} quarters → {len(fin_g4)} days cash flow metrics for {symbol}")
             
@@ -6605,6 +7167,10 @@ def build_panel(
             fin_g5 = fin_g5.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
             fin_g5['has_data'] = 1.0
+            
+            # Track days since last quarterly earnings
+            latest_quarter = df_quarterly.index.max()
+            fin_g5['days_since_update'] = np.maximum((fin_g5.index - latest_quarter).days, 0)
             
             logger.info(f"✅ G5: Built {len(df_quarterly)} quarters → {len(fin_g5)} days growth metrics for {symbol}")
             
@@ -6773,19 +7339,52 @@ def build_panel(
             
             ratio_cols = ['pe_ratio', 'pb_ratio', 'ps_ratio', 'ev_ebitda', 'dividend_yield']
             
-            # Compute 5-year rolling z-scores on daily data
-            for base_metric in ['pe_ratio', 'pb_ratio', 'ev_ebitda']:
+            # Compute 5-year rolling z-scores on daily data (ONLY for time-varying ratios)
+            # NOTE: ev_ebitda and dividend_yield are snapshots (constant), not time-series
+            for base_metric in ['pe_ratio', 'pb_ratio', 'ps_ratio']:
                 if base_metric in fin_g6.columns:
                     rolling_mean = fin_g6[base_metric].rolling(1260, min_periods=252).mean()
                     rolling_std = fin_g6[base_metric].rolling(1260, min_periods=252).std()
                     fin_g6[f'{base_metric}_zscore_5y'] = (fin_g6[base_metric] - rolling_mean) / (rolling_std + 1e-9)
+            
+            # ================================================================
+            # SPLIT ROLE FEATURES: PREDICTIVE vs RISK
+            # ================================================================
+            # Z-scores are PREDICTIVE: positive z = expensive vs history = potential mean reversion (value tilt).
+            # Mamba uses these for slow alpha (value factor momentum, growth-value rotation).
+            #
+            # valuation_richness is RISK: max(0, zscore) = one-sided stress where EXPENSIVE = FRAGILE.
+            # Expensive stocks have more downside risk if sentiment shifts.
+            # This goes to portfolio risk_scale aggregation (higher = reduce position size).
+            # ================================================================
+            
+            valuation_stress_cols = []
+            for metric in ['pe_ratio', 'pb_ratio', 'ps_ratio']:
+                zscore_col = f'{metric}_zscore_5y'
+                if zscore_col in fin_g6.columns:
+                    # RISK: valuation_richness = max(0, zscore)
+                    # Expensive (positive z) = fragile = stress
+                    # Cheap (negative z) = no stress from this metric
+                    stress_col = f'{metric}_richness'
+                    fin_g6[stress_col] = fin_g6[zscore_col].apply(
+                        lambda x: max(0.0, x) if pd.notna(x) else 0.0
+                    )
+                    valuation_stress_cols.append(stress_col)
+            
+            # Composite valuation richness (mean of individual richness scores)
+            if valuation_stress_cols:
+                fin_g6['valuation_richness'] = fin_g6[valuation_stress_cols].mean(axis=1)
+            
+            # Track days since last quarterly earnings report
+            latest_quarter = df_quarterly.index.max()
+            fin_g6['days_since_update'] = np.maximum((fin_g6.index - latest_quarter).days, 0)
             
             # Final cleanup
             fin_g6 = fin_g6.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
             fin_g6['has_data'] = 1.0
             
-            logger.info(f"✅ G6: Built {len(ratio_cols)} time-varying valuation ratios for {symbol}")
+            logger.info(f"✅ G6: Built {len(ratio_cols)} time-varying valuation ratios + stress for {symbol}")
             
             fin_g6.attrs['provenance'] = {'source': 'eodhd_quarterly_fundamentals', 'metrics': ratio_cols}
             fin_g6.attrs['telemetry'] = {'status': 'ok', 'source': 'eodhd', 'type': 'quarterly_time_series', 'has_data': 1}
@@ -6968,6 +7567,10 @@ def build_panel(
             fin_g7 = fin_g7.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
             fin_g7['has_data'] = 1.0
+            
+            # Track days since last quarterly dividend data
+            latest_quarter = df_quarterly.index.max()
+            fin_g7['days_since_update'] = np.maximum((fin_g7.index - latest_quarter).days, 0)
             
             logger.info(f"✅ G7: Built {len(df_quarterly)} quarters → {len(fin_g7)} days dividend/shareholder metrics for {symbol}")
             
@@ -7310,31 +7913,14 @@ def build_panel(
             logger.debug(f"DCF feature generation failed for {symbol}: {e}")
             return None
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # DEPRECATED: _h_news_sentiment_hf
+    # This is NOT a family - it should exist outside the family system.
+    # Kept as stub for backward compatibility but removed from registry.
+    # ─────────────────────────────────────────────────────────────────────────
     def _h_news_sentiment_hf():
-        """HuggingFace-based news sentiment module"""
-        # Try loading from cache first (prep_families should have generated this)
-        if cache_dir is not None:
-            cached = _load_cached_family_for_hf('news_sentiment_hf', 'news_sentiment_hf')
-            if cached is not None and not cached.empty:
-                logger.info(f"✅ news_sentiment_hf: using cached result for {symbol}")
-                return cached
-        
-        # Fallback: generate on-the-fly (should rarely happen if prep_families ran)
-        try:
-            from src.dcf_lab.modules.news_sentiment_hf import NewsSentimentHF
-            logger.warning(f"⚠️ news_sentiment_hf: cache miss, generating on-the-fly for {symbol}")
-            module = NewsSentimentHF()
-            signal = module.emit_signal(symbol=symbol, horizon=63, start_date=start, end_date=end)
-            if signal and hasattr(signal, 'df') and isinstance(signal.df, pd.DataFrame):
-                df = signal.df
-                if not df.empty:
-                    df = _safe_filter(df, start, end)
-                    if not df.empty:
-                        df.attrs['telemetry'] = {'status': 'ok', 'source': 'NewsSentimentHF'}
-                        df.attrs['feature_counts'] = {'generated': len(df.columns)}
-                        return df
-        except Exception as e:
-            logger.debug(f"news_sentiment_hf failed for {symbol}: {e}")
+        """DEPRECATED: news_sentiment_hf is not a family."""
+        logger.warning(f"news_sentiment_hf called but is deprecated - not a family")
         return None
 
     def _h_earnings_transcript_hf():
@@ -7571,22 +8157,19 @@ def build_panel(
 
     def _h_forecast_hf():
         """HF block blending forecast-oriented families."""
-        families_used = ['quantile_forecast', 'calibration', 'online_learning', 'arima_forecast', 'tft_features']
+        # REMOVED: calibration, online_learning - these are governance layers, not families
+        families_used = ['quantile_forecast', 'arima_forecast', 'tft_features']
         if cache_dir is None:
             logger.warning("forecast_hf: cache_dir is required for HF cached inputs")
             return None
 
         quantile_df = _load_cached_family_for_hf('forecast_hf', 'quantile_forecast')
-        calibration_df = _load_cached_family_for_hf('forecast_hf', 'calibration')
-        online_df = _load_cached_family_for_hf('forecast_hf', 'online_learning')
         arima_df = _load_cached_family_for_hf('forecast_hf', 'arima_forecast')
         tft_df = _load_cached_family_for_hf('forecast_hf', 'tft_features')
 
         blocks: List[pd.DataFrame] = []
         for fam_name, raw_df, limit in [
             ('quantile_forecast', quantile_df, 24),
-            ('calibration', calibration_df, 10),
-            ('online_learning', online_df, 18),
             ('arima_forecast', arima_df, 6),
             ('tft_features', tft_df, 14),
         ]:
@@ -7804,7 +8387,8 @@ def build_panel(
 
     def _h_news_nlp_hf():
         """HF block for news/NLP driven signals."""
-        families_used = ['finbert', 'doc_embedding_novelty_hf', 'earnings_transcript_hf', 'news_sentiment_hf', 'alternative_signals']
+        # REMOVED: news_sentiment_hf - not a family, should exist outside family system
+        families_used = ['finbert', 'doc_embedding_novelty_hf', 'earnings_transcript_hf', 'alternative_signals']
         if cache_dir is None:
             logger.warning("news_nlp_hf: cache_dir is required for HF cached inputs")
             return None
@@ -7812,7 +8396,7 @@ def build_panel(
         finbert_df = _load_cached_family_for_hf('news_nlp_hf', 'finbert')
         doc_df = _load_cached_family_for_hf('news_nlp_hf', 'doc_embedding_novelty_hf')
         transcript_df = _load_cached_family_for_hf('news_nlp_hf', 'earnings_transcript_hf')
-        news_hf_df = _load_cached_family_for_hf('news_nlp_hf', 'news_sentiment_hf')
+        # REMOVED: news_sentiment_hf - not a family
         alt_df = _load_cached_family_for_hf('news_nlp_hf', 'alternative_signals')
 
         blocks: List[pd.DataFrame] = []
@@ -7821,7 +8405,7 @@ def build_panel(
             ('finbert', finbert_df, 16),
             ('doc_embedding_novelty_hf', doc_df, 12),
             ('earnings_transcript_hf', transcript_df, 12),
-            ('news_sentiment_hf', news_hf_df, 12),
+            # REMOVED: news_sentiment_hf - not a family
         ]:
             if raw_df is None:
                 continue
@@ -7978,6 +8562,7 @@ def build_panel(
         'news_sentiment': _h_news_sentiment,
         'ml_framework': _h_ml_framework,
         'microstructure': _h_microstructure,
+        'event_time_bars': _h_event_time_bars,
         'drift_monitor': _h_drift_monitor,
         'dcf': _h_dcf,
         'multiasset': _h_multiasset,
@@ -7995,12 +8580,15 @@ def build_panel(
         'peer_screener_context': _h_peer_screener_context,
         'fin_g7': _h_fin_g7,
         
-        # Dependent families (MUST run after quantile_forecast)
-        'calibration': _h_calibration,
-        'online_learning': _h_online_learning,
+        # ─────────────────────────────────────────────────────────────────────
+        # REMOVED: calibration and online_learning
+        # These are GOVERNANCE LAYERS, not feature families.
+        # They persist via artifacts/governance/ with horizon-aware state keys.
+        # See: src/stage_b_stateful/governance_persistence.py
+        # ─────────────────────────────────────────────────────────────────────
         
         # HuggingFace-based modules
-        'news_sentiment_hf': _h_news_sentiment_hf,
+        # REMOVED: news_sentiment_hf - not a family, should exist outside family system
         'earnings_transcript_hf': _h_earnings_transcript_hf,
         'doc_embedding_novelty_hf': _h_doc_embedding_novelty_hf,
         'macro_tst_hf': _h_macro_tst_hf,
@@ -8186,6 +8774,63 @@ def build_panel(
     if stage is not None:
         panel.attrs['stage'] = stage
     panel = _apply_stable_schema_stubs(panel)
+    
+    # Post-maturity flag computation from JSONL events
+    panel = _compute_flags_from_events(panel, symbol, horizon, cache_dir)
+    
+    return panel
+
+
+def _compute_flags_from_events(panel: pd.DataFrame, symbol: str, horizon: int, cache_dir: Optional[Path]) -> pd.DataFrame:
+    """Compute tracking flags from JSONL event logs post-maturity.
+    
+    This reads drift/retraining/recalibration events logged during generation
+    and computes flags for each row based on event history. "Post-maturity" means
+    this happens AFTER family generation during panel merge, NOT filtering by date.
+    
+    Args:
+        panel: Merged panel DataFrame
+        symbol: Symbol name
+        horizon: Forecast horizon
+        cache_dir: Cache directory path
+    
+    Returns:
+        Panel with updated flags (days_since_update, drift_flag, etc.)
+    """
+    if panel.empty or cache_dir is None:
+        return panel
+    
+    event_log_dir = Path(cache_dir) / 'event_logs'
+    
+    # Process each family's events
+    # NOTE: calibration and online_learning are now GOVERNANCE LAYERS, not families.
+    # Their events are managed via artifacts/governance/, not prep_families.
+    # Only quantile_forecast remains as a family with event tracking here.
+    for family in ['quantile_forecast']:
+        try:
+            # Load materialization date
+            mat_file = event_log_dir / f'{symbol}_h{horizon}_{family}_materialization.json'
+            if not mat_file.exists():
+                continue
+                
+            with open(mat_file) as f:
+                mat_data = json.load(f)
+                mat_date = pd.to_datetime(mat_data['last_materialization'])
+            
+            # Compute days_since_update for ALL rows
+            col_name = f'{family}_days_since_update'
+            if col_name in panel.columns:
+                panel[col_name] = np.maximum((mat_date - panel.index).days, 0)
+            
+            # NOTE: online_learning event processing removed.
+            # Online learning is now a GOVERNANCE LAYER, not a family.
+            # Event tracking for online_learning happens via:
+            #   artifacts/governance/online_learning/
+            # See: src/stage_b_stateful/governance_persistence.py
+                
+        except Exception as e:
+            logger.warning(f"Failed to compute flags from events for {family}: {e}")
+    
     return panel
 
 

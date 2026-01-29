@@ -23,7 +23,7 @@ import json
 import re
 import tempfile
 from collections import Counter
-from typing import Dict, List, Optional, Any, Iterable
+from typing import Dict, List, Optional, Any, Iterable, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -597,6 +597,105 @@ class EODHDProvider:
             payload = str((endpoint, tuple(sorted(safe_params.items()))))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def _eod_master_cache_key(self, symbol: str, period: str) -> str:
+        """
+        Master cache key for EOD data - uses only symbol + period, NOT date ranges.
+        This allows us to cache full history and slice from it.
+        """
+        payload = json.dumps({"type": "eod_master", "symbol": symbol, "period": period}, sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _load_eod_master_cache(self, symbol: str, period: str) -> Optional[Tuple[pd.DataFrame, pd.Timestamp, pd.Timestamp]]:
+        """
+        Load EOD master cache for a symbol.
+        Returns: (DataFrame, cached_start, cached_end) or None if not cached.
+        """
+        cache_key = self._eod_master_cache_key(symbol, period)
+        path = self._cache_path(cache_key)
+        
+        if not path.exists():
+            return None
+            
+        try:
+            # Check TTL (use longer TTL for master cache - 1 day for recent data)
+            age = time.time() - path.stat().st_mtime
+            # Master cache valid for 1 day (we'll extend with new data anyway)
+            if age > 86400:  # 24 hours
+                if self._trace_enabled:
+                    logger.debug("📦 EODHD master cache expired for %s (age=%.1fh)", symbol, age / 3600)
+                return None
+                
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                
+            if not data or not isinstance(data, list):
+                return None
+                
+            df = pd.DataFrame(data)
+            if df.empty:
+                return None
+                
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date').sort_index()
+            
+            cached_start = df.index.min()
+            cached_end = df.index.max()
+            
+            if self._trace_enabled:
+                logger.debug("📦 EODHD master cache loaded for %s: %s to %s (%d rows)", 
+                           symbol, cached_start.date(), cached_end.date(), len(df))
+                           
+            return df, cached_start, cached_end
+            
+        except Exception as e:
+            logger.debug("Failed to load EOD master cache for %s: %s", symbol, e)
+            return None
+
+    def _save_eod_master_cache(self, symbol: str, period: str, df: pd.DataFrame) -> None:
+        """Save EOD data to master cache (stores raw API response format)."""
+        if df is None or df.empty:
+            return
+            
+        try:
+            cache_key = self._eod_master_cache_key(symbol, period)
+            path = self._cache_path(cache_key)
+            
+            # Convert back to raw format for caching
+            save_df = df.reset_index()
+            
+            # Rename index column to 'date' if needed
+            if 'index' in save_df.columns:
+                save_df = save_df.rename(columns={'index': 'date'})
+            
+            # Use lowercase column names for storage (matches API format)
+            # Map from formatted (Open, High, etc.) to raw (open, high, etc.)
+            col_map = {
+                'Open': 'open',
+                'High': 'high', 
+                'Low': 'low',
+                'Close': 'close',
+                'Adj Close': 'adjusted_close',
+                'Volume': 'volume'
+            }
+            save_df = save_df.rename(columns=col_map)
+            
+            # Convert date to string for JSON
+            if 'date' in save_df.columns:
+                save_df['date'] = pd.to_datetime(save_df['date']).dt.strftime('%Y-%m-%d')
+            
+            records = save_df.to_dict('records')
+            
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(records, f)
+            tmp.replace(path)
+            
+            if self._trace_enabled:
+                logger.debug("📦 EODHD master cache saved for %s: %d rows", symbol, len(records))
+                
+        except Exception as e:
+            logger.debug("Failed to save EOD master cache for %s: %s", symbol, e)
+
     def _cache_path(self, cache_key: str) -> Path:
         return self._cache_dir / f"{cache_key}.json"
 
@@ -667,7 +766,13 @@ class EODHDProvider:
         period: str = "d"
     ) -> Optional[pd.DataFrame]:
         """
-        Get end-of-day historical prices
+        Get end-of-day historical prices with smart caching.
+        
+        Caching Strategy:
+        1. Check if we have a master cache for this symbol+period
+        2. If cached data covers the requested range, return from cache (no API call)
+        3. If cached data is partial, fetch only the missing portions
+        4. Merge cached + new data and update the master cache
         
         Args:
             symbol: Stock symbol (e.g., 'AAPL' or 'AAPL.US')
@@ -684,10 +789,12 @@ class EODHDProvider:
 
         cache_key = (symbol, period)
         req_start = pd.to_datetime(start_date) if start_date else None
-        req_end = pd.to_datetime(end_date) if end_date else None
+        req_end = pd.to_datetime(end_date) if end_date else pd.Timestamp.now()
 
-        # Fast path: serve from in-memory range cache when covered.
-        if self._range_cache_enabled and cache_key in self._eod_range_cache and req_start is not None and req_end is not None:
+        # ============================================================
+        # STEP 1: Check in-memory range cache first (fastest path)
+        # ============================================================
+        if self._range_cache_enabled and cache_key in self._eod_range_cache and req_start is not None:
             cov = self._eod_range_coverage.get(cache_key)
             if cov is not None:
                 cov_start, cov_end = cov
@@ -695,39 +802,142 @@ class EODHDProvider:
                     self._range_cache_hits += 1
                     cached_df = self._eod_range_cache[cache_key]
                     return cached_df.loc[(cached_df.index >= req_start) & (cached_df.index <= req_end)].copy()
-        
-        # When partially cached, expand the fetch to cover the union once.
-        fetch_start = start_date
-        fetch_end = end_date
-        if self._range_cache_enabled and cache_key in self._eod_range_cache and req_start is not None and req_end is not None:
-            cov = self._eod_range_coverage.get(cache_key)
-            if cov is not None:
-                cov_start, cov_end = cov
-                fetch_start = min(cov_start, req_start).strftime('%Y-%m-%d')
-                fetch_end = max(cov_end, req_end).strftime('%Y-%m-%d')
 
-        params = {'period': period}
-        if fetch_start:
-            params['from'] = fetch_start
-        if fetch_end:
-            params['to'] = fetch_end
+        # ============================================================
+        # STEP 2: Check disk master cache (persists across runs)
+        # ============================================================
+        master_cache = self._load_eod_master_cache(symbol, period)
+        cached_df = None
+        cached_start = None
+        cached_end = None
         
-        self._range_cache_misses += 1
-        data = self._make_request(f"eod/{symbol}", params)
+        if master_cache is not None:
+            cached_df, cached_start, cached_end = master_cache
+            
+            # If cache fully covers requested range, return from cache
+            if req_start is not None and cached_start <= req_start and cached_end >= req_end:
+                if self._trace_enabled:
+                    logger.debug("📦 EODHD master cache HIT for %s: requested %s to %s, cached %s to %s",
+                               symbol, req_start.date(), req_end.date(), cached_start.date(), cached_end.date())
+                self._cache_hits += 1
+                
+                # Update in-memory cache too
+                if self._range_cache_enabled:
+                    self._eod_range_cache[cache_key] = cached_df
+                    self._eod_range_coverage[cache_key] = (cached_start, cached_end)
+                
+                # Rename columns and return slice
+                result = self._format_eod_dataframe(cached_df)
+                if result is not None and req_start is not None:
+                    return result.loc[(result.index >= req_start) & (result.index <= req_end)].copy()
+                return result
+
+        # ============================================================
+        # STEP 3: Determine what needs to be fetched
+        # ============================================================
+        fetch_ranges = []  # List of (start, end) tuples to fetch
         
-        if not data:
+        if cached_df is not None and req_start is not None:
+            # We have partial data - fetch only what's missing
+            if req_start < cached_start:
+                # Need earlier data
+                fetch_ranges.append((req_start.strftime('%Y-%m-%d'), 
+                                    (cached_start - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            if req_end > cached_end:
+                # Need later data (up to today)
+                fetch_ranges.append(((cached_end + pd.Timedelta(days=1)).strftime('%Y-%m-%d'),
+                                    req_end.strftime('%Y-%m-%d')))
+            
+            if not fetch_ranges:
+                # Cache covers our range - shouldn't reach here but handle it
+                if self._trace_enabled:
+                    logger.debug("📦 EODHD cache fully covers range for %s", symbol)
+                result = self._format_eod_dataframe(cached_df)
+                if result is not None and req_start is not None:
+                    return result.loc[(result.index >= req_start) & (result.index <= req_end)].copy()
+                return result
+        else:
+            # No cache - fetch full requested range (or full history if no start specified)
+            fetch_start = start_date or "1990-01-01"  # Fetch from earliest available
+            fetch_end = end_date or pd.Timestamp.now().strftime('%Y-%m-%d')
+            fetch_ranges.append((fetch_start, fetch_end))
+
+        # ============================================================
+        # STEP 4: Fetch missing data from API
+        # ============================================================
+        if self._trace_enabled:
+            logger.debug("📡 EODHD fetching for %s: %d range(s) %s", symbol, len(fetch_ranges), fetch_ranges)
+        
+        fetched_frames = []
+        for fetch_start, fetch_end in fetch_ranges:
+            params = {'period': period, 'from': fetch_start, 'to': fetch_end}
+            self._range_cache_misses += 1
+            data = self._make_request(f"eod/{symbol}", params)
+            
+            if data:
+                try:
+                    df = pd.DataFrame(data)
+                    if not df.empty:
+                        df['date'] = pd.to_datetime(df['date'])
+                        df = df.set_index('date').sort_index()
+                        fetched_frames.append(df)
+                except Exception as e:
+                    logger.debug("Failed to parse EODHD chunk for %s: %s", symbol, e)
+
+        # ============================================================
+        # STEP 5: Merge cached + fetched data
+        # ============================================================
+        all_frames = []
+        if cached_df is not None and not cached_df.empty:
+            # cached_df already has date as index from _load_eod_master_cache
+            all_frames.append(cached_df)
+        
+        all_frames.extend(fetched_frames)
+        
+        if not all_frames:
             return None
         
+        # Combine all data
+        if len(all_frames) == 1:
+            combined_df = all_frames[0]
+        else:
+            # Ensure all frames have matching columns before concat
+            combined_df = pd.concat(all_frames, axis=0, ignore_index=False)
+            # Remove duplicates (keep last for most recent data)
+            combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+        
+        combined_df = combined_df.sort_index()
+        
+        # ============================================================
+        # STEP 6: Save merged data to master cache
+        # ============================================================
+        if not combined_df.empty:
+            # Format before saving
+            formatted_df = self._format_eod_dataframe(combined_df)
+            if formatted_df is not None:
+                self._save_eod_master_cache(symbol, period, formatted_df)
+                
+                # Update in-memory cache
+                if self._range_cache_enabled:
+                    self._eod_range_cache[cache_key] = formatted_df
+                    self._eod_range_coverage[cache_key] = (formatted_df.index.min(), formatted_df.index.max())
+                
+                # Return requested slice
+                if req_start is not None:
+                    return formatted_df.loc[(formatted_df.index >= req_start) & (formatted_df.index <= req_end)].copy()
+                return formatted_df
+        
+        return None
+
+    def _format_eod_dataframe(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Format raw EOD DataFrame to standard column names."""
+        if df is None or df.empty:
+            return None
+            
         try:
-            df = pd.DataFrame(data)
-            if df.empty:
-                return None
+            result = df.copy()
             
-            # Parse date and set as index
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')
-            
-            # Rename columns to match yfinance convention
+            # Rename columns to match yfinance convention (if not already renamed)
             column_map = {
                 'open': 'Open',
                 'high': 'High',
@@ -736,24 +946,17 @@ class EODHDProvider:
                 'adjusted_close': 'Adj Close',
                 'volume': 'Volume'
             }
-            df = df.rename(columns=column_map)
+            result = result.rename(columns=column_map)
             
             # Convert to numeric
             for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                if col in result.columns:
+                    result[col] = pd.to_numeric(result[col], errors='coerce')
             
-            df = df.sort_index()
-            if self._range_cache_enabled:
-                self._eod_range_cache[cache_key] = df
-                self._eod_range_coverage[cache_key] = (df.index.min(), df.index.max())
-
-            if req_start is not None and req_end is not None:
-                return df.loc[(df.index >= req_start) & (df.index <= req_end)].copy()
-            return df
+            return result.sort_index()
             
         except Exception as e:
-            logger.error(f"Failed to parse EODHD price data: {e}")
+            logger.error(f"Failed to format EODHD price data: {e}")
             return None
     
     def get_intraday_prices(

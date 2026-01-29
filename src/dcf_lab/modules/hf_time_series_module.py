@@ -46,7 +46,14 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class HFTimeSeriesConfig:
-    """Configuration for :class:`HFTimeSeriesModule`."""
+    """Configuration for :class:`HFTimeSeriesModule`.
+
+    Micro-improvements (v2):
+      - attn_temperature: Softmax temperature τ ∈ [0.7, 1.2] to prevent attention
+        collapse onto single days. Lower τ = sharper, higher τ = smoother.
+      - conf_ema_alpha: EMA smoothing for hf_conf to dampen single-day conviction
+        spikes. α = 0.0 disables (raw |score|), α = 0.3 recommended.
+    """
 
     input_dim: int
     window: int
@@ -57,6 +64,9 @@ class HFTimeSeriesConfig:
     dropout: float = 0.1
     bidirectional: bool = True
     device: Optional[str] = None
+    # v2 micro-improvements
+    attn_temperature: float = 1.0  # τ ∈ [0.7, 1.2], prevents attention collapse
+    conf_ema_alpha: float = 0.3   # EMA smoothing for hf_conf, 0 = disabled
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0:
@@ -71,6 +81,10 @@ class HFTimeSeriesConfig:
             raise ValueError("d_model must be > 0")
         if not 0.0 <= self.dropout <= 0.5:
             raise ValueError("dropout must be in [0, 0.5]")
+        if not 0.5 <= self.attn_temperature <= 2.0:
+            raise ValueError("attn_temperature must be in [0.5, 2.0]")
+        if not 0.0 <= self.conf_ema_alpha <= 0.9:
+            raise ValueError("conf_ema_alpha must be in [0.0, 0.9]")
 
     @property
     def encoder_dim(self) -> int:
@@ -111,6 +125,12 @@ class HFTimeSeriesModule(nn.Module):
             nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim, 1),
         )
+
+        # v2 micro-improvements: attention temperature and confidence EMA state
+        self.attn_temperature = config.attn_temperature
+        self.conf_ema_alpha = config.conf_ema_alpha
+        # Running EMA state for confidence calibration (batch-level, reset per forward)
+        self._conf_ema_state: Optional[Tensor] = None
 
         self.to(config.device or self._auto_device())
 
@@ -157,22 +177,60 @@ class HFTimeSeriesModule(nn.Module):
                 raise ValueError("attention_mask must match (batch, window)")
             scores = scores.masked_fill(attention_mask == 0, float("-inf"))
 
-        weights = torch.softmax(scores, dim=1).unsqueeze(-1)
+        # (A) Attention temperature scaling: softmax(e_t / τ)
+        # τ < 1.0 = sharper attention, τ > 1.0 = smoother distribution
+        # Prevents collapse onto single day, improves robustness in volatile regimes
+        scaled_scores = scores / self.attn_temperature
+        weights = torch.softmax(scaled_scores, dim=1).unsqueeze(-1)
         pooled = torch.sum(weights * enc_out, dim=1)
 
         logits = self.head(pooled).squeeze(-1)
         prob_up = torch.sigmoid(logits)
         hf_score = (prob_up * 2.0) - 1.0
-        hf_conf = torch.abs(hf_score)
+
+        # (B) Confidence calibration via EMA: dampens single-day conviction spikes
+        # hf_conf_t = α × hf_conf_{t-1} + (1 - α) × |hf_score_t|
+        raw_conf = torch.abs(hf_score)
+        if self.conf_ema_alpha > 0.0 and not self.training:
+            # Only apply EMA during inference (training uses raw for gradient flow)
+            if self._conf_ema_state is None or self._conf_ema_state.shape != raw_conf.shape:
+                self._conf_ema_state = raw_conf.clone()
+            else:
+                self._conf_ema_state = (
+                    self.conf_ema_alpha * self._conf_ema_state +
+                    (1.0 - self.conf_ema_alpha) * raw_conf
+                )
+            hf_conf = self._conf_ema_state.clone()
+        else:
+            hf_conf = raw_conf
 
         return {
             "logits": logits,
             "p_up": prob_up,
             "hf_score": hf_score,
             "hf_conf": hf_conf,
+            "hf_conf_raw": raw_conf,  # Unsmoothed for diagnostics
             "attention": weights.squeeze(-1),
             "pooled_state": pooled,
+            "attn_entropy": self._attention_entropy(weights.squeeze(-1)),  # Diagnostic
         }
+
+    @staticmethod
+    def _attention_entropy(weights: Tensor) -> Tensor:
+        """Compute attention entropy for diagnostic purposes.
+
+        Higher entropy = more uniform attention (good).
+        Low entropy = attention collapsed onto few days (potential overfit).
+        Max entropy for window=40 is log(40) ≈ 3.69.
+        """
+        # Avoid log(0) with small epsilon
+        log_weights = torch.log(weights + 1e-10)
+        entropy = -torch.sum(weights * log_weights, dim=1)
+        return entropy
+
+    def reset_ema_state(self) -> None:
+        """Reset confidence EMA state (call between symbols or time series)."""
+        self._conf_ema_state = None
 
     @staticmethod
     def compute_loss(logits: Tensor, targets: Tensor) -> Tensor:

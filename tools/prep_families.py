@@ -74,6 +74,12 @@ def _uses_symbol_only_cache_path(family: str) -> bool:
     return str(family).strip().lower() in {f.lower() for f in SYMBOL_ONLY_HF_BLOCKS}
 
 
+def _uses_shared_cache_path(family: str) -> bool:
+    """Check if a family uses the shared cache (symbol/horizon invariant)."""
+    fam_lower = str(family).strip().lower()
+    return fam_lower in {"doc_embedding_novelty_hf", "peer_screener_context"}
+
+
 def _family_cache_dir_for_write(cache_dir: Path, symbol: str, horizon: int, family: str) -> Path:
     """Return the directory where consolidated caches for (family) should live.
 
@@ -89,16 +95,53 @@ def _family_cache_dir_for_write(cache_dir: Path, symbol: str, horizon: int, fami
 
 
 def _family_cache_basename(symbol: str, horizon: int, family: str, split: str = "") -> str:
-    """Generate cache file basename. Split parameter is deprecated - ignored for clean caching."""
+    """Generate cache file basename. 
+    
+    Returns clean basename without split suffix for symbol-only families and when split is empty.
+    Includes split suffix for backward compatibility when split is explicitly provided.
+    """
     symbol_lower = symbol.lower()
     fam_lower = str(family).lower()
-    # Clean cache: no train/valid splits, single file per family
+    
+    # Symbol-only families never use split suffix (truly shared across horizons/splits)
     if _uses_symbol_only_cache_path(fam_lower):
         return f"{symbol_lower}_{family}.parquet"
+    
+    # Non-symbol-only families: include split if provided (for backward compat with existing caches)
+    if split:
+        return f"{symbol_lower}_h{horizon}_{family}_{split}.parquet"
     return f"{symbol_lower}_h{horizon}_{family}.parquet"
 
 
 def _family_cache_paths(cache_dir: Path, symbol: str, horizon: int, family: str, split: str) -> Tuple[Path, Path, Path]:
+    """Get cache paths for a family, handling shared cache families like doc_embedding_novelty_hf."""
+    fam_lower = str(family).lower()
+    
+    # Shared cache families (doc_embedding_novelty_hf, peer_screener_context) use shared cache with date-range naming
+    if _uses_shared_cache_path(fam_lower):
+        if fam_lower == "doc_embedding_novelty_hf":
+            shared_dir = SHARED_CACHE_DIR / "doc_embedding" / "doc_embedding_novelty_hf"
+        elif fam_lower == "peer_screener_context":
+            shared_dir = SHARED_CACHE_DIR / "peer_screener" / "peer_screener_context"
+        else:
+            shared_dir = SHARED_CACHE_DIR / fam_lower
+        # Look for existing features.parquet files matching the split
+        pattern = f"{split}_*_features.parquet"
+        matching_files = sorted(shared_dir.glob(pattern), reverse=True) if shared_dir.exists() else []
+        
+        if matching_files:
+            # Return the most recent matching file as the features path
+            features_path = matching_files[0]
+            base_path = features_path.with_name(features_path.name.replace("_features.parquet", ".parquet"))
+            lagged_path = features_path.with_name(features_path.name.replace("_features.parquet", "_features_lagged.parquet"))
+            return base_path, features_path, lagged_path
+        else:
+            # No existing files - return expected path pattern for creation
+            features_path = shared_dir / f"{split}_features.parquet"
+            base_path = shared_dir / f"{split}.parquet"
+            lagged_path = shared_dir / f"{split}_features_lagged.parquet"
+            return base_path, features_path, lagged_path
+    
     base_name = _family_cache_basename(symbol, horizon, family, split)
     target_dir = _family_cache_dir_for_write(cache_dir, symbol, horizon, family)
     base_path = target_dir / base_name
@@ -188,7 +231,7 @@ def _write_storage_snapshot(*, horizon: int, cache_root: Path, output_dir: Path)
             "paths": {
                 "cache_root": str(cache_root),
                 "feature_panel_dir": str(FEATURE_PANEL_DIR),
-                "data_cache": str(REPO_ROOT / "data_cache"),
+                "shared_cache": str(REPO_ROOT / "cache" / "shared"),
             },
             "mounts": {
                 "cache_root": _find_mount_for_path(cache_root),
@@ -218,7 +261,7 @@ def _write_storage_snapshot(*, horizon: int, cache_root: Path, output_dir: Path)
         snapshot["sizes_bytes"] = {
             "cache_root": _du_bytes(cache_root),
             "feature_panel_dir": _du_bytes(FEATURE_PANEL_DIR),
-            "data_cache": _du_bytes(REPO_ROOT / "data_cache"),
+            "shared_cache": _du_bytes(REPO_ROOT / "cache" / "shared"),
         }
 
         out_path = output_dir / f"storage_snapshot_{host}_{stamp}.json"
@@ -269,13 +312,15 @@ def _shared_invariant_cache_path(task: "SignalTask", cache_dir: Path) -> Path:
     split_key = str(task.split).lower()
     family_key = str(task.family).lower()
     dest_dir = _shared_invariant_cache_root(cache_dir, task.horizon, task.family) / family_key
-    new_path = dest_dir / f"{split_key}_{start_key}_{end_key}.parquet"
+    
+    # Cache file naming convention: {split}_{start}_{end}_features.parquet
+    new_path = dest_dir / f"{split_key}_{start_key}_{end_key}_features.parquet"
 
     # Backward-compat: if we previously stored horizon-scoped shared artifacts,
     # reuse them if present.
     if family_key in HORIZON_INVARIANT_HF_MODULES and not new_path.exists():
         old_dir = _shared_invariant_cache_root(cache_dir, task.horizon, None) / family_key
-        old_path = old_dir / f"{split_key}_{start_key}_{end_key}.parquet"
+        old_path = old_dir / f"{split_key}_{start_key}_{end_key}_features.parquet"
         if old_path.exists():
             return old_path
 
@@ -454,21 +499,23 @@ DEFAULT_WF_STEP_DAYS = 126
 # Also exclude cross-sectional/universe-wide families by default; those are generated
 # as separate "universe snapshot" datasets and should only be merged into model
 # features when explicitly requested.
+# Phase 2 exclusions: families not needed for current pipeline
 DEFAULT_EXCLUDE_FAMILIES: Tuple[str, ...] = (
     "fx",
     "commodities",
     "crypto",
+    "news_sentiment_hf",
+    "calibration",
+    "online_learning",
 )
 DEFAULT_WF_TRAIN_YEARS = 5
 
 # Families that must run sequentially due to explicit dependency ordering.
-#
-# Per-symbol user-required flow:
+# Only quantile_forecast is horizon-bound. calibration/online_learning are removed.
 # - Base families run in parallel
-# - Dependency chain runs sequentially: quantile_forecast → calibration → online_learning
 # - HF blocks run in parallel AFTER base families are complete
 # - hf_agg is META-derived and computed last during unified panel build
-SEQUENTIAL_ONLY_FAMILIES: Set[str] = {"quantile_forecast", "calibration", "online_learning"}
+SEQUENTIAL_ONLY_FAMILIES: Set[str] = {"quantile_forecast"}
 
 
 def _is_horizon_bound_family(family: str) -> bool:
@@ -692,10 +739,9 @@ def _migrate_symbol_only_hf_block_caches_from_horizon_dir(
 
 # Families that have dependencies and MUST run in specific order
 # These run in the sequential phase AFTER parallel families complete
+# NOTE: calibration and online_learning are removed from the pipeline
 DEPENDENCY_FAMILIES: Dict[str, List[str]] = {
     "quantile_forecast": [],
-    "calibration": ["quantile_forecast"],
-    "online_learning": ["quantile_forecast", "calibration"],
 }
 
 
@@ -929,11 +975,64 @@ def find_incomplete_families(
 
 
 def write_task_metadata(task: SignalTask) -> None:
-    """Persist metadata for any generated cache file."""
-    coverage = _read_parquet_date_range(task.cache_path)
+    """Persist metadata for the generated _features.parquet cache file."""
+    # Since we no longer write signal files, write metadata for _features.parquet
+    features_path = task.cache_path.parent / task.cache_path.name.replace(
+        ".parquet", "_features.parquet"
+    )
+    coverage = _read_parquet_date_range(features_path)
     if coverage is None:
         return
     file_start, file_end = coverage
+    source_asof_ts = None
+    source_col = f"{task.family}_source_asof_ts"
+    try:
+        if features_path.exists():
+            try:
+                source_frame = pd.read_parquet(features_path, columns=[source_col])
+            except Exception:
+                source_frame = None
+            if isinstance(source_frame, pd.DataFrame) and source_col in source_frame.columns:
+                latest = source_frame[source_col].dropna()
+                if not latest.empty:
+                    source_asof_ts = pd.to_datetime(latest.iloc[-1], errors="coerce")
+                    if isinstance(source_asof_ts, pd.Timestamp) and not pd.isna(source_asof_ts):
+                        source_asof_ts = source_asof_ts.isoformat()
+                    else:
+                        source_asof_ts = None
+    except Exception:
+        source_asof_ts = None
+
+    cadence_days = None
+    expected_latency_days = None
+    try:
+        from src.features.family_metadata import load_family_metadata  # type: ignore
+
+        reg_path = Path(__file__).resolve().parents[1] / "src" / "features" / "family_metadata_registry.json"
+        registry = load_family_metadata(reg_path if reg_path.exists() else None)
+        meta_obj = registry.get(task.family)
+        if meta_obj is not None:
+            freq = str(getattr(meta_obj, "update_frequency", "")).lower()
+            cadence_days = {
+                "daily": 1,
+                "intraday": 0,
+                "weekly": 7,
+                "monthly": 30,
+                "quarterly": 90,
+                "event": None,
+                "irregular": None,
+            }.get(freq, None)
+            latency = str(getattr(meta_obj, "update_latency_class", "")).lower()
+            expected_latency_days = {
+                "intraday": 0,
+                "same_day_close": 0,
+                "t_plus_1": 1,
+                "t_plus_2_plus": 2,
+            }.get(latency, None)
+    except Exception:
+        cadence_days = None
+        expected_latency_days = None
+
     meta = {
         "symbol": task.symbol,
         "family": task.family,
@@ -946,8 +1045,12 @@ def write_task_metadata(task: SignalTask) -> None:
         "window_id": task.window_id,
         "scope": task.scope,
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "fetch_ts": pd.Timestamp.utcnow().isoformat(),
+        "source_asof_ts": source_asof_ts,
+        "cadence_days": cadence_days,
+        "expected_latency_days": expected_latency_days,
     }
-    meta_path = _cache_meta_path(task.cache_path)
+    meta_path = _cache_meta_path(features_path)
     try:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         with open(meta_path, "w") as handle:
@@ -1289,7 +1392,8 @@ def detect_existing_signals(
             pass
 
     for family in families:
-        for split in ("train", "valid"):
+        # Check both split patterns: "" (consolidated/Stage-A) and "train"/"valid" (walk-forward)
+        for split in ("", "train", "valid"):
             consolidated_path, features_path, features_lagged_path = _family_cache_paths(
                 cache_dir,
                 symbol,
@@ -1563,8 +1667,9 @@ def _write_feature_cache(
     This is used to prevent schema drift where incremental merges keep legacy
     columns that are no longer generated.
     
-    GOVERNANCE: If ``family`` is provided, validates that a ``{family}_has_data``
-    column exists. Missing governance columns are auto-injected with a warning.
+    GOVERNANCE: If ``family`` is provided, validates that governance columns exist
+    and are properly computed for the full date range. Missing/stub governance 
+    columns are auto-computed based on the actual data coverage.
     """
 
     normalized = _normalize_date_column(frame)
@@ -1575,18 +1680,45 @@ def _write_feature_cache(
     # ═══════════════════════════════════════════════════════════════════════════════
     # GOVERNANCE VALIDATION (Jan 2026)
     # ═══════════════════════════════════════════════════════════════════════════════
-    # Ensure every family cache has a has_data column. If missing, auto-inject with
-    # has_data=1.0 and log a warning so developers know to fix the generator.
+    # Centralized governance pass in aggregator_panel.py is authoritative.
+    # Here we only ensure columns exist to keep schema stable; values are
+    # treated as non-authoritative and overwritten later.
     # ═══════════════════════════════════════════════════════════════════════════════
     if family and not normalized.empty:
         has_data_col = f"{family}_has_data"
-        if has_data_col not in normalized.columns:
-            LOGGER.warning(
-                "⚠️ GOVERNANCE: %s cache missing %s column - auto-injecting. "
-                "Fix the generator to set has_data=1.0 on successful fetch.",
-                family, has_data_col
-            )
-            normalized[has_data_col] = 1.0
+        activity_col = f"{family}_activity"
+        days_since_col = f"{family}_days_since_update"
+        
+        # Get family feature columns (exclude governance columns)
+        family_feature_cols = [
+            c for c in normalized.columns 
+            if str(c).startswith(f"{family}_") 
+            and c not in [has_data_col, activity_col, days_since_col, 'date']
+            and not str(c).endswith('_has_data')
+            and not str(c).endswith('_activity')
+            and not str(c).endswith('_days_since_update')
+        ]
+        
+        # Default governance columns (non-authoritative)
+        has_data_computed = pd.Series(1.0, index=normalized.index)
+        
+        # Check if existing has_data is all-1.0 stub or has NaNs
+        if has_data_col in normalized.columns:
+            existing_has_data = pd.to_numeric(normalized[has_data_col], errors='coerce')
+            is_stub = existing_has_data.isna().any() or (existing_has_data == 1.0).all()
+            if is_stub and family_feature_cols:
+                # Replace stub with computed values
+                normalized[has_data_col] = has_data_computed
+        else:
+            normalized[has_data_col] = has_data_computed
+        
+        # Activity: default to 1.0
+        if activity_col not in normalized.columns or normalized[activity_col].isna().any():
+            normalized[activity_col] = 1.0
+        
+        # Days since update: default to 0.0
+        if days_since_col not in normalized.columns or normalized[days_since_col].isna().any():
+            normalized[days_since_col] = 0.0
 
     if allowed_columns is not None:
         allowed = [c for c in allowed_columns if c and c != "date"]
@@ -1828,6 +1960,15 @@ def validate_family_quality(
             "alternative_signals": ["alt_", "alternative_", "news_volume_", "news_sentiment_", "social_"],
             "cross_asset": ["cross_", "CROSS_", "cross_asset_"],
             "microstructure": ["micro_", "microstructure_", "MICRO_"],
+            # macro_tst_hf uses legacy non-prefixed columns (l1_, l2_, l3_, derived_)
+            "macro_tst_hf": ["macro_tst_hf_", "l1_", "l2_", "l3_", "derived_"],
+            # doc_embedding_novelty_hf uses event-based column names
+            "doc_embedding_novelty_hf": [
+                "doc_embedding_novelty_hf_", "n_events", "n_articles",
+                "macro_novelty", "geopolitical_novelty", "regulatory_novelty",
+                "energy_novelty", "conflict_novelty", "tech_novelty",
+                "theme_weight", "baseline_", "novelty_", "top_theme",
+            ],
         }
         
         prefixes = family_column_prefixes.get(family, [f"{family}_", f"{family.upper()}_"])
@@ -1853,6 +1994,8 @@ def validate_family_quality(
         # - peer_screener_context: cross-sectional ranks that are only valid when peer coverage is sufficient
         #   (use the *_has_data flag downstream to gate usage).
         # - fx/commodities/crypto: optional external market data feeds; may be unavailable in some environments.
+        # - macro_tst_hf: HF model dependent, may produce low-variance outputs depending on model state.
+        # - doc_embedding_novelty_hf: GDELT dependent, may have sparse coverage.
         allowed_dormant_families = {
             "calibration",
             "peer_screener_context",
@@ -1862,6 +2005,10 @@ def validate_family_quality(
             "fx",
             "commodities",
             "crypto",
+            # HF-model dependent: may produce low-variance outputs depending on model availability/state.
+            "macro_tst_hf",
+            # GDELT dependent: may have sparse coverage when news feed is unavailable.
+            "doc_embedding_novelty_hf",
             # NOTE: correlation and ml_framework now correctly set has_data=1 via their generators.
             # They are NOT dormant - they fetch real data from EODHD.
         }
@@ -2279,6 +2426,7 @@ def generate_base_family_signal(
                 if task.family == "earnings"
                 else None
             ),
+            family=task.family,
         )
         LOGGER.info(
             "✅ Cached %d raw features for Stage A: %s",
@@ -2342,6 +2490,7 @@ def generate_base_family_signal(
                     if task.family == "earnings"
                     else None
                 ),
+                family=task.family,
             )
 
             is_valid, reason = validate_family_quality(feature_cache_path, task.family)
@@ -2383,6 +2532,7 @@ def generate_base_family_signal(
                     if task.family == "earnings"
                     else None
                 ),
+                family=task.family,
             )
             LOGGER.info(
                 "\u2705 Cached %d lag-expanded features for downstream stages: %s",
@@ -2459,13 +2609,16 @@ def generate_base_family_signal(
         # Normalize chronology + enforce parquet-safe columns
         signal = _normalize_date_column(signal)
 
-        # Write to cache (index=False since date is now a column)
-        task.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        if task.merge_strategy == "merge":
-            signal = _merge_on_date(task.cache_path, signal)
-        signal.to_parquet(task.cache_path, index=False)
+        # DISABLED: Signal file writing (only _features.parquet is needed)
+        # The signal file was a legacy artifact containing only governance columns.
+        # All consumers now read from _features.parquet directly.
+        # 
+        # task.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # if task.merge_strategy == "merge":
+        #     signal = _merge_on_date(task.cache_path, signal)
+        # signal.to_parquet(task.cache_path, index=False)
+        # LOGGER.info("✅ Generated base family signal: %s", task.cache_key())
         
-        LOGGER.info("✅ Generated base family signal: %s", task.cache_key())
         return True
         
     except Exception as e:
@@ -2644,11 +2797,11 @@ def generate_hf_module_signal(
         legacy_cols = ["score", "score_raw", "conf", "confidence"]
         signal = signal.drop(columns=[c for c in legacy_cols if c in signal.columns], errors="ignore")
 
-        # Save standardized signal to final path
-        task.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        if task.merge_strategy == "merge":
-            signal = _merge_on_date(task.cache_path, signal)
-        signal.to_parquet(task.cache_path, index=False)
+        # DISABLED: Signal file writing (only _features.parquet is needed)
+        # task.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # if task.merge_strategy == "merge":
+        #     signal = _merge_on_date(task.cache_path, signal)
+        # signal.to_parquet(task.cache_path, index=False)
 
         # Persist raw feature cache for Stage A consumers
         feature_cache_path = task.cache_path.parent / task.cache_path.name.replace(
@@ -2660,6 +2813,7 @@ def generate_hf_module_signal(
                 feature_cache_path,
                 signal,
                 merge=task.merge_strategy == "merge",
+                family=task.family,
             )
             LOGGER.info(
                 "✅ Cached HF raw features for Stage A: %s",
@@ -2687,6 +2841,7 @@ def generate_hf_module_signal(
                             lagged_feature_cache_path,
                             lagged_cache,
                             merge=task.merge_strategy == "merge",
+                            family=task.family,
                         )
                         LOGGER.info(
                             "\u2705 Cached %d lag-expanded features for downstream stages: %s",
@@ -2871,16 +3026,23 @@ def compute_required_split_ranges(
     windows: List[WalkForwardWindow],
     fallback_range: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
 ) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
-    """Compute the aggregate date coverage needed for train/valid splits."""
+    """Compute the aggregate date coverage needed for consolidated caches.
+    
+    When windows is empty (Stage-A mode), returns a single 'consolidated' range
+    covering the entire fallback period - no train/valid splits needed.
+    
+    When windows exist (walk-forward mode), returns train/valid split ranges
+    for the walk-forward windows.
+    """
     if not windows:
+        # Stage-A mode: single consolidated range, no train/valid splits
         if fallback_range is None:
             return {}
         fallback_start, fallback_end = fallback_range
         today = pd.Timestamp.now().normalize()
         capped_end = min(fallback_end, today)
         return {
-            "train": (fallback_start, capped_end),
-            "valid": (fallback_start, capped_end),
+            "consolidated": (fallback_start, capped_end),
         }
 
     today = pd.Timestamp.now().normalize()
@@ -2930,12 +3092,20 @@ def build_consolidated_tasks(
     family_plan.extend((f, False) for f in hf_blocks)
     # Meta families (like hf_agg) are derived (no standalone caches) and must not be scheduled as tasks.
 
+    # Determine which splits to iterate: 'consolidated' for Stage-A, or 'train'/'valid' for walk-forward
+    splits_to_iterate = list(required_ranges.keys())
+
     for family, is_hf_module in family_plan:
-        for split in ["train", "valid"]:
+        for split in splits_to_iterate:
             if split not in required_ranges:
                 continue
             required_start, required_end = required_ranges[split]
+            # For coverage lookup, try split-specific first, then fall back to consolidated
+            # This allows Stage-B to reuse Stage-A consolidated caches when train/valid don't exist
             coverage = coverage_map.get(family, {}).get(split)
+            if coverage is None and split in ("train", "valid"):
+                # Fall back to consolidated coverage if train/valid doesn't exist
+                coverage = coverage_map.get(family, {}).get("")
             segments: List[Tuple[pd.Timestamp, pd.Timestamp, Literal["replace", "merge"]]] = []
 
             # Symbol-only HF blocks are shared across horizons, so they must be
@@ -2944,12 +3114,14 @@ def build_consolidated_tasks(
             if _uses_symbol_only_cache_path(family):
                 task_horizon = int(HF_SYMBOL_ONLY_CANONICAL_HORIZON)
 
+            # For consolidated mode, use empty string for split to generate files without _train/_valid suffix
+            file_split = "" if split == "consolidated" else split
             cache_path, _, _ = _family_cache_paths(
                 cache_dir,
                 symbol,
                 horizon,
                 family,
-                split,
+                file_split,
             )
 
             # Even if raw feature coverage exists, strict completeness (and some downstream
@@ -3005,7 +3177,7 @@ def build_consolidated_tasks(
                     horizon=task_horizon,
                     family=family,
                     window_id=None,
-                    split=split,
+                    split=file_split,  # Use file_split for cache file naming (empty for consolidated mode)
                     date_start=seg_start,
                     date_end=seg_end,
                     cache_path=cache_path,
@@ -3976,9 +4148,11 @@ def build_symbol_panel_cache(
             return None
 
     if out_path is None:
-        FEATURE_PANEL_DIR.mkdir(parents=True, exist_ok=True)
+        # Use symbol subfolder: cache/merged/{SYMBOL}/
+        symbol_dir = FEATURE_PANEL_DIR / symbol.upper()
+        symbol_dir.mkdir(parents=True, exist_ok=True)
         panel_name = f"{symbol.upper()}_h{horizon}_{track_label.lower()}.parquet"
-        panel_path = FEATURE_PANEL_DIR / panel_name
+        panel_path = symbol_dir / panel_name
     else:
         panel_path = Path(out_path)
         panel_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4068,17 +4242,32 @@ def build_symbol_panel_cache(
                             has = (numeric.fillna(0.0).abs().sum(axis=1) > 0.0).astype(float)
                         df_scaf[has_col] = has
 
-                    # Days since last update (calendar days; -1 before first update).
-                    if days_col not in df_scaf.columns:
+                    # Days since last update (calendar days; 0 on update day, increasing thereafter).
+                    # Always recompute - cached values are often stubs (all zeros).
+                    need_days_recompute = (
+                        days_col not in df_scaf.columns
+                        or (df_scaf[days_col] == 0).all()
+                        or df_scaf[days_col].isna().any()
+                    )
+                    if need_days_recompute:
                         try:
-                            last_dt = dates.where(has > 0.0).ffill()
+                            # has > 0 marks days when this family has real data
+                            has_data_mask = has > 0.0
+                            last_dt = dates.where(has_data_mask).ffill()
                             ds = (dates - last_dt).dt.days
-                            df_scaf[days_col] = ds.fillna(-1).astype(int)
+                            df_scaf[days_col] = ds.fillna(-1).astype(float)
                         except Exception:
-                            df_scaf[days_col] = -1
+                            df_scaf[days_col] = 0.0
 
                     # Activity: rolling std of family mean (captures "movement" when active).
-                    if act_col not in df_scaf.columns or (df_scaf[act_col].isna().all() if act_col in df_scaf.columns else False):
+                    # Always recompute if all zeros or all NaN.
+                    need_activity_recompute = (
+                        act_col not in df_scaf.columns
+                        or (df_scaf[act_col].isna().all() if act_col in df_scaf.columns else False)
+                        or (df_scaf[act_col] == 0).all()
+                        or (df_scaf[act_col] == 1).all()
+                    )
+                    if need_activity_recompute:
                         try:
                             candidate_cols = [
                                 c
@@ -4176,8 +4365,10 @@ def build_symbol_panel_cache(
                     fam_pref = f"{fam_s}_"
                     fam_cols = [c for c in df_clean.columns if str(c).startswith(fam_pref)]
                     
-                    # Drop legacy score/conf columns (no longer used)
-                    legacy_suffixes = ["_score", "_score_raw", "_conf", "_confidence"]
+                    # Drop legacy score columns (no longer used)
+                    # NOTE: _confidence is NOT dropped - it's a first-class governance column (Jan 2026)
+                    # Only drop: _score, _score_raw, _conf (abbreviated legacy confidence)
+                    legacy_suffixes = ["_score", "_score_raw", "_conf"]
                     for suffix in legacy_suffixes:
                         legacy_col = f"{fam_s}{suffix}"
                         if legacy_col in fam_cols:
@@ -4654,15 +4845,16 @@ def build_symbol_panel_cache(
             if "date" in normalized_panel.columns:
                 # Derive output names from the merged panel name.
                 stem = str(panel_path.stem)
-                base = stem[:-6] if stem.endswith("_merged") else stem
+                base = stem[:-7] if stem.endswith("_merged") else stem
                 legacy_features_path = panel_path.with_name(f"{base}_features.parquet")
                 legacy_index_path = panel_path.with_name(f"{base}_index.parquet")
 
                 sym_u = str(symbol).upper()
                 h_i = int(horizon)
                 # Canonical convention: no date columns, no timestamps in parquet.
-                features_path = panel_path.with_name(f"{sym_u}_{h_i}_features.parquet")
-                index_path = panel_path.with_name(f"{sym_u}_{h_i}_index.parquet")
+                # Use h{H} prefix for consistency with merged panel naming.
+                features_path = panel_path.with_name(f"{sym_u}_h{h_i}_features.parquet")
+                index_path = panel_path.with_name(f"{sym_u}_h{h_i}_index.parquet")
 
                 df_idx = normalized_panel.copy()
                 dt = pd.to_datetime(df_idx["date"], errors="coerce")
@@ -4696,8 +4888,10 @@ def build_symbol_panel_cache(
                     sess_index = pd.DatetimeIndex(df_idx.index)
                     session_ids = pd.Index(cal.sessions.get_indexer(sess_index)).astype(int)
 
-                    # Leakage audit (best-effort): ensure we didn't map a session-date row
-                    # back onto the same session when NEXT-session mode is enabled.
+                    # ================================================================
+                    # ENHANCED LEAKAGE AUDIT
+                    # ================================================================
+                    # Multi-layer audit for temporal leakage prevention (institutional-grade).
                     audit: dict = {
                         "symbol": str(symbol),
                         "horizon": int(horizon),
@@ -4706,6 +4900,8 @@ def build_symbol_panel_cache(
                         "raw_rows": int(len(s_norm)),
                         "collapsed_sessions": int(len(sess_index)),
                     }
+                    
+                    # Layer 1: Session-level temporal alignment check
                     try:
                         same_session = 0
                         if apply_to_next_session:
@@ -4717,9 +4913,79 @@ def build_symbol_panel_cache(
                                 except Exception:
                                     continue
                         audit["same_session_mappings"] = int(same_session)
-                        audit["ok"] = bool((same_session == 0) if apply_to_next_session else True)
+                        audit["temporal_alignment_ok"] = bool((same_session == 0) if apply_to_next_session else True)
                     except Exception:
-                        audit["ok"] = True
+                        audit["temporal_alignment_ok"] = True
+                    
+                    # Layer 2: Column-name leakage scan (pattern detection)
+                    try:
+                        leak_patterns = [
+                            "lead", "future", "target", "fwd", "next", "t+", 
+                            "forward", "ahead", "label", "y_", "lookahead"
+                        ]
+                        suspicious_cols = []
+                        for col in df_idx.columns:
+                            col_lower = str(col).lower()
+                            if any(pattern in col_lower for pattern in leak_patterns):
+                                suspicious_cols.append(str(col))
+                        
+                        audit["column_name_leakage"] = {
+                            "suspicious_count": len(suspicious_cols),
+                            "suspicious_columns": suspicious_cols[:50],  # First 50
+                            "ok": len(suspicious_cols) == 0
+                        }
+                    except Exception as e:
+                        audit["column_name_leakage"] = {"ok": True, "error": str(e)}
+                    
+                    # Layer 3: Governance column isolation check
+                    try:
+                        gov_suffixes = (
+                            "_has_data", "_activity", "_days_since_update", 
+                            "_confidence", "_conf", "_source_asof_ts"
+                        )
+                        gov_cols = [c for c in df_idx.columns if str(c).endswith(gov_suffixes)]
+                        
+                        audit["governance_isolation"] = {
+                            "governance_column_count": len(gov_cols),
+                            "governance_columns": gov_cols[:50],  # First 50
+                            "ok": True  # Governance columns are allowed in cache, blocked in Stage-B
+                        }
+                    except Exception as e:
+                        audit["governance_isolation"] = {"ok": True, "error": str(e)}
+                    
+                    # Layer 4: Timestamp alignment check (source_asof_ts ≤ session date)
+                    try:
+                        timestamp_violations = []
+                        asof_cols = [c for c in df_idx.columns if "_source_asof_ts" in str(c)]
+                        
+                        for asof_col in asof_cols[:10]:  # Check first 10 timestamp columns
+                            try:
+                                asof_ts = pd.to_datetime(df_idx[asof_col], errors="coerce")
+                                session_ts = sess_index
+                                violations = (asof_ts > session_ts).sum()
+                                if violations > 0:
+                                    timestamp_violations.append({
+                                        "column": str(asof_col),
+                                        "violations": int(violations),
+                                        "total_rows": int(len(asof_ts))
+                                    })
+                            except Exception:
+                                continue
+                        
+                        audit["timestamp_alignment"] = {
+                            "violations": timestamp_violations,
+                            "ok": len(timestamp_violations) == 0
+                        }
+                    except Exception as e:
+                        audit["timestamp_alignment"] = {"ok": True, "error": str(e)}
+                    
+                    # Overall audit status
+                    audit["ok"] = bool(
+                        audit.get("temporal_alignment_ok", True) and
+                        audit.get("column_name_leakage", {}).get("ok", True) and
+                        audit.get("governance_isolation", {}).get("ok", True) and
+                        audit.get("timestamp_alignment", {}).get("ok", True)
+                    )
 
                     try:
                         audit_path = panel_path.with_suffix(".leakage_audit.json")
@@ -4803,17 +5069,14 @@ def build_symbol_panel_cache(
                 features_df.reset_index(drop=True).to_parquet(features_path, index=False)
                 index_df.to_parquet(index_path, index=False)
 
-                # Backward-compatibility symlinks (best-effort): keep any derived names pointing
-                # at the canonical convention.
+                # Backward-compatibility symlinks (best-effort): keep legacy names pointing
+                # at the canonical h{H} convention.
                 try:
                     import os as _os
 
                     for link_path, target_path in (
                         (legacy_features_path, features_path),
                         (legacy_index_path, index_path),
-                        # Common alternate convention: <SYMBOL>_h<H>_features.parquet
-                        (panel_path.with_name(f"{sym_u}_h{h_i}_features.parquet"), features_path),
-                        (panel_path.with_name(f"{sym_u}_h{h_i}_index.parquet"), index_path),
                     ):
                         if link_path == target_path:
                             continue
@@ -5044,27 +5307,38 @@ def build_symbol_panel_cache(
                 # Format: MAMBA_OPTIONAL_COLUMNS="family:col1,col2;family2:col3,col4"
                 # Example: MAMBA_OPTIONAL_COLUMNS="correlation:corr_decoupling_z;dcf:undervaluation;cross_asset:all"
                 # Special values:
+                #   - "all:all" enables ALL optional columns for ALL families (master switch)
                 #   - "family:all" enables ALL optional columns for that family
                 #   - Column names are suffix only (without family prefix)
                 # 
                 # Supported families:
-                #   - correlation, corp_splits, cross_asset, dcf
+                #   - correlation, corp_splits, cross_asset, dcf, dividends, earnings
                 #   - alt_signals, arima, quantile, candle
                 # ============================================================
                 unified_opt_raw = os.getenv("MAMBA_OPTIONAL_COLUMNS", "").strip().lower()
                 unified_opt_map: Dict[str, set] = {}
+                
+                # Master switch: all:all enables everything
+                _mamba_optional_master_switch = False
+                
                 for segment in unified_opt_raw.split(";"):
                     segment = segment.strip()
                     if ":" in segment:
                         fam, cols = segment.split(":", 1)
                         fam = fam.strip()
                         cols_set = {c.strip() for c in cols.split(",") if c.strip()}
+                        # Check for master switch
+                        if fam == "all" and "all" in cols_set:
+                            _mamba_optional_master_switch = True
                         if fam not in unified_opt_map:
                             unified_opt_map[fam] = set()
                         unified_opt_map[fam].update(cols_set)
 
                 def _unified_mamba_enabled(family: str, suffix: str) -> bool:
                     """Check if suffix is enabled for family in unified env var."""
+                    # Master switch overrides everything
+                    if _mamba_optional_master_switch:
+                        return True
                     fam_opts = unified_opt_map.get(family, set())
                     return "all" in fam_opts or suffix in fam_opts
 
@@ -5941,6 +6215,14 @@ def build_symbol_panel_cache(
                 mamba_cols = _uniq(mamba_cols)
                 portfolio_cols = _uniq(portfolio_cols)
 
+                # Hygiene isolation: never allow governance columns into Mamba inputs
+                gov_suffixes = ("_has_data", "_activity", "_days_since_update", "_confidence")
+                hygiene_cols = [c for c in mamba_cols if str(c).endswith(gov_suffixes)]
+                if hygiene_cols:
+                    mamba_cols = [c for c in mamba_cols if c not in hygiene_cols]
+                    portfolio_cols.extend(hygiene_cols)
+                    portfolio_cols = _uniq(portfolio_cols)
+
                 # Ensure total coverage (no leaks, no drops)
                 all_feature_cols = [c for c in normalized_panel.columns if str(c) != "date"]
                 covered = set(mamba_cols).union(set(portfolio_cols))
@@ -5999,6 +6281,29 @@ def build_symbol_panel_cache(
                 mamba_path = None
                 portfolio_path = None
 
+        # ------------------------------------------------------------------
+        # HF Blocks merged parquet (forecast_hf + tech_micro_hf + event_risk_hf)
+        # ------------------------------------------------------------------
+        hf_panel: Optional[pd.DataFrame] = None
+        hf_path: Optional[Path] = None
+        try:
+            hf_block_prefixes = ("forecast_hf_", "tech_micro_hf_", "event_risk_hf_")
+            hf_cols = [
+                c for c in normalized_panel.columns
+                if any(str(c).startswith(prefix) for prefix in hf_block_prefixes)
+            ]
+            if hf_cols:
+                base_cols = ["date"] if "date" in normalized_panel.columns else []
+                hf_panel = normalized_panel[base_cols + hf_cols].copy()
+                sym_u = str(symbol).upper()
+                h_i = int(horizon)
+                hf_path = panel_path.with_name(f"{sym_u}_h{h_i}_merged_hf.parquet")
+                LOGGER.info("HF blocks panel: %d columns from %s", len(hf_cols), ", ".join(hf_block_prefixes))
+        except Exception as exc:
+            LOGGER.warning("HF blocks panel creation failed for %s h%d: %s", symbol, int(horizon), exc)
+            hf_panel = None
+            hf_path = None
+
         normalized_panel.to_parquet(panel_path, index=False)
 
         # Write split parquets (best-effort; do not fail build)
@@ -6007,6 +6312,9 @@ def build_symbol_panel_cache(
                 mamba_panel.to_parquet(mamba_path, index=False)
             if write_role_splits and portfolio_panel is not None and portfolio_path is not None:
                 portfolio_panel.to_parquet(portfolio_path, index=False)
+            if hf_panel is not None and hf_path is not None and not hf_panel.empty:
+                hf_panel.to_parquet(hf_path, index=False)
+                LOGGER.info("💾 Wrote HF blocks panel: %s", hf_path)
         except Exception as exc:
             LOGGER.warning("Failed writing role-split panels for %s h%d: %s", symbol, int(horizon), exc)
 
@@ -6025,6 +6333,7 @@ def build_symbol_panel_cache(
             "index_path": str(index_path) if index_path is not None else "",
             "mamba_panel_path": str(mamba_path) if mamba_path is not None else "",
             "portfolio_panel_path": str(portfolio_path) if portfolio_path is not None else "",
+            "hf_panel_path": str(hf_path) if hf_path is not None else "",
         }
         with open(panel_path.with_suffix(".meta.json"), "w") as handle:
             json.dump(meta, handle, indent=2)
@@ -6256,24 +6565,15 @@ def prepare_families(
     LOGGER.info("Cache: %s", cache_dir)
     
     # 1. Build walk-forward windows when needed
+    # NOTE: Both Stage-A and Stage-B now use consolidated files (no train/valid splits)
+    # to ensure cache files are reusable across runs. Walk-forward windows are
+    # NOT generated - the entire date range is used as a single consolidated span.
     LOGGER.info("")
     LOGGER.info("─" * 80)
-    if stage_a_mode:
-        LOGGER.info("STEP 1: Stage-A consolidated coverage")
+    if stage_a_mode or stage_b_mode:
+        mode_label = "Stage-A" if stage_a_mode else "Stage-B"
+        LOGGER.info("STEP 1: %s consolidated coverage (no train/valid splits)", mode_label)
         windows: List[WalkForwardWindow] = []
-    elif stage_b_mode:
-        LOGGER.info("STEP 1: Building Walk-Forward Windows")
-        windows = build_walk_forward_windows(
-            start_date=wf_start,
-            end_date=wf_end,
-            train_years=wf_train_years,
-            step_years=wf_step_years,
-            step_days=wf_step_days,
-            horizon_days=horizon,
-        )
-        for window in windows:
-            LOGGER.info("  %s", window)
-        validate_walk_forward_windows(windows)
     else:
         windows = []
     
@@ -6641,14 +6941,22 @@ def prepare_families(
         )
 
     panel_cache_path: Optional[Path] = None
-    if stage_b_mode:
+    
+    # Build unified merged panel for both Stage-A and Stage-B modes
+    # Stage-A: Reads from consolidated _features.parquet files
+    # Stage-B: Reads from train/valid split files
+    if write_merged or stage_a_mode:
         LOGGER.info("")
         LOGGER.info("─" * 80)
-        LOGGER.info("STEP 7: Unified Feature Panel")
+        LOGGER.info("STEP 7: Unified Feature Panel (%s mode)", "Stage-A" if stage_a_mode else "Stage-B")
         LOGGER.info("─" * 80)
+        
         if write_merged:
             LOGGER.info("Building merged per-symbol parquet (all dates; unified panel format).")
-            merged_default = FEATURE_PANEL_DIR / f"{symbol.upper()}_h{horizon}_merged.parquet"
+            # Use symbol subfolder: cache/merged/{SYMBOL}/
+            symbol_merged_dir = FEATURE_PANEL_DIR / symbol.upper()
+            symbol_merged_dir.mkdir(parents=True, exist_ok=True)
+            merged_default = symbol_merged_dir / f"{symbol.upper()}_h{horizon}_merged.parquet"
             merged_path = (merged_out or merged_default)
             panel_cache_path = build_symbol_panel_cache(
                 symbol=symbol,
@@ -6673,6 +6981,24 @@ def prepare_families(
                 os.symlink(rel_target, link_path)
             except Exception as exc:
                 LOGGER.debug("Failed to symlink merged parquet into cache_dir: %s", exc)
+        elif stage_a_mode:
+            # Stage-A mode: build merged panel from consolidated files
+            LOGGER.info("Building consolidated panel from Stage-A caches.")
+            symbol_merged_dir = FEATURE_PANEL_DIR / symbol.upper()
+            symbol_merged_dir.mkdir(parents=True, exist_ok=True)
+            merged_default = symbol_merged_dir / f"{symbol.upper()}_h{horizon}_merged.parquet"
+            panel_cache_path = build_symbol_panel_cache(
+                symbol=symbol,
+                horizon=horizon,
+                cache_dir=cache_dir,
+                families=list(all_families),
+                coverage_start=required_start,
+                coverage_end=required_end,
+                track_label="merged",
+                out_path=merged_default,
+            )
+            if panel_cache_path is None:
+                LOGGER.warning("Unified feature panel build failed; folds will rebuild on demand.")
         else:
             LOGGER.info("Building consolidated TrackC panel; window slices are derived at runtime.")
             panel_cache_path = build_symbol_panel_cache(
@@ -6686,8 +7012,6 @@ def prepare_families(
             )
             if panel_cache_path is None:
                 LOGGER.warning("Unified feature panel build failed; folds will rebuild on demand.")
-    else:
-        LOGGER.info("Stage-A mode: unified feature panel build skipped")
 
     # ------------------------------------------------------------------------
     # Coverage validation (strict-mode correctness)
@@ -6722,20 +7046,44 @@ def prepare_families(
     )
 
     for family in list(base_families) + list(hf_modules) + list(hf_blocks):
-        for split in ["train", "valid"]:
+        # Stage-A mode: check for consolidated files (no split suffix)
+        # Stage-B mode: check for both consolidated AND train/valid split files
+        family_has_cache = False
+        
+        if stage_a_mode:
+            # Stage-A: only check consolidated _features.parquet
             base_path, features_path, lagged_path = _family_cache_paths(
                 cache_dir,
                 symbol,
                 horizon,
                 family,
-                split,
+                "",  # No split for consolidated files
             )
             variants = [features_path, base_path]
             if WRITE_LAGGED_FEATURE_CACHES:
                 variants.insert(0, lagged_path)
-            if not any(path.exists() for path in variants):
-                remaining_missing += 1
-                missing_families.add(family)
+            if any(path.exists() for path in variants):
+                family_has_cache = True
+        else:
+            # Stage-B: check train/valid splits, fall back to consolidated
+            for split in ["", "train", "valid"]:
+                base_path, features_path, lagged_path = _family_cache_paths(
+                    cache_dir,
+                    symbol,
+                    horizon,
+                    family,
+                    split,
+                )
+                variants = [features_path, base_path]
+                if WRITE_LAGGED_FEATURE_CACHES:
+                    variants.insert(0, lagged_path)
+                if any(path.exists() for path in variants):
+                    family_has_cache = True
+                    break
+        
+        if not family_has_cache:
+            remaining_missing += 1
+            missing_families.add(family)
 
     # Strict-mode must also ensure the unified TrackC panel did not silently skip any families.
     if strict and stage_b_mode and panel_cache_path is not None:

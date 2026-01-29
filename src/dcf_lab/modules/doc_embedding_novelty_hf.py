@@ -44,7 +44,12 @@ except ImportError:
 
 LOGGER = logging.getLogger(__name__)
 
-_DATA_CACHE = Path(__file__).resolve().parents[3] / "data_cache"
+# Import centralized cache paths
+try:
+    from src.cache_paths import SHARED_CACHE_ROOT
+    _DATA_CACHE = SHARED_CACHE_ROOT
+except ImportError:
+    _DATA_CACHE = Path(__file__).resolve().parents[3] / "cache" / "shared"
 
 # Symbol profile keywords for relevance scoring
 SYMBOL_PROFILES = {

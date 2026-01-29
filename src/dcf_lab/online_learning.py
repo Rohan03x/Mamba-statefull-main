@@ -23,9 +23,11 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 # Statistical imports for drift detection
 try:
@@ -529,6 +531,11 @@ class OnlineLearningSystem:
         self.recent_samples: deque = deque(
             maxlen=backlog_windows * window_size
         )
+        
+        # Event logging setup
+        self.event_log_path = None  # Set by aggregator_panel during initialization
+        self.symbol = None  # Set by aggregator_panel
+        self.horizon = None  # Set by aggregator_panel
 
         # Initialize drift detectors
         self._initialize_drift_detectors()
@@ -576,8 +583,17 @@ class OnlineLearningSystem:
     def add_sample(self,
                    features: np.ndarray,
                    target: float,
-                   prediction: Optional[float] = None) -> Dict[str, Any]:
-        """Add new sample and trigger adaptations if needed"""
+                   prediction: Optional[float] = None,
+                   calibration_quality: Optional[float] = None) -> Dict[str, Any]:
+        """Add new sample and trigger adaptations if needed.
+        
+        Parameters
+        ----------
+        calibration_quality : float, optional
+            Calibration quality score in [0, 1]. When provided, learning decisions
+            are gated: updates only happen when calibration_quality >= threshold.
+            Default: None (no gating, always allow updates).
+        """
 
         adaptation_info = {
             'drift_detected': False,
@@ -585,16 +601,30 @@ class OnlineLearningSystem:
             'model_retrained': False,
             'performance_updated': False,
             'drift_results': [],
-            'partial_retrain': False
+            'partial_retrain': False,
+            'calibration_gated': False,
+            'calibration_quality': calibration_quality,
         }
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Calibration-Gated Learning: Gate updates when calibration is poor
+        # ─────────────────────────────────────────────────────────────────────
+        CALIB_GATE_THRESHOLD = 0.3  # Match Phase-2 calib_freeze_threshold
+        learning_allowed = True
+        if calibration_quality is not None:
+            learning_allowed = float(calibration_quality) >= CALIB_GATE_THRESHOLD
+            if not learning_allowed:
+                adaptation_info['calibration_gated'] = True
+                logger.debug(f"[CALIB-GATE] Online learning update skipped: "
+                           f"calibration_quality={calibration_quality:.3f} < {CALIB_GATE_THRESHOLD}")
 
         self._store_recent_sample(features, target)
 
-        # Update feature scaling
+        # Update feature scaling (always allowed, even when learning is gated)
         if self.config.enable_feature_adaptation:
             self.feature_scaler.partial_fit(features.reshape(1, -1))
 
-        # Check for concept drift
+        # Check for concept drift (detection always runs, adaptation is gated)
         if self.config.enable_drift_detection and prediction is not None:
             drift_results = self._check_drift(target, prediction)
             adaptation_info['drift_results'] = drift_results
@@ -604,33 +634,52 @@ class OnlineLearningSystem:
                 adaptation_info['drift_detected'] = True
                 logger.info(
                     f"Concept drift detected: {[r.detection_method for r in drift_results if r.drift_detected]}")
+                
+                # Log drift event to JSONL
+                self._log_event('drift_detected', {
+                    'methods': [r.detection_method for r in drift_results if r.drift_detected],
+                    'drift_results': [{'method': r.detection_method, 'detected': r.drift_detected} for r in drift_results]
+                })
 
-                # Trigger adaptation
-                if self._handle_drift_detection(drift_results):
+                # Trigger adaptation ONLY if learning is allowed (calibration gate)
+                if learning_allowed and self._handle_drift_detection(drift_results):
                     adaptation_info['partial_retrain'] = True
 
-        # Update performance metrics
+        # Update performance metrics (always allowed - observational, not learning)
         if prediction is not None:
             self._update_performance(target, prediction)
             adaptation_info['performance_updated'] = True
 
-        # Check if model update is needed
+        # Check if model update is needed (GATED by calibration)
         update_needed = self._should_update_model()
-        if update_needed and self.model is not None:
+        if learning_allowed and update_needed and self.model is not None:
             self._incremental_update(features, target)
             adaptation_info['model_updated'] = True
 
-        # Check if full retrain is needed
+        # Check if full retrain is needed (GATED by calibration)
         retrain_needed = self._should_retrain_model(
             adaptation_info['drift_detected'])
-        if retrain_needed:
+        if learning_allowed and retrain_needed:
             logger.info("Triggering model retraining")
             adaptation_info['model_retrained'] = True
+            
+            # Log retraining event to JSONL
+            self._log_event('model_retrain_triggered', {
+                'drift_detected': adaptation_info['drift_detected'],
+                'model_age': self.model_age,
+                'calibration_quality': calibration_quality,
+            })
             # Note: Actual retraining would be handled by external system
 
         # Update model age
         self.model_age += 1
         self.update_count += 1
+        
+        # Increment update counters when model is updated
+        if adaptation_info.get('model_updated'):
+            self._log_event('incremental_update', {})
+        if adaptation_info.get('partial_retrain'):
+            self._log_event('partial_retrain', {})
 
         # Store adaptation event
         if any(
@@ -1120,7 +1169,16 @@ class OnlineLearningSystem:
         
         recalibration_strength = abs(float(calibration_bias)) * quantile_sharpness
         features['recalibration_strength'] = float(recalibration_strength)
-        features['recalibration_needed'] = float(recalibration_strength > 0.5)
+        recalibration_needed = recalibration_strength > 0.5
+        features['recalibration_needed'] = float(recalibration_needed)
+        
+        # Log recalibration event to JSONL
+        if recalibration_needed:
+            self._log_event('recalibration_needed', {
+                'strength': float(recalibration_strength),
+                'calibration_bias': float(calibration_bias),
+                'quantile_sharpness': float(quantile_sharpness)
+            })
         
         # ===================================================================
         # ADDITIONAL ALPHA FEATURES
@@ -1298,7 +1356,49 @@ if __name__ == "__main__":
     summary = system.get_adaptation_summary()
     print("Final Summary:")
     print(f"  Total Samples: {summary['current_performance']['samples_count']}")
+    print(f"  Total Drifts: {summary['current_performance']['total_drifts_detected']}")
+    print(f"  MAE: {summary['current_performance']['mae']:.4f}")
     print(f"  Final MAE: {summary['current_performance']['mae']:.6f}")
     print(f"  Drifts Detected: {summary['current_performance']['total_drifts_detected']}")
     print(f"  Incremental Updates: {summary['current_performance']['incremental_updates']}")
     print(f"  Recent Adaptations: {summary['recent_adaptations']}")
+    
+    
+# Add _log_event method to OnlineLearningSystem class
+def _log_event_method(self, event_type: str, event_data: dict):
+    """Log an event to JSONL file for post-processing during panel merge.
+    
+    Args:
+        event_type: Type of event (drift_detected, model_retrain_triggered, recalibration_needed, etc.)
+        event_data: Additional event metadata
+    """
+    if self.event_log_path is None:
+        return  # Event logging not configured
+    
+    try:
+        event_log_path = Path(self.event_log_path)
+        event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Use current_timestamp if available (data timestamp), otherwise use datetime.now()
+        timestamp = getattr(self, 'current_timestamp', None)
+        if timestamp is not None:
+            timestamp_str = pd.Timestamp(timestamp).isoformat()
+        else:
+            timestamp_str = datetime.now().isoformat()
+        
+        event = {
+            'timestamp': timestamp_str,
+            'symbol': self.symbol,
+            'horizon': self.horizon,
+            'event_type': event_type,
+            'event_data': event_data
+        }
+        
+        with open(event_log_path, 'a') as f:
+            f.write(json.dumps(event) + '\n')
+    except Exception as e:
+        logger.warning(f"Failed to log event {event_type}: {e}")
+
+
+# Attach _log_event method to OnlineLearningSystem
+OnlineLearningSystem._log_event = _log_event_method

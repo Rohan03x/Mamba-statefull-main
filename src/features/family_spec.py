@@ -119,6 +119,144 @@ def canonical_metric_columns(family: str) -> Tuple[str, str, str]:
     return has_data, activity, days_since
 
 
+GOVERNANCE_SUFFIXES: Set[str] = {
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+    "conf",
+    "coverage_pct",
+    "missing_ratio",
+    "source_lag_days",
+    "is_valid",
+    "is_stale",
+}
+
+# Event core column lists (canonical) for update-point detection.
+EVENT_CORE_COLS: Dict[str, List[str]] = {
+    "corp_actions_splits": [
+        "corp_actions_splits_flag",
+        "corp_actions_splits_split_ratio",
+        "corp_actions_splits_split_ratio_log",
+        "corp_actions_splits_split_count_5y",
+        "corp_actions_splits_reverse_split_flag",
+    ],
+    "dividends": [
+        "dividends_dividend_amount",
+        "dividends_dividend_frequency",
+        "dividends_payout_ratio_proxy",
+        "dividends_dividend_change_1y",
+        "dividends_dividend_cut_flag",
+        "dividends_dividend_increase_flag",
+    ],
+    "earnings": [
+        "earnings_eps_surprise_pct",
+        "earnings_revenue_surprise_pct",
+        "earnings_eps_surprise_z_126",
+        "earnings_revenue_surprise_z_126",
+        "earnings_guidance_surprise_proxy",
+        "earnings_analyst_revision_breadth_30d",
+        "earnings_estimate_dispersion_score",
+        "earnings_calendar_confirmed",
+    ],
+    "insider_form4": [
+        "insider_form4_num_trades_1d",
+        "insider_form4_num_unique_insiders_1d",
+        "insider_form4_net_shares_1d",
+        "insider_form4_net_value_1d",
+        "insider_form4_buy_value_1d",
+        "insider_form4_sell_value_1d",
+        "insider_form4_exec_net_value_1d",
+        "insider_form4_cluster_buy_value_1d",
+    ],
+    "index_constituents": [
+        "index_constituents_member_gspc",
+        "index_constituents_added_gspc",
+        "index_constituents_removed_gspc",
+        "index_constituents_weight_gspc",
+        "index_constituents_member_dji",
+        "index_constituents_added_dji",
+        "index_constituents_removed_dji",
+        "index_constituents_weight_dji",
+        "index_constituents_num_indices",
+    ],
+    "doc_embedding_novelty_hf": [
+        "doc_embedding_novelty_hf_n_events",
+        "doc_embedding_novelty_hf_n_articles",
+        "doc_embedding_novelty_hf_top_theme",
+        "doc_embedding_novelty_hf_theme_weight",
+        "doc_embedding_novelty_hf_novelty_score_macro",
+        "doc_embedding_novelty_hf_novelty_score_micro",
+        "doc_embedding_novelty_hf_novelty_cluster_entropy",
+        "doc_embedding_novelty_hf_novelty_spike_flag",
+        "doc_embedding_novelty_hf_conf",
+    ],
+    "news_sentiment_hf": [
+        "news_sentiment_hf_score",
+        "news_sentiment_hf_conf",
+    ],
+}
+
+ECON_EVENT_CORE_INCLUDE_PREFIXES: Tuple[str, ...] = (
+    "econ_events_calendar_event_occurrence_",
+    "econ_events_calendar_pulse_occurrence_",
+    "econ_events_calendar_pulse_surprise_",
+    "econ_events_calendar_pulse_strength_",
+    "econ_events_calendar_surprise_",
+    "econ_events_calendar_surprise_has_forecast_",
+)
+
+ECON_EVENT_CORE_EXCLUDE_PREFIXES: Tuple[str, ...] = (
+    "econ_events_calendar_prox_next_",
+    "econ_events_calendar_recency_last_",
+    "econ_events_calendar_window_pre_",
+    "econ_events_calendar_window_post_",
+    "econ_events_calendar_macro_upcoming_",
+)
+
+ECON_EVENT_CORE_INCLUDE_EXACT: Tuple[str, ...] = (
+    "econ_events_calendar_macro_shock_major",
+    "econ_events_calendar_macro_surprise_signed",
+)
+
+
+def resolve_core_columns(family: str, columns: Sequence[str]) -> List[str]:
+    """Return core columns for a family, excluding governance/diagnostics.
+
+    For EVENT families, uses explicit lists/patterns. Otherwise defaults to
+    family-prefixed numeric columns excluding governance/diagnostic suffixes.
+    """
+    fam = str(family).strip().lower()
+    cols = [str(c) for c in columns]
+
+    def _is_governance(col: str) -> bool:
+        for suffix in GOVERNANCE_SUFFIXES:
+            if col.lower().endswith(f"_{suffix}"):
+                return True
+        return False
+
+    if fam == "econ_events_calendar":
+        included: List[str] = []
+        for c in cols:
+            cl = c.lower()
+            if cl in ECON_EVENT_CORE_INCLUDE_EXACT:
+                included.append(c)
+                continue
+            if any(cl.startswith(pfx) for pfx in ECON_EVENT_CORE_INCLUDE_PREFIXES):
+                if not any(cl.startswith(pfx) for pfx in ECON_EVENT_CORE_EXCLUDE_PREFIXES):
+                    included.append(c)
+        return included
+
+    if fam in EVENT_CORE_COLS:
+        wanted = set(EVENT_CORE_COLS[fam])
+        return [c for c in cols if c in wanted]
+
+    # Default: family-prefixed columns excluding governance/diagnostics.
+    prefix = f"{fam}_"
+    core = [c for c in cols if c.lower().startswith(prefix) and not _is_governance(c)]
+    return core
+
+
 LEGACY_BASE_FAMILY_ORDER: List[str] = [
     "quantile_forecast",
     "arima_forecast",
@@ -164,14 +302,40 @@ LEGACY_HF_MODULE_ORDER = [
     "macro_tst_hf",
 ]
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HF Block Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# HF blocks are intermediate inference steps that run AFTER Mamba and BEFORE
+# portfolio allocation.  They annotate/modulate the Mamba signal but cannot
+# flip direction.  Only blocks with proven edge should remain active.
+#
+# ACTIVE blocks (proven signal-to-noise):
+#   - tech_micro_hf   : Technical + microstructure (high-frequency, low noise)
+#   - forecast_hf     : Forecast ensemble (calibrated, horizon-bound)
+#
+# DISABLED blocks (noise/redundancy/sparsity):
+#   - vol_deriv_hf        : Duplicates portfolio risk module
+#   - macro_regime_hf     : Macro data is low-frequency, ≠ sequence learning
+#   - fundamental_val_hf  : Low frequency, sparse updates (quarterly)
+#   - news_nlp_hf         : Noise amplification, sentiment already in base families
+#
+# This restraint is what real hedge funds do: fewer signals, higher conviction.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 HF_BLOCK_ORDER = [
     "tech_micro_hf",
     "forecast_hf",
-    "vol_deriv_hf",
-    "macro_regime_hf",
-    "fundamental_val_hf",
-    "news_nlp_hf",
+    "event_risk_hf",  # Portfolio-only event risk management
 ]
+
+# Disabled HF blocks - kept for documentation and potential future reactivation.
+DISABLED_HF_BLOCKS: Set[str] = {
+    "vol_deriv_hf",        # Duplicates portfolio risk
+    "macro_regime_hf",     # Macro ≠ sequence learning
+    "fundamental_val_hf",  # Low frequency, sparse
+    "news_nlp_hf",         # Noise amplification
+}
 
 # Cache partitioning policy for HF blocks.
 #
@@ -181,7 +345,9 @@ HF_BLOCK_ORDER = [
 HORIZON_BOUND_HF_BLOCKS: Set[str] = {"forecast_hf"}
 SYMBOL_ONLY_HF_BLOCKS: Set[str] = set(HF_BLOCK_ORDER) - set(HORIZON_BOUND_HF_BLOCKS)
 
-META_FAMILIES = ["hf_agg"]
+# hf_agg is DISABLED - HF block outputs are consumed directly by Stage B/C
+# without an intermediate aggregation step.
+META_FAMILIES: List[str] = []  # was ["hf_agg"]
 
 
 def _ordered_subset(candidates: Iterable[str], preferred: Sequence[str]) -> List[str]:
@@ -261,25 +427,9 @@ _BASE_SPECS: List[Tuple[str, Dict[str, object]]] = [
             "summary_fn": "arima_summary",
         },
     ),
-    (
-        "calibration",
-        {
-            "stage": "B",
-            "tags": {"calibration"},
-            "dependencies": ["quantile_forecast"],
-            "reliability_cols": ["cal_ECE", "cal_ECE_max", "cal_quality"],
-        },
-    ),
-    (
-        "online_learning",
-        {
-            "stage": "B",
-            "tags": {"drift", "online"},
-            "dependencies": ["quantile_forecast", "calibration"],
-            "reliability_cols": ["alpha_weight"],
-            "drift_cols": ["drift_gap", "drift_eps", "drift_flag", "drift_severity"],
-        },
-    ),
+    # NOTE: calibration and online_learning are DISABLED - not part of current pipeline
+    # They were: calibration -> depends on quantile_forecast
+    #            online_learning -> depends on quantile_forecast, calibration
     ("cross_asset", {"stage": "A", "tags": {"macro"}}),
     ("exchange_calendar", {"stage": "A", "tags": {"calendar", "structure"}}),
     ("econ_events_calendar", {"stage": "A", "tags": {"macro", "event"}}),
@@ -290,6 +440,7 @@ _BASE_SPECS: List[Tuple[str, Dict[str, object]]] = [
     ("correlation", {"stage": "A", "tags": {"correlation"}}),
     ("candle_mechanics", {"stage": "A", "tags": {"price_action", "ohlcv"}}),
     ("microstructure", {"stage": "A", "tags": {"microstructure"}}),
+    ("event_time_bars", {"stage": "A", "tags": {"microstructure", "intraday"}}),
     ("options", {"stage": "A", "tags": {"derivatives"}}),
     ("short_interest", {"stage": "A", "tags": {"positioning"}}),
     ("insider_form4", {"stage": "A", "tags": {"fundamental", "insider", "event"}}),
@@ -326,13 +477,45 @@ HF_MODULE_SPECS: List[Tuple[str, Dict[str, object]]] = [
     ),
 ]
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HF Block Input Eligibility (Non-Negotiable)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# A base family may be consumed by an HF block ONLY if ALL THREE are true:
+#
+#   1. DENSE IN TIME      → Meaningful values on ≥80% of trading days
+#   2. STATIONARY         → Changes, spreads, ratios; NOT raw levels or counts
+#   3. SEQUENCE-NATIVE    → Information is in patterns across days, not impulses
+#
+# If any one fails → DO NOT FEED HF.
+# This rule separates hedge-fund ML from Kaggle ML.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 HF_BLOCK_SPECS: List[Tuple[str, Dict[str, object]]] = [
     (
         "tech_micro_hf",
         {
             "stage": "HF_BLOCK",
             "tags": {"hf", "microstructure"},
-            "dependencies": ["ml_framework", "microstructure", "correlation"],
+            # ─────────────────────────────────────────────────────────────────
+            # Eligibility constraints (enforced at generator level):
+            #   ml_framework     : Full (already normalized technicals)
+            #   microstructure   : Full (price mechanics are sequence-native)
+            #   correlation      : Full (rolling windows, stationary)
+            #   candle_mechanics : Normalized anatomy only, no raw returns
+            #   garch_iv         : Cap ~6 features (changes, ratios, residuals)
+            #   options          : Flows, skews, changes only (no OI/levels)
+            #   options_anchoring: Distance-to-strike, pinning strength only
+            # ─────────────────────────────────────────────────────────────────
+            "dependencies": [
+                "ml_framework",
+                "microstructure",
+                "correlation",
+                "candle_mechanics",
+                "garch_iv",
+                "options",
+                "options_anchoring",
+            ],
         },
     ),
     (
@@ -340,89 +523,141 @@ HF_BLOCK_SPECS: List[Tuple[str, Dict[str, object]]] = [
         {
             "stage": "HF_BLOCK",
             "tags": {"hf", "ensemble"},
+            # ─────────────────────────────────────────────────────────────────
+            # Eligibility constraints (enforced at generator level):
+            #   quantile_forecast : Full (probability distributions)
+            #   arima_forecast    : Full (forecast residuals, changes)
+            #   tft_features      : Full (temporal patterns, normalized)
+            #   regime            : Full (regime states are sequence-native)
+            #   cboe_term         : Slope & curvature changes only (no levels)
+            #   short_interest    : Smoothed deltas, z-scores only (no raw SI%)
+            # NOTE: calibration and online_learning removed from pipeline
+            # ─────────────────────────────────────────────────────────────────
             "dependencies": [
                 "quantile_forecast",
-                "calibration",
-                "online_learning",
                 "arima_forecast",
                 "tft_features",
-            ],
-        },
-    ),
-    (
-        "vol_deriv_hf",
-        {
-            "stage": "HF_BLOCK",
-            "tags": {"hf", "vol"},
-            "dependencies": [
-                "garch_iv",
-                "cboe_term",
-                "options_anchoring",
-                "options",
-                "short_interest",
-            ],
-        },
-    ),
-    (
-        "macro_regime_hf",
-        {
-            "stage": "HF_BLOCK",
-            "tags": {"hf", "macro"},
-            "dependencies": [
-                "macro_tst_hf",
                 "regime",
-                "multiasset",
-                "cross_asset",
-                "correlation",
-            ],
-        },
-    ),
-    (
-        "fundamental_val_hf",
-        {
-            "stage": "HF_BLOCK",
-            "tags": {"hf", "fundamental"},
-            "dependencies": [
-                "fin_g1",
-                "fin_g2",
-                "fin_g3",
-                "fin_g4",
-                "fin_g5",
-                "fin_g6",
-                "fin_g7",
-                "earnings",
-                "dividends",
-                "dcf",
-                "subsidiary",
+                "cboe_term",
                 "short_interest",
             ],
         },
     ),
     (
-        "news_nlp_hf",
+        "twitter_twikit_hf",
+        {
+            "stage": "DISABLED",
+            "tags": {"hf", "sentiment", "social"},
+            # ─────────────────────────────────────────────────────────────────
+            # DISABLED: Reddit sentiment analysis (via YARS - no auth required)
+            # Reason: Requires ~1,560 API calls for 15-year range (30+ minutes)
+            #         Weekly batching needed for historical coverage
+            # Three-channel architecture:
+            #   - Channel A: Symbol cashtag search (e.g., "AAPL")
+            #   - Channel B: Company name search (e.g., "Apple Inc stock")
+            #   - Channel C: Curated accounts (future)
+            #
+            # Features (24 total):
+            #   - Governance: has_data, activity, sample_n, coverage
+            #   - Attention: tweet_count, engagement metrics
+            #   - Sentiment: FinBERT scores, neg/pos/neu fractions
+            #   - Novelty: sentence-transformers, topic extraction
+            #   - Portfolio: event_risk, panic, sent_regime
+            #
+            # Data source: Reddit (r/wallstreetbets, r/stocks, r/investing)
+            # ML models: FinBERT + sentence-transformers
+            # No dependencies - direct data source
+            # ─────────────────────────────────────────────────────────────────
+            "dependencies": [],
+        },
+    ),
+    (
+        "event_risk_hf",
         {
             "stage": "HF_BLOCK",
-            "tags": {"hf", "nlp"},
+            "tags": {"hf", "risk", "event", "portfolio_only"},
+            # ─────────────────────────────────────────────────────────────────
+            # Event Risk Management for Portfolio Parquet (NOT Mamba)
+            #
+            # This block provides explicit, controllable event risk features:
+            #   - event_risk_hf_earnings_next_1d (0/1)
+            #   - event_risk_hf_earnings_next_3d (0/1)
+            #   - event_risk_hf_macro_next_1d (0/1)
+            #   - event_risk_hf_score (0..1)
+            #   - event_risk_hf_earnings_imminent (continuous 0..1)
+            #   - event_risk_hf_macro_imminent (continuous 0..1)
+            #
+            # Routing: ALL columns → RISK role → Portfolio parquet ONLY
+            # Data sources: earnings family (EODHD), econ_events_calendar
+            # ─────────────────────────────────────────────────────────────────
             "dependencies": [
-                "finbert",
-                "doc_embedding_novelty_hf",
-                "earnings_transcript_hf",
-                "news_sentiment_hf",
-                "alternative_signals",
+                "earnings",
+                "econ_events_calendar",
             ],
         },
     ),
+    # ─────────────────────────────────────────────────────────────────────────
+    # DISABLED HF BLOCKS (kept for reference, not loaded into FAMILY_SPECS)
+    # ─────────────────────────────────────────────────────────────────────────
+    # These blocks are disabled due to noise/redundancy/sparsity concerns.
+    # See DISABLED_HF_BLOCKS constant for rationale.
+    #
+    # (
+    #     "vol_deriv_hf",
+    #     {
+    #         "stage": "HF_BLOCK",
+    #         "tags": {"hf", "vol"},
+    #         "dependencies": [
+    #             "garch_iv", "cboe_term", "options_anchoring", "options", "short_interest",
+    #         ],
+    #     },
+    # ),
+    # (
+    #     "macro_regime_hf",
+    #     {
+    #         "stage": "HF_BLOCK",
+    #         "tags": {"hf", "macro"},
+    #         "dependencies": [
+    #             "macro_tst_hf", "regime", "multiasset", "cross_asset", "correlation",
+    #         ],
+    #     },
+    # ),
+    # (
+    #     "fundamental_val_hf",
+    #     {
+    #         "stage": "HF_BLOCK",
+    #         "tags": {"hf", "fundamental"},
+    #         "dependencies": [
+    #             "fin_g1", "fin_g2", "fin_g3", "fin_g4", "fin_g5", "fin_g6", "fin_g7",
+    #             "earnings", "dividends", "dcf", "subsidiary", "short_interest",
+    #         ],
+    #     },
+    # ),
+    # (
+    #     "news_nlp_hf",
+    #     {
+    #         "stage": "HF_BLOCK",
+    #         "tags": {"hf", "nlp"},
+    #         "dependencies": [
+    #             "finbert", "doc_embedding_novelty_hf", "earnings_transcript_hf",
+    #             "news_sentiment_hf", "alternative_signals",
+    #         ],
+    #     },
+    # ),
+    # ─────────────────────────────────────────────────────────────────────────
 ]
 
+# hf_agg DISABLED - see META_FAMILIES comment above.
+# HF block signals are consumed directly by build_panel without aggregation.
 META_SPEC: List[Tuple[str, Dict[str, object]]] = [
-    (
-        "hf_agg",
-        {
-            "stage": "META",
-            "tags": {"hf", "meta"},
-            "dependencies": HF_BLOCK_ORDER,
-        },
-    )
+    # (
+    #     "hf_agg",
+    #     {
+    #         "stage": "META",
+    #         "tags": {"hf", "meta"},
+    #         "dependencies": HF_BLOCK_ORDER,
+    #     },
+    # )
 ]
 
 FAMILY_SPECS: Dict[str, FamilySpec] = {}
@@ -454,6 +689,10 @@ for optional_name in ("commodities", "crypto", "fx"):
 __all__ = [
     "FamilySpec",
     "FAMILY_SPECS",
+    "DISABLED_HF_BLOCKS",
+    "HF_BLOCK_ORDER",
+    "HORIZON_BOUND_HF_BLOCKS",
+    "SYMBOL_ONLY_HF_BLOCKS",
     "canonical_metric_columns",
     "compute_family_summary",
     "default_base_families",

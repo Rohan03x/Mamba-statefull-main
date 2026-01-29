@@ -1790,6 +1790,23 @@ class OptunaConfig:
     tune_weights_only: bool = False
     fixed_params: Dict[str, Any] = field(default_factory=dict)
     
+    # =========================================================================
+    # 🔵 UNIFIED STAGED TUNING (ONE KNOB - Section 10)
+    # =========================================================================
+    # Single knob controls ALL modules together: Graph, SGC, Cross-Section,
+    # Mamba backbone, AND Multi-Horizon. See Phase2_Optuna_Search_Space.md.
+    #
+    # Stage 0: Ablation (prove modules help - on/off grid)
+    # Stage 1: Stability (lr, dropout, regularization, sigma bounds)
+    # Stage 2: Architecture/Capacity (d_model, n_layers, heads)
+    # Stage 3: Thresholds + Coupling (regime multipliers, MH coupling)
+    # Stage 4: Fine-tune (weights only, advanced features)
+    phase2_tuning_stage: int = 1  # 0, 1, 2, 3, or 4
+    
+    # Per-stage fixed params (loaded from previous stage's best)
+    # Keys are param names, values are the frozen values
+    phase2_fixed_params: Dict[str, Any] = field(default_factory=dict)
+    
     # 3-pillar bounds (final k_final is clamped to these)
     three_pillar_dim_min: int = 4   # Minimum dim (avoid underspecification)
     three_pillar_dim_max: int = 32  # Maximum dim (allows hitting ~95% variance on larger families)
@@ -1973,6 +1990,170 @@ class OptunaConfig:
     # study on dynamic search-space errors; instead fail fast so the user can
     # intentionally manage study names.
     disable_study_auto_reset: bool = False
+
+    # =========================================================================
+    # 🔵 MULTI-HORIZON (MH) TRAINING PARAMETERS (Workstream 6)
+    # =========================================================================
+    # Multi-Horizon architecture enables training a single backbone to predict
+    # across all horizons (5,21,63,126,252 days) using FiLM conditioning.
+    # See Section 16 of Phase2_Optuna_Search_Space.md for full documentation.
+    #
+    # 4-STAGE TUNING STRATEGY:
+    #   Stage 1: Stability + Calibration (8 params)
+    #   Stage 2: Multi-Horizon Coupling (7 params)
+    #   Stage 3: Backbone Capacity (6 params)
+    #   Stage 4: Cross-Section Extension (6 params)
+    
+    # Master switch for Multi-Horizon mode
+    mh_enabled: bool = False
+    
+    # Tuning stage (1-4): controls which params are frozen vs tuned
+    mh_tuning_stage: int = 1
+    
+    # Fixed (non-tuned) parameters
+    mh_horizons: Tuple[int, ...] = (5, 21, 63, 126, 252)  # Fixed horizon set
+    mh_continuous_dim: int = 16  # Sinusoidal embedding dimension (fixed)
+    
+    # -------------------------------------------------------------------------
+    # STAGE 1: STABILITY + CALIBRATION (8 tuned params)
+    # -------------------------------------------------------------------------
+    mh_lr_min: float = 1e-5
+    mh_lr_max: float = 1e-3
+    mh_weight_decay_min: float = 1e-6
+    mh_weight_decay_max: float = 1e-3
+    mh_dropout_min: float = 0.0
+    mh_dropout_max: float = 0.3
+    mh_batch_size_choices: Tuple[int, ...] = (16, 24, 32)
+    mh_grad_clip_min: float = 0.5
+    mh_grad_clip_max: float = 2.0
+    mh_sigma_floor_min: float = 0.005
+    mh_sigma_floor_max: float = 0.05
+    mh_sigma_ceiling_min: float = 1.0
+    mh_sigma_ceiling_max: float = 3.0
+    mh_balance_mode_choices_s1: Tuple[str, ...] = ("sqrt", "log")  # Stage 1 subset
+    
+    # -------------------------------------------------------------------------
+    # STAGE 2: MULTI-HORIZON COUPLING (7 tuned params)
+    # -------------------------------------------------------------------------
+    mh_d_horizon_choices: Tuple[int, ...] = (16, 32, 48, 64)
+    mh_film_hidden_mult_choices: Tuple[int, ...] = (1, 2, 3)
+    mh_sigma_mono_penalty_min: float = 1e-4
+    mh_sigma_mono_penalty_max: float = 1e-1
+    mh_sigma_monotonic: bool = True  # Default: enforce monotonic uncertainty
+    mh_balance_mode_choices_s2: Tuple[str, ...] = ("sqrt", "log", "equal")  # Stage 2 expanded
+    mh_head_hidden_dim_choices: Tuple[int, ...] = (32, 64, 96, 128)
+    mh_head_num_layers_choices: Tuple[int, ...] = (1, 2, 3)
+    
+    # -------------------------------------------------------------------------
+    # STAGE 3: BACKBONE CAPACITY (6 tuned params)
+    # -------------------------------------------------------------------------
+    mh_d_model_choices: Tuple[int, ...] = (64, 96, 128, 192, 256)
+    mh_n_layers_choices: Tuple[int, ...] = (2, 3, 4, 5, 6)
+    mh_expand_factor_min: float = 1.5
+    mh_expand_factor_max: float = 3.0
+    mh_conv_kernel_choices: Tuple[int, ...] = (3, 5, 7)
+    mh_max_epochs_choices: Tuple[int, ...] = (5, 10, 15, 20)
+    
+    # -------------------------------------------------------------------------
+    # STAGE 4: CROSS-SECTION EXTENSION (6 tuned params)
+    # -------------------------------------------------------------------------
+    mh_cs_n_temporal_layers_choices: Tuple[int, ...] = (2, 4, 6)
+    mh_cs_n_cross_section_layers_choices: Tuple[int, ...] = (1, 2, 3, 4)
+    mh_cs_cross_section_heads_choices: Tuple[int, ...] = (2, 4, 8)
+    mh_cs_cross_section_dropout_min: float = 0.0
+    mh_cs_cross_section_dropout_max: float = 0.2
+    mh_cs_adjacency_residual_min: float = 0.0
+    mh_cs_adjacency_residual_max: float = 0.3
+    mh_cs_use_learned_adjacency: bool = True  # Default: use learned adjacency
+    
+    # -------------------------------------------------------------------------
+    # BUSINESS WEIGHTS (frozen across all stages, set externally)
+    # -------------------------------------------------------------------------
+    # These weights prioritize business-relevant horizons for loss aggregation.
+    # Default: equal weights; user can override per use case.
+    mh_horizon_weights_default: Tuple[float, ...] = (0.2, 0.2, 0.2, 0.2, 0.2)
+    
+    # Fixed params for MH (loaded from previous stage best values)
+    mh_fixed_params: Dict[str, Any] = field(default_factory=dict)
+    
+    # =========================================================================
+    # 🔵 WORKSTREAM 7: ROBUST PORTFOLIO OPTIMIZER PARAMETERS
+    # =========================================================================
+    # Upgrades from simple signal thresholding to distribution-aware, tail-aware
+    # robust portfolio optimization. See Phase2_Optuna_Search_Space.md Section 17.
+    #
+    # STAGED TUNING (aligned with phase2_tuning_stage):
+    #   Stage 0: Ablation (all frozen, optimizer disabled)
+    #   Stage 1: Stability - core knobs (lambda_var, sigma_blend, caps)
+    #   Stage 2: Capacity - structural (cov_method, CVaR on/off, n_factors)
+    #   Stage 3: Fine-tuning - narrow ranges around Stage 1/2 winners
+    #   Stage 4: Weights-only (all frozen)
+    #
+    # Key Features:
+    # 1. Replace sigma proxy with predicted sigma from multi-horizon model
+    # 2. Factor covariance model with graph shrinkage
+    # 3. Mean-variance with CVaR constraint
+    # 4. Turnover penalty in objective
+    # 5. Uncertainty-aware position caps
+    
+    # Master switch (frozen True in Stage 1+, False in Stage 0)
+    robust_optimizer_enabled: bool = False
+    
+    # -------------------------------------------------------------------------
+    # STAGE 1: Core Risk Knobs (tuned in Stage 1)
+    # -------------------------------------------------------------------------
+    # Risk aversion (variance penalty weight) - LOG-UNIFORM [0.1, 10.0]
+    robust_lambda_var_min: float = 0.1
+    robust_lambda_var_max: float = 10.0
+    
+    # Turnover penalty weight - LOG-UNIFORM [1e-4, 1.0]
+    robust_lambda_turnover_min: float = 1e-4
+    robust_lambda_turnover_max: float = 1.0
+    
+    # Tail risk penalty weight (optional, lower priority)
+    robust_lambda_tail_min: float = 0.0
+    robust_lambda_tail_max: float = 0.05
+    
+    # Predicted sigma blend (0 = pure historical, 1 = pure predicted) - UNIFORM [0.3, 0.9]
+    robust_predicted_sigma_blend_min: float = 0.3
+    robust_predicted_sigma_blend_max: float = 0.9
+    
+    # Mu/sigma cap - UNIFORM [1.5, 6.0]
+    robust_mu_sigma_cap_min: float = 1.5
+    robust_mu_sigma_cap_max: float = 6.0
+    
+    # Reliability minimum - UNIFORM [0.1, 0.6]
+    robust_reliability_min_min: float = 0.1
+    robust_reliability_min_max: float = 0.6
+    
+    # -------------------------------------------------------------------------
+    # STAGE 2: Structural Choices (tuned in Stage 2)
+    # -------------------------------------------------------------------------
+    # Covariance method - CATEGORICAL
+    robust_cov_method_choices: Tuple[str, ...] = ("ewma_shrink", "factor", "graph_shrink")
+    
+    # CVaR constraint on/off - CATEGORICAL
+    robust_cvar_constraint_choices: Tuple[bool, ...] = (False, True)
+    
+    # CVaR alpha (tail probability) - only tuned if cvar_constraint=True
+    robust_cvar_alpha_min: float = 0.01
+    robust_cvar_alpha_max: float = 0.10
+    
+    # CVaR limit (max acceptable CVaR loss) - only tuned if cvar_constraint=True
+    robust_cvar_limit_min: float = -0.10  # 10% max CVaR loss
+    robust_cvar_limit_max: float = -0.02  # 2% max CVaR loss
+    
+    # Factor covariance n_factors (when cov_method = "factor")
+    robust_n_factors_choices: Tuple[int, ...] = (3, 5, 8, 10)
+    
+    # -------------------------------------------------------------------------
+    # STAGE 3: Fine-Tuning (narrow ranges around Stage 1/2 winners)
+    # -------------------------------------------------------------------------
+    # Uncertainty caps on/off (usually stays True)
+    robust_uncertainty_caps_choices: Tuple[bool, ...] = (True, False)
+    
+    # Fine-tune range: ±0.1 around best (computed dynamically in suggest method)
+    robust_fine_tune_range: float = 0.1
 
 
 @dataclass
@@ -5232,6 +5413,13 @@ class StageBOptunaOptimizer:
         Mamba is an alternative to LSTM/Transformers with O(n) complexity.
         Particularly effective for long-range dependencies and regime shifts in financial data.
         
+        Uses unified phase2_tuning_stage (0-4) for staged tuning:
+            Stage 0: Ablation (freeze all, vary model_type only)
+            Stage 1: Stability (lr, dropout, weight_decay, grad_clip, batch_size)
+            Stage 2: Capacity (d_model, n_layers, ssm_dim, expand_factor)
+            Stage 3: Schedule + Head (epochs, scheduler, head config)
+            Stage 4: Weights only (all frozen)
+        
         Includes:
             - A. Core Architecture (d_model, n_layers, ssm_dim, expand_factor, seq_len, activation)
             - B. Normalization & Dropout (norm_type, norm_strategy, dropout variants)
@@ -5241,18 +5429,37 @@ class StageBOptunaOptimizer:
             - F. Thresholds (handled separately via _suggest_threshold_params)
         """
         params = {}
+        stage = getattr(self.config, "phase2_tuning_stage", 1)
+        fixed = dict(getattr(self.config, "phase2_fixed_params", {}) or {})
+        
+        # Helper: fix param to frozen value or default
+        def _fix(name: str, default: Any) -> Any:
+            return trial.suggest_categorical(name, [fixed.get(name, default)])
+        
+        # Helper: suggest or fix based on stage
+        def _suggest_or_fix_cat(name: str, choices: list, default: Any, tune_stages: tuple) -> Any:
+            if stage in tune_stages:
+                return trial.suggest_categorical(name, choices)
+            return _fix(name, default)
+        
+        def _suggest_or_fix_float(name: str, low: float, high: float, default: float, 
+                                   tune_stages: tuple, log: bool = False) -> float:
+            if stage in tune_stages:
+                return trial.suggest_float(name, low, high, log=log)
+            return _fix(name, default)
+        
+        def _suggest_or_fix_int(name: str, low: int, high: int, default: int, 
+                                tune_stages: tuple) -> int:
+            if stage in tune_stages:
+                return trial.suggest_int(name, low, high)
+            return _fix(name, default)
 
-        # WEIGHTS-ONLY MODE: freeze all Mamba params
-        if bool(getattr(self.config, "tune_weights_only", False)):
-            fixed = dict(getattr(self.config, "fixed_params", {}) or {})
-            def _fix(name: str, default: Any) -> Any:
-                return trial.suggest_categorical(name, [fixed.get(name, default)])
-
+        # WEIGHTS-ONLY MODE or Stage 4: freeze all Mamba params
+        if bool(getattr(self.config, "tune_weights_only", False)) or stage == 4:
             params["mamba_d_model"] = _fix("mamba_d_model", self.config.mamba_d_model_choices[0])
             params["mamba_n_layers"] = _fix("mamba_n_layers", self.config.mamba_n_layers_choices[0])
             params["mamba_ssm_dim"] = _fix("mamba_ssm_dim", self.config.mamba_ssm_dim_choices[0])
             params["mamba_expand_factor"] = _fix("mamba_expand_factor", self.config.mamba_expand_factor_choices[0])
-            # If user provides a seq_len that isn't in the effective choice set, coerce to nearest allowed.
             try:
                 allowed = list(self._get_effective_mamba_seq_len_choices())
             except Exception:
@@ -5284,113 +5491,183 @@ class StageBOptunaOptimizer:
             return params
         
         # =====================================================================
-        # A. CORE MAMBA ARCHITECTURE
+        # A. CORE MAMBA ARCHITECTURE - Stage 2 (Capacity)
         # =====================================================================
-        params["mamba_d_model"] = trial.suggest_categorical(
-            "mamba_d_model", list(self.config.mamba_d_model_choices),
+        params["mamba_d_model"] = _suggest_or_fix_cat(
+            "mamba_d_model", 
+            list(self.config.mamba_d_model_choices),
+            self.config.mamba_d_model_choices[0],
+            tune_stages=(2,),
         )
-        params["mamba_n_layers"] = trial.suggest_categorical(
-            "mamba_n_layers", list(self.config.mamba_n_layers_choices),
+        params["mamba_n_layers"] = _suggest_or_fix_cat(
+            "mamba_n_layers",
+            list(self.config.mamba_n_layers_choices),
+            self.config.mamba_n_layers_choices[0],
+            tune_stages=(2,),
         )
-        params["mamba_ssm_dim"] = trial.suggest_categorical(
-            "mamba_ssm_dim", list(self.config.mamba_ssm_dim_choices),
+        params["mamba_ssm_dim"] = _suggest_or_fix_cat(
+            "mamba_ssm_dim",
+            list(self.config.mamba_ssm_dim_choices),
+            self.config.mamba_ssm_dim_choices[0],
+            tune_stages=(2,),
         )
-        params["mamba_expand_factor"] = trial.suggest_categorical(
-            "mamba_expand_factor", list(self.config.mamba_expand_factor_choices),
+        params["mamba_expand_factor"] = _suggest_or_fix_cat(
+            "mamba_expand_factor",
+            list(self.config.mamba_expand_factor_choices),
+            self.config.mamba_expand_factor_choices[0],
+            tune_stages=(2,),
         )
-        params["mamba_seq_len"] = trial.suggest_categorical(
-            "mamba_seq_len", self._get_effective_mamba_seq_len_choices(),
+        params["mamba_seq_len"] = _suggest_or_fix_cat(
+            "mamba_seq_len",
+            list(self._get_effective_mamba_seq_len_choices()),
+            self._get_effective_mamba_seq_len_choices()[0],
+            tune_stages=(2,),
         )
-        params["mamba_activation"] = trial.suggest_categorical(
-            "mamba_activation", list(self.config.mamba_activation_choices),
+        params["mamba_activation"] = _suggest_or_fix_cat(
+            "mamba_activation",
+            list(self.config.mamba_activation_choices),
+            self.config.mamba_activation_choices[0],
+            tune_stages=(2,),
         )
         
         # =====================================================================
-        # B. NORMALIZATION & DROPOUT
+        # B. NORMALIZATION & DROPOUT - Stage 1 (Stability)
         # =====================================================================
-        params["mamba_norm_type"] = trial.suggest_categorical(
-            "mamba_norm_type", list(self.config.mamba_norm_type_choices),
+        params["mamba_norm_type"] = _suggest_or_fix_cat(
+            "mamba_norm_type",
+            list(self.config.mamba_norm_type_choices),
+            self.config.mamba_norm_type_choices[0],
+            tune_stages=(1,),
         )
-        params["mamba_norm_strategy"] = trial.suggest_categorical(
-            "mamba_norm_strategy", list(self.config.mamba_norm_strategy_choices),
+        params["mamba_norm_strategy"] = _suggest_or_fix_cat(
+            "mamba_norm_strategy",
+            list(self.config.mamba_norm_strategy_choices),
+            self.config.mamba_norm_strategy_choices[0],
+            tune_stages=(1,),
         )
-        params["mamba_dropout"] = trial.suggest_float(
+        params["mamba_dropout"] = _suggest_or_fix_float(
             "mamba_dropout",
             self.config.mamba_dropout_min,
             self.config.mamba_dropout_max,
+            default=0.1,
+            tune_stages=(1,),
         )
-        params["mamba_resid_dropout"] = trial.suggest_categorical(
-            "mamba_resid_dropout", list(self.config.mamba_resid_dropout_choices),
+        params["mamba_resid_dropout"] = _suggest_or_fix_cat(
+            "mamba_resid_dropout",
+            list(self.config.mamba_resid_dropout_choices),
+            self.config.mamba_resid_dropout_choices[0],
+            tune_stages=(1,),
         )
-        params["mamba_ssm_dropout"] = trial.suggest_categorical(
-            "mamba_ssm_dropout", list(self.config.mamba_ssm_dropout_choices),
+        params["mamba_ssm_dropout"] = _suggest_or_fix_cat(
+            "mamba_ssm_dropout",
+            list(self.config.mamba_ssm_dropout_choices),
+            self.config.mamba_ssm_dropout_choices[0],
+            tune_stages=(1,),
         )
-        params["mamba_gate_dropout"] = trial.suggest_categorical(
-            "mamba_gate_dropout", list(self.config.mamba_gate_dropout_choices),
+        params["mamba_gate_dropout"] = _suggest_or_fix_cat(
+            "mamba_gate_dropout",
+            list(self.config.mamba_gate_dropout_choices),
+            self.config.mamba_gate_dropout_choices[0],
+            tune_stages=(1,),
         )
         
         # =====================================================================
-        # C. TRAINING DYNAMICS
+        # C. TRAINING DYNAMICS - Stage 1 (Stability)
         # =====================================================================
-        params["mamba_optimizer"] = trial.suggest_categorical(
-            "mamba_optimizer", list(self.config.mamba_optimizer_choices),
+        params["mamba_optimizer"] = _suggest_or_fix_cat(
+            "mamba_optimizer",
+            list(self.config.mamba_optimizer_choices),
+            self.config.mamba_optimizer_choices[0],
+            tune_stages=(1,),
         )
-        params["mamba_learning_rate"] = trial.suggest_float(
+        params["mamba_learning_rate"] = _suggest_or_fix_float(
             "mamba_learning_rate",
             self.config.mamba_lr_min,
             self.config.mamba_lr_max,
+            default=1e-3,
+            tune_stages=(1,),
             log=True,
         )
-        params["mamba_weight_decay"] = trial.suggest_float(
+        params["mamba_weight_decay"] = _suggest_or_fix_float(
             "mamba_weight_decay",
             self.config.mamba_weight_decay_min,
             self.config.mamba_weight_decay_max,
+            default=1e-5,
+            tune_stages=(1,),
             log=True,
         )
-        params["mamba_grad_clip"] = trial.suggest_categorical(
-            "mamba_grad_clip", list(self.config.mamba_grad_clip_choices),
+        params["mamba_grad_clip"] = _suggest_or_fix_cat(
+            "mamba_grad_clip",
+            list(self.config.mamba_grad_clip_choices),
+            self.config.mamba_grad_clip_choices[0],
+            tune_stages=(1,),
         )
         
         # =====================================================================
-        # D. TRAINING SCHEDULE
+        # D. TRAINING SCHEDULE - Stage 1 (batch_size) + Stage 3 (epochs, scheduler)
         # =====================================================================
-        params["mamba_lr_scheduler"] = trial.suggest_categorical(
-            "mamba_lr_scheduler", list(self.config.mamba_lr_scheduler_choices),
+        params["mamba_lr_scheduler"] = _suggest_or_fix_cat(
+            "mamba_lr_scheduler",
+            list(self.config.mamba_lr_scheduler_choices),
+            self.config.mamba_lr_scheduler_choices[0],
+            tune_stages=(3,),
         )
-        params["mamba_warmup_steps"] = trial.suggest_categorical(
-            "mamba_warmup_steps", list(self.config.mamba_warmup_steps_choices),
+        params["mamba_warmup_steps"] = _suggest_or_fix_cat(
+            "mamba_warmup_steps",
+            list(self.config.mamba_warmup_steps_choices),
+            self.config.mamba_warmup_steps_choices[0],
+            tune_stages=(3,),
         )
-        params["mamba_max_epochs"] = trial.suggest_categorical(
-            "mamba_max_epochs", list(self.config.mamba_max_epochs_choices),
+        params["mamba_max_epochs"] = _suggest_or_fix_cat(
+            "mamba_max_epochs",
+            list(self.config.mamba_max_epochs_choices),
+            self.config.mamba_max_epochs_choices[0],
+            tune_stages=(3,),
         )
-        params["mamba_batch_size"] = trial.suggest_categorical(
-            "mamba_batch_size", list(self.config.mamba_batch_size_choices),
+        params["mamba_batch_size"] = _suggest_or_fix_cat(
+            "mamba_batch_size",
+            list(self.config.mamba_batch_size_choices),
+            self.config.mamba_batch_size_choices[0],
+            tune_stages=(1,),  # Batch size is stability
         )
         
         # =====================================================================
-        # E. LOSS & OUTPUT STRUCTURE
+        # E. LOSS & OUTPUT STRUCTURE - Stage 3 (Head config)
         # =====================================================================
-        params["mamba_loss_fn"] = trial.suggest_categorical(
-            "mamba_loss_fn", list(self.config.mamba_loss_fn_choices),
+        params["mamba_loss_fn"] = _suggest_or_fix_cat(
+            "mamba_loss_fn",
+            list(self.config.mamba_loss_fn_choices),
+            self.config.mamba_loss_fn_choices[0],
+            tune_stages=(3,),
         )
-        params["mamba_head_type"] = trial.suggest_categorical(
-            "mamba_head_type", list(self.config.mamba_head_type_choices),
+        params["mamba_head_type"] = _suggest_or_fix_cat(
+            "mamba_head_type",
+            list(self.config.mamba_head_type_choices),
+            self.config.mamba_head_type_choices[0],
+            tune_stages=(3,),
         )
         
         # MLP head configuration (only used when head_type="mlp")
         if params["mamba_head_type"] == "mlp":
-            params["mamba_head_hidden_dim"] = trial.suggest_int(
+            params["mamba_head_hidden_dim"] = _suggest_or_fix_int(
                 "mamba_head_hidden_dim",
                 self.config.mamba_head_hidden_dim_min,
                 self.config.mamba_head_hidden_dim_max,
+                default=128,
+                tune_stages=(3,),
             )
-            params["mamba_head_num_layers"] = trial.suggest_categorical(
-                "mamba_head_num_layers", list(self.config.mamba_head_num_layers_choices),
+            params["mamba_head_num_layers"] = _suggest_or_fix_cat(
+                "mamba_head_num_layers",
+                list(self.config.mamba_head_num_layers_choices),
+                self.config.mamba_head_num_layers_choices[0],
+                tune_stages=(3,),
             )
-            params["mamba_head_dropout"] = trial.suggest_float(
+            params["mamba_head_dropout"] = _suggest_or_fix_float(
                 "mamba_head_dropout",
                 self.config.mamba_head_dropout_min,
                 self.config.mamba_head_dropout_max,
+                default=0.0,
+                tune_stages=(3,),
             )
         else:
             # Defaults for linear head
@@ -5399,6 +5676,353 @@ class StageBOptunaOptimizer:
             params["mamba_head_dropout"] = 0.0
         
         # F. Thresholds (handled separately via _suggest_threshold_params)
+        
+        return params
+    
+    def _suggest_multi_horizon_params(self, trial: "Trial") -> Dict[str, Any]:
+        """Suggest Multi-Horizon (MH) training hyperparameters with unified staging.
+        
+        Uses unified phase2_tuning_stage (0-4) for staged tuning:
+        
+        Stage 0 (Ablation): MH on/off only
+        Stage 1 (Stability): lr, weight_decay, dropout, batch_size, grad_clip,
+            sigma_floor, sigma_ceiling, balance_mode
+        Stage 2 (Capacity): d_model, n_layers, expand_factor, conv_kernel, max_epochs
+            + MH coupling: d_horizon, film_hidden_mult
+        Stage 3 (Coupling + Head): sigma_mono_penalty, sigma_monotonic, 
+            head_hidden_dim, head_num_layers, balance_mode (expanded)
+        Stage 4 (Cross-Section): cs_n_temporal_layers, cs_n_cross_section_layers,
+            cs_cross_section_heads, cs_cross_section_dropout, 
+            cs_adjacency_residual, cs_use_learned_adjacency
+            
+        Returns:
+            Dict with all MH parameters (some frozen, some tuned based on stage)
+        """
+        params = {}
+        
+        # Exit early if MH not enabled
+        if not self.config.mh_enabled:
+            params["mh_enabled"] = False
+            return params
+        
+        params["mh_enabled"] = True
+        stage = getattr(self.config, "phase2_tuning_stage", 1)  # Use unified stage
+        fixed = dict(getattr(self.config, "phase2_fixed_params", {}) or {})
+        # Also check legacy mh_fixed_params for backward compatibility
+        mh_fixed = dict(getattr(self.config, "mh_fixed_params", {}) or {})
+        fixed.update(mh_fixed)
+        
+        def _fix(name: str, default: Any) -> Any:
+            """Return frozen param value from fixed_params or default."""
+            return fixed.get(name, default)
+        
+        def _suggest_or_fix(
+            name: str,
+            suggest_fn,
+            default: Any,
+            tune_in_stages: Tuple[int, ...],
+        ) -> Any:
+            """Suggest if current stage is in tune_in_stages, else fix."""
+            if stage in tune_in_stages:
+                return suggest_fn()
+            else:
+                val = _fix(name, default)
+                # Use categorical with single value to register in Optuna
+                return trial.suggest_categorical(name, [val])
+        
+        # =====================================================================
+        # FIXED PARAMS (never tuned)
+        # =====================================================================
+        params["mh_horizons"] = list(self.config.mh_horizons)
+        params["mh_continuous_dim"] = self.config.mh_continuous_dim
+        params["mh_horizon_weights"] = list(self.config.mh_horizon_weights_default)
+        
+        # =====================================================================
+        # STAGE 1: STABILITY + CALIBRATION (8 params)
+        # Tuned in stage 1, frozen in stages 2-4
+        # =====================================================================
+        params["mh_learning_rate"] = _suggest_or_fix(
+            "mh_learning_rate",
+            lambda: trial.suggest_float(
+                "mh_learning_rate",
+                self.config.mh_lr_min,
+                self.config.mh_lr_max,
+                log=True,
+            ),
+            default=3e-4,
+            tune_in_stages=(1,),
+        )
+        
+        params["mh_weight_decay"] = _suggest_or_fix(
+            "mh_weight_decay",
+            lambda: trial.suggest_float(
+                "mh_weight_decay",
+                self.config.mh_weight_decay_min,
+                self.config.mh_weight_decay_max,
+                log=True,
+            ),
+            default=1e-5,
+            tune_in_stages=(1,),
+        )
+        
+        params["mh_dropout"] = _suggest_or_fix(
+            "mh_dropout",
+            lambda: trial.suggest_float(
+                "mh_dropout",
+                self.config.mh_dropout_min,
+                self.config.mh_dropout_max,
+            ),
+            default=0.1,
+            tune_in_stages=(1, 3),  # Re-tuned in stage 3
+        )
+        
+        params["mh_batch_size"] = _suggest_or_fix(
+            "mh_batch_size",
+            lambda: trial.suggest_categorical(
+                "mh_batch_size",
+                list(self.config.mh_batch_size_choices),
+            ),
+            default=24,
+            tune_in_stages=(1,),
+        )
+        
+        params["mh_grad_clip"] = _suggest_or_fix(
+            "mh_grad_clip",
+            lambda: trial.suggest_float(
+                "mh_grad_clip",
+                self.config.mh_grad_clip_min,
+                self.config.mh_grad_clip_max,
+            ),
+            default=1.0,
+            tune_in_stages=(1,),
+        )
+        
+        params["mh_sigma_floor"] = _suggest_or_fix(
+            "mh_sigma_floor",
+            lambda: trial.suggest_float(
+                "mh_sigma_floor",
+                self.config.mh_sigma_floor_min,
+                self.config.mh_sigma_floor_max,
+            ),
+            default=0.02,
+            tune_in_stages=(1,),
+        )
+        
+        params["mh_sigma_ceiling"] = _suggest_or_fix(
+            "mh_sigma_ceiling",
+            lambda: trial.suggest_float(
+                "mh_sigma_ceiling",
+                self.config.mh_sigma_ceiling_min,
+                self.config.mh_sigma_ceiling_max,
+            ),
+            default=2.0,
+            tune_in_stages=(1,),
+        )
+        
+        # balance_mode: Stage 1 uses subset, Stage 2 uses expanded
+        if stage == 1:
+            params["mh_balance_mode"] = trial.suggest_categorical(
+                "mh_balance_mode",
+                list(self.config.mh_balance_mode_choices_s1),
+            )
+        elif stage == 2:
+            params["mh_balance_mode"] = trial.suggest_categorical(
+                "mh_balance_mode",
+                list(self.config.mh_balance_mode_choices_s2),
+            )
+        else:
+            # Stages 3-4: freeze balance_mode from Stage 2 best
+            params["mh_balance_mode"] = trial.suggest_categorical(
+                "mh_balance_mode",
+                [_fix("mh_balance_mode", "sqrt")],
+            )
+        
+        # =====================================================================
+        # STAGE 2: MULTI-HORIZON COUPLING (7 params)
+        # Tuned in stage 2, frozen in stages 3-4
+        # =====================================================================
+        params["mh_d_horizon"] = _suggest_or_fix(
+            "mh_d_horizon",
+            lambda: trial.suggest_categorical(
+                "mh_d_horizon",
+                list(self.config.mh_d_horizon_choices),
+            ),
+            default=32,
+            tune_in_stages=(2,),
+        )
+        
+        params["mh_film_hidden_mult"] = _suggest_or_fix(
+            "mh_film_hidden_mult",
+            lambda: trial.suggest_categorical(
+                "mh_film_hidden_mult",
+                list(self.config.mh_film_hidden_mult_choices),
+            ),
+            default=2,
+            tune_in_stages=(2,),
+        )
+        
+        params["mh_sigma_mono_penalty"] = _suggest_or_fix(
+            "mh_sigma_mono_penalty",
+            lambda: trial.suggest_float(
+                "mh_sigma_mono_penalty",
+                self.config.mh_sigma_mono_penalty_min,
+                self.config.mh_sigma_mono_penalty_max,
+                log=True,
+            ),
+            default=1e-2,
+            tune_in_stages=(2,),
+        )
+        
+        params["mh_sigma_monotonic"] = _suggest_or_fix(
+            "mh_sigma_monotonic",
+            lambda: trial.suggest_categorical(
+                "mh_sigma_monotonic",
+                [True, False],
+            ),
+            default=self.config.mh_sigma_monotonic,
+            tune_in_stages=(2,),
+        )
+        
+        params["mh_head_hidden_dim"] = _suggest_or_fix(
+            "mh_head_hidden_dim",
+            lambda: trial.suggest_categorical(
+                "mh_head_hidden_dim",
+                list(self.config.mh_head_hidden_dim_choices),
+            ),
+            default=64,
+            tune_in_stages=(2,),
+        )
+        
+        params["mh_head_num_layers"] = _suggest_or_fix(
+            "mh_head_num_layers",
+            lambda: trial.suggest_categorical(
+                "mh_head_num_layers",
+                list(self.config.mh_head_num_layers_choices),
+            ),
+            default=2,
+            tune_in_stages=(2,),
+        )
+        
+        # =====================================================================
+        # STAGE 3: BACKBONE CAPACITY (6 params)
+        # Tuned in stage 3, frozen in stage 4
+        # =====================================================================
+        params["mh_d_model"] = _suggest_or_fix(
+            "mh_d_model",
+            lambda: trial.suggest_categorical(
+                "mh_d_model",
+                list(self.config.mh_d_model_choices),
+            ),
+            default=128,
+            tune_in_stages=(3,),
+        )
+        
+        params["mh_n_layers"] = _suggest_or_fix(
+            "mh_n_layers",
+            lambda: trial.suggest_categorical(
+                "mh_n_layers",
+                list(self.config.mh_n_layers_choices),
+            ),
+            default=4,
+            tune_in_stages=(3,),
+        )
+        
+        params["mh_expand_factor"] = _suggest_or_fix(
+            "mh_expand_factor",
+            lambda: trial.suggest_float(
+                "mh_expand_factor",
+                self.config.mh_expand_factor_min,
+                self.config.mh_expand_factor_max,
+            ),
+            default=2.0,
+            tune_in_stages=(3,),
+        )
+        
+        params["mh_conv_kernel"] = _suggest_or_fix(
+            "mh_conv_kernel",
+            lambda: trial.suggest_categorical(
+                "mh_conv_kernel",
+                list(self.config.mh_conv_kernel_choices),
+            ),
+            default=5,
+            tune_in_stages=(3,),
+        )
+        
+        params["mh_max_epochs"] = _suggest_or_fix(
+            "mh_max_epochs",
+            lambda: trial.suggest_categorical(
+                "mh_max_epochs",
+                list(self.config.mh_max_epochs_choices),
+            ),
+            default=10,
+            tune_in_stages=(3,),
+        )
+        
+        # =====================================================================
+        # STAGE 4: CROSS-SECTION EXTENSION (6 params)
+        # Only tuned in stage 4; Level 1 ignores these
+        # =====================================================================
+        params["mh_cs_n_temporal_layers"] = _suggest_or_fix(
+            "mh_cs_n_temporal_layers",
+            lambda: trial.suggest_categorical(
+                "mh_cs_n_temporal_layers",
+                list(self.config.mh_cs_n_temporal_layers_choices),
+            ),
+            default=4,
+            tune_in_stages=(4,),
+        )
+        
+        params["mh_cs_n_cross_section_layers"] = _suggest_or_fix(
+            "mh_cs_n_cross_section_layers",
+            lambda: trial.suggest_categorical(
+                "mh_cs_n_cross_section_layers",
+                list(self.config.mh_cs_n_cross_section_layers_choices),
+            ),
+            default=2,
+            tune_in_stages=(4,),
+        )
+        
+        params["mh_cs_cross_section_heads"] = _suggest_or_fix(
+            "mh_cs_cross_section_heads",
+            lambda: trial.suggest_categorical(
+                "mh_cs_cross_section_heads",
+                list(self.config.mh_cs_cross_section_heads_choices),
+            ),
+            default=4,
+            tune_in_stages=(4,),
+        )
+        
+        params["mh_cs_cross_section_dropout"] = _suggest_or_fix(
+            "mh_cs_cross_section_dropout",
+            lambda: trial.suggest_float(
+                "mh_cs_cross_section_dropout",
+                self.config.mh_cs_cross_section_dropout_min,
+                self.config.mh_cs_cross_section_dropout_max,
+            ),
+            default=0.1,
+            tune_in_stages=(4,),
+        )
+        
+        params["mh_cs_adjacency_residual"] = _suggest_or_fix(
+            "mh_cs_adjacency_residual",
+            lambda: trial.suggest_float(
+                "mh_cs_adjacency_residual",
+                self.config.mh_cs_adjacency_residual_min,
+                self.config.mh_cs_adjacency_residual_max,
+            ),
+            default=0.1,
+            tune_in_stages=(4,),
+        )
+        
+        params["mh_cs_use_learned_adjacency"] = _suggest_or_fix(
+            "mh_cs_use_learned_adjacency",
+            lambda: trial.suggest_categorical(
+                "mh_cs_use_learned_adjacency",
+                [True, False],
+            ),
+            default=self.config.mh_cs_use_learned_adjacency,
+            tune_in_stages=(4,),
+        )
         
         return params
     
@@ -5445,10 +6069,20 @@ class StageBOptunaOptimizer:
         Returns:
             Dict with all threshold/regime hyperparameters
         """
-        if bool(getattr(self.config, "tune_weights_only", False)):
-            fixed = dict(getattr(self.config, "fixed_params", {}) or {})
-            def _fix(name: str, default: Any) -> Any:
-                return trial.suggest_categorical(name, [fixed.get(name, default)])
+        stage = getattr(self.config, "phase2_tuning_stage", 1)
+        fixed = dict(getattr(self.config, "phase2_fixed_params", {}) or {})
+        
+        def _fix(name: str, default: Any) -> Any:
+            return trial.suggest_categorical(name, [fixed.get(name, default)])
+        
+        def _suggest_or_fix_float(name: str, low: float, high: float, default: float, 
+                                   tune_stages: tuple) -> float:
+            if stage in tune_stages:
+                return trial.suggest_float(name, low, high)
+            return _fix(name, default)
+        
+        # WEIGHTS-ONLY MODE or Stage 4: freeze all threshold params
+        if bool(getattr(self.config, "tune_weights_only", False)) or stage == 4:
             return {
                 "threshold": float(_fix("threshold", 0.10)),
                 "bull_long_mult": float(_fix("bull_long_mult", 1.0)),
@@ -5461,61 +6095,79 @@ class StageBOptunaOptimizer:
                 "vol_scaler": float(_fix("vol_scaler", 1.0)),
             }
 
-        # Base threshold
-        threshold = trial.suggest_float(
+        # All threshold params tuned in Stage 3 (Thresholds + Coupling)
+        threshold = _suggest_or_fix_float(
             "threshold",
             self.config.threshold_min,
             self.config.threshold_max,
+            default=0.10,
+            tune_stages=(3,),
         )
         
         # Bull regime - separate long/short
-        bull_long_mult = trial.suggest_float(
+        bull_long_mult = _suggest_or_fix_float(
             "bull_long_mult",
             self.config.bull_long_mult_min,
             self.config.bull_long_mult_max,
+            default=1.0,
+            tune_stages=(3,),
         )
-        bull_short_mult = trial.suggest_float(
+        bull_short_mult = _suggest_or_fix_float(
             "bull_short_mult",
             self.config.bull_short_mult_min,
             self.config.bull_short_mult_max,
+            default=1.0,
+            tune_stages=(3,),
         )
         
         # Bear regime - separate long/short
-        bear_long_mult = trial.suggest_float(
+        bear_long_mult = _suggest_or_fix_float(
             "bear_long_mult",
             self.config.bear_long_mult_min,
             self.config.bear_long_mult_max,
+            default=1.5,
+            tune_stages=(3,),
         )
-        bear_short_mult = trial.suggest_float(
+        bear_short_mult = _suggest_or_fix_float(
             "bear_short_mult",
             self.config.bear_short_mult_min,
             self.config.bear_short_mult_max,
+            default=0.5,
+            tune_stages=(3,),
         )
         
         # Crisis regime - separate long/short
-        crisis_long_mult = trial.suggest_float(
+        crisis_long_mult = _suggest_or_fix_float(
             "crisis_long_mult",
             self.config.crisis_long_mult_min,
             self.config.crisis_long_mult_max,
+            default=3.0,
+            tune_stages=(3,),
         )
-        crisis_short_mult = trial.suggest_float(
+        crisis_short_mult = _suggest_or_fix_float(
             "crisis_short_mult",
             self.config.crisis_short_mult_min,
             self.config.crisis_short_mult_max,
+            default=3.0,
+            tune_stages=(3,),
         )
         
-        # Confidence gating
-        conf_threshold = trial.suggest_float(
+        # Confidence gating - Stage 1 (Stability)
+        conf_threshold = _suggest_or_fix_float(
             "conf_threshold",
             self.config.conf_threshold_min,
             self.config.conf_threshold_max,
+            default=0.5,
+            tune_stages=(1,),
         )
         
-        # Volatility scaler
-        vol_scaler = trial.suggest_float(
+        # Volatility scaler - Stage 1 (Stability)
+        vol_scaler = _suggest_or_fix_float(
             "vol_scaler",
             self.config.vol_scaler_min,
             self.config.vol_scaler_max,
+            default=1.0,
+            tune_stages=(1,),
         )
         
         return {
@@ -5528,6 +6180,317 @@ class StageBOptunaOptimizer:
             "crisis_short_mult": crisis_short_mult,
             "conf_threshold": conf_threshold,
             "vol_scaler": vol_scaler,
+        }
+    
+    def _suggest_robust_optimizer_params(self, trial: "Trial") -> Dict[str, Any]:
+        """Suggest Workstream 7 Robust Portfolio Optimizer parameters.
+        
+        STAGED TUNING (aligned with unified phase2_tuning_stage):
+        
+        Stage 0: Ablation
+            - phase2_use_robust_optimizer=False (optimizer disabled)
+            - All other params frozen to defaults
+        
+        Stage 1: Stability — Core Risk Knobs
+            FREEZE:
+                - phase2_use_robust_optimizer=True
+                - phase2_robust_covariance_method="ewma_shrink"
+                - phase2_robust_cvar_constraint=False
+                - phase2_robust_uncertainty_caps=True
+            TUNE:
+                - phase2_robust_lambda_var: log-uniform [0.1, 10.0]
+                - phase2_robust_predicted_sigma_blend: uniform [0.3, 0.9]
+                - phase2_robust_mu_sigma_cap: uniform [1.5, 6.0]
+                - phase2_robust_reliability_min: uniform [0.1, 0.6]
+                - phase2_robust_lambda_turnover: log-uniform [1e-4, 1.0]
+        
+        Stage 2: Capacity — Structural Choices
+            FREEZE: Stage 1 winners
+            TUNE:
+                - phase2_robust_covariance_method: categorical
+                - phase2_robust_cvar_constraint: categorical {True, False}
+                - If cvar_constraint=True: tune cvar_alpha, cvar_limit
+                - phase2_robust_n_factors: categorical (if cov_method="factor")
+        
+        Stage 3: Fine-Tuning — Narrow Ranges
+            FREEZE: Stage 1/2 winners except:
+            TUNE:
+                - phase2_robust_predicted_sigma_blend: ±0.1 around best
+                - phase2_robust_reliability_min: ±0.1 around best
+                - phase2_robust_uncertainty_caps: categorical {True, False}
+        
+        Stage 4: Weights-Only
+            - All frozen to best values from Stage 3
+        
+        Returns:
+            Dict with robust optimizer parameters
+        """
+        import math
+        
+        stage = getattr(self.config, "phase2_tuning_stage", 1)
+        fixed = dict(getattr(self.config, "phase2_fixed_params", {}) or {})
+        fine_tune_range = getattr(self.config, "robust_fine_tune_range", 0.1)
+        
+        def _fix(name: str, default: Any) -> Any:
+            """Return fixed value from previous stage or default."""
+            return trial.suggest_categorical(name, [fixed.get(name, default)])
+        
+        def _suggest_log_uniform(name: str, low: float, high: float) -> float:
+            """Suggest from log-uniform distribution."""
+            log_low = math.log(max(low, 1e-10))
+            log_high = math.log(max(high, 1e-9))
+            return math.exp(trial.suggest_float(name, log_low, log_high))
+        
+        # =====================================================================
+        # STAGE 0: ABLATION — Optimizer disabled
+        # =====================================================================
+        if stage == 0:
+            return {
+                "phase2_use_robust_optimizer": bool(_fix("phase2_use_robust_optimizer", False)),
+                "phase2_robust_lambda_var": float(_fix("phase2_robust_lambda_var", 1.0)),
+                "phase2_robust_lambda_turnover": float(_fix("phase2_robust_lambda_turnover", 0.001)),
+                "phase2_robust_lambda_tail": float(_fix("phase2_robust_lambda_tail", 0.0)),
+                "phase2_robust_predicted_sigma_blend": float(_fix("phase2_robust_predicted_sigma_blend", 0.6)),
+                "phase2_robust_covariance_method": str(_fix("phase2_robust_covariance_method", "ewma_shrink")),
+                "phase2_robust_cvar_constraint": bool(_fix("phase2_robust_cvar_constraint", False)),
+                "phase2_robust_cvar_alpha": float(_fix("phase2_robust_cvar_alpha", 0.05)),
+                "phase2_robust_cvar_limit": float(_fix("phase2_robust_cvar_limit", -0.05)),
+                "phase2_robust_uncertainty_caps": bool(_fix("phase2_robust_uncertainty_caps", True)),
+                "phase2_robust_mu_sigma_cap": float(_fix("phase2_robust_mu_sigma_cap", 3.0)),
+                "phase2_robust_reliability_min": float(_fix("phase2_robust_reliability_min", 0.3)),
+                "phase2_robust_n_factors": int(_fix("phase2_robust_n_factors", 5)),
+            }
+        
+        # =====================================================================
+        # STAGE 4: WEIGHTS-ONLY — All frozen
+        # =====================================================================
+        if stage == 4 or bool(getattr(self.config, "tune_weights_only", False)):
+            return {
+                "phase2_use_robust_optimizer": bool(_fix("phase2_use_robust_optimizer", True)),
+                "phase2_robust_lambda_var": float(_fix("phase2_robust_lambda_var", 1.0)),
+                "phase2_robust_lambda_turnover": float(_fix("phase2_robust_lambda_turnover", 0.001)),
+                "phase2_robust_lambda_tail": float(_fix("phase2_robust_lambda_tail", 0.0)),
+                "phase2_robust_predicted_sigma_blend": float(_fix("phase2_robust_predicted_sigma_blend", 0.6)),
+                "phase2_robust_covariance_method": str(_fix("phase2_robust_covariance_method", "ewma_shrink")),
+                "phase2_robust_cvar_constraint": bool(_fix("phase2_robust_cvar_constraint", False)),
+                "phase2_robust_cvar_alpha": float(_fix("phase2_robust_cvar_alpha", 0.05)),
+                "phase2_robust_cvar_limit": float(_fix("phase2_robust_cvar_limit", -0.05)),
+                "phase2_robust_uncertainty_caps": bool(_fix("phase2_robust_uncertainty_caps", True)),
+                "phase2_robust_mu_sigma_cap": float(_fix("phase2_robust_mu_sigma_cap", 3.0)),
+                "phase2_robust_reliability_min": float(_fix("phase2_robust_reliability_min", 0.3)),
+                "phase2_robust_n_factors": int(_fix("phase2_robust_n_factors", 5)),
+            }
+        
+        # =====================================================================
+        # STAGE 1: STABILITY — Core Risk Knobs
+        # =====================================================================
+        if stage == 1:
+            # FROZEN in Stage 1
+            use_robust = True
+            cov_method = "ewma_shrink"
+            cvar_constraint = False
+            uncertainty_caps = True
+            cvar_alpha = 0.05
+            cvar_limit = -0.05
+            n_factors = 5
+            lambda_tail = 0.0
+            
+            # TUNED in Stage 1 (log-uniform for lambda_var, lambda_turnover)
+            lambda_var = _suggest_log_uniform(
+                "phase2_robust_lambda_var",
+                self.config.robust_lambda_var_min,
+                self.config.robust_lambda_var_max,
+            )
+            
+            lambda_turnover = _suggest_log_uniform(
+                "phase2_robust_lambda_turnover",
+                self.config.robust_lambda_turnover_min,
+                self.config.robust_lambda_turnover_max,
+            )
+            
+            predicted_sigma_blend = trial.suggest_float(
+                "phase2_robust_predicted_sigma_blend",
+                self.config.robust_predicted_sigma_blend_min,
+                self.config.robust_predicted_sigma_blend_max,
+            )
+            
+            mu_sigma_cap = trial.suggest_float(
+                "phase2_robust_mu_sigma_cap",
+                self.config.robust_mu_sigma_cap_min,
+                self.config.robust_mu_sigma_cap_max,
+            )
+            
+            reliability_min = trial.suggest_float(
+                "phase2_robust_reliability_min",
+                self.config.robust_reliability_min_min,
+                self.config.robust_reliability_min_max,
+            )
+            
+            return {
+                "phase2_use_robust_optimizer": bool(use_robust),
+                "phase2_robust_lambda_var": float(lambda_var),
+                "phase2_robust_lambda_turnover": float(lambda_turnover),
+                "phase2_robust_lambda_tail": float(lambda_tail),
+                "phase2_robust_predicted_sigma_blend": float(predicted_sigma_blend),
+                "phase2_robust_covariance_method": str(cov_method),
+                "phase2_robust_cvar_constraint": bool(cvar_constraint),
+                "phase2_robust_cvar_alpha": float(cvar_alpha),
+                "phase2_robust_cvar_limit": float(cvar_limit),
+                "phase2_robust_uncertainty_caps": bool(uncertainty_caps),
+                "phase2_robust_mu_sigma_cap": float(mu_sigma_cap),
+                "phase2_robust_reliability_min": float(reliability_min),
+                "phase2_robust_n_factors": int(n_factors),
+            }
+        
+        # =====================================================================
+        # STAGE 2: CAPACITY — Structural Choices
+        # =====================================================================
+        if stage == 2:
+            # FROZEN from Stage 1 winners
+            use_robust = True
+            lambda_var = float(fixed.get("phase2_robust_lambda_var", 1.0))
+            lambda_turnover = float(fixed.get("phase2_robust_lambda_turnover", 0.001))
+            lambda_tail = float(fixed.get("phase2_robust_lambda_tail", 0.0))
+            predicted_sigma_blend = float(fixed.get("phase2_robust_predicted_sigma_blend", 0.6))
+            uncertainty_caps = True
+            mu_sigma_cap = float(fixed.get("phase2_robust_mu_sigma_cap", 3.0))
+            reliability_min = float(fixed.get("phase2_robust_reliability_min", 0.3))
+            
+            # TUNED in Stage 2: structural choices
+            cov_method = trial.suggest_categorical(
+                "phase2_robust_covariance_method",
+                list(self.config.robust_cov_method_choices),
+            )
+            
+            cvar_constraint = trial.suggest_categorical(
+                "phase2_robust_cvar_constraint",
+                [False, True],
+            )
+            
+            # Conditionally tune CVaR params if constraint enabled
+            if cvar_constraint:
+                cvar_alpha = trial.suggest_float(
+                    "phase2_robust_cvar_alpha",
+                    self.config.robust_cvar_alpha_min,
+                    self.config.robust_cvar_alpha_max,
+                )
+                cvar_limit = trial.suggest_float(
+                    "phase2_robust_cvar_limit",
+                    self.config.robust_cvar_limit_min,
+                    self.config.robust_cvar_limit_max,
+                )
+            else:
+                cvar_alpha = 0.05
+                cvar_limit = -0.05
+            
+            # Tune n_factors if using factor covariance
+            if cov_method == "factor":
+                n_factors = trial.suggest_categorical(
+                    "phase2_robust_n_factors",
+                    list(self.config.robust_n_factors_choices),
+                )
+            else:
+                n_factors = 5
+            
+            return {
+                "phase2_use_robust_optimizer": bool(use_robust),
+                "phase2_robust_lambda_var": float(lambda_var),
+                "phase2_robust_lambda_turnover": float(lambda_turnover),
+                "phase2_robust_lambda_tail": float(lambda_tail),
+                "phase2_robust_predicted_sigma_blend": float(predicted_sigma_blend),
+                "phase2_robust_covariance_method": str(cov_method),
+                "phase2_robust_cvar_constraint": bool(cvar_constraint),
+                "phase2_robust_cvar_alpha": float(cvar_alpha),
+                "phase2_robust_cvar_limit": float(cvar_limit),
+                "phase2_robust_uncertainty_caps": bool(uncertainty_caps),
+                "phase2_robust_mu_sigma_cap": float(mu_sigma_cap),
+                "phase2_robust_reliability_min": float(reliability_min),
+                "phase2_robust_n_factors": int(n_factors),
+            }
+        
+        # =====================================================================
+        # STAGE 3: FINE-TUNING — Narrow Ranges
+        # =====================================================================
+        if stage == 3:
+            # FROZEN from Stage 1/2 winners
+            use_robust = True
+            lambda_var = float(fixed.get("phase2_robust_lambda_var", 1.0))
+            lambda_turnover = float(fixed.get("phase2_robust_lambda_turnover", 0.001))
+            lambda_tail = float(fixed.get("phase2_robust_lambda_tail", 0.0))
+            cov_method = str(fixed.get("phase2_robust_covariance_method", "ewma_shrink"))
+            cvar_constraint = bool(fixed.get("phase2_robust_cvar_constraint", False))
+            cvar_alpha = float(fixed.get("phase2_robust_cvar_alpha", 0.05))
+            cvar_limit = float(fixed.get("phase2_robust_cvar_limit", -0.05))
+            n_factors = int(fixed.get("phase2_robust_n_factors", 5))
+            
+            # TUNED in Stage 3: Fine-tune with narrow ranges
+            # predicted_sigma_blend: ±0.1 around best
+            best_sigma_blend = float(fixed.get("phase2_robust_predicted_sigma_blend", 0.6))
+            sigma_blend_low = max(0.1, best_sigma_blend - fine_tune_range)
+            sigma_blend_high = min(1.0, best_sigma_blend + fine_tune_range)
+            predicted_sigma_blend = trial.suggest_float(
+                "phase2_robust_predicted_sigma_blend",
+                sigma_blend_low,
+                sigma_blend_high,
+            )
+            
+            # reliability_min: ±0.1 around best
+            best_reliability_min = float(fixed.get("phase2_robust_reliability_min", 0.3))
+            reliability_low = max(0.05, best_reliability_min - fine_tune_range)
+            reliability_high = min(0.9, best_reliability_min + fine_tune_range)
+            reliability_min = trial.suggest_float(
+                "phase2_robust_reliability_min",
+                reliability_low,
+                reliability_high,
+            )
+            
+            # mu_sigma_cap: ±0.5 around best
+            best_mu_sigma_cap = float(fixed.get("phase2_robust_mu_sigma_cap", 3.0))
+            mu_cap_low = max(1.0, best_mu_sigma_cap - 0.5)
+            mu_cap_high = min(8.0, best_mu_sigma_cap + 0.5)
+            mu_sigma_cap = trial.suggest_float(
+                "phase2_robust_mu_sigma_cap",
+                mu_cap_low,
+                mu_cap_high,
+            )
+            
+            # Optionally test uncertainty_caps on/off (usually stays True)
+            uncertainty_caps = trial.suggest_categorical(
+                "phase2_robust_uncertainty_caps",
+                [True, False],
+            )
+            
+            return {
+                "phase2_use_robust_optimizer": bool(use_robust),
+                "phase2_robust_lambda_var": float(lambda_var),
+                "phase2_robust_lambda_turnover": float(lambda_turnover),
+                "phase2_robust_lambda_tail": float(lambda_tail),
+                "phase2_robust_predicted_sigma_blend": float(predicted_sigma_blend),
+                "phase2_robust_covariance_method": str(cov_method),
+                "phase2_robust_cvar_constraint": bool(cvar_constraint),
+                "phase2_robust_cvar_alpha": float(cvar_alpha),
+                "phase2_robust_cvar_limit": float(cvar_limit),
+                "phase2_robust_uncertainty_caps": bool(uncertainty_caps),
+                "phase2_robust_mu_sigma_cap": float(mu_sigma_cap),
+                "phase2_robust_reliability_min": float(reliability_min),
+                "phase2_robust_n_factors": int(n_factors),
+            }
+        
+        # Fallback (should not reach here)
+        return {
+            "phase2_use_robust_optimizer": True,
+            "phase2_robust_lambda_var": 1.0,
+            "phase2_robust_lambda_turnover": 0.001,
+            "phase2_robust_lambda_tail": 0.0,
+            "phase2_robust_predicted_sigma_blend": 0.6,
+            "phase2_robust_covariance_method": "ewma_shrink",
+            "phase2_robust_cvar_constraint": False,
+            "phase2_robust_cvar_alpha": 0.05,
+            "phase2_robust_cvar_limit": -0.05,
+            "phase2_robust_uncertainty_caps": True,
+            "phase2_robust_mu_sigma_cap": 3.0,
+            "phase2_robust_reliability_min": 0.3,
+            "phase2_robust_n_factors": 5,
         }
     
     def _suggest_pipeline_params(self, trial: "Trial") -> Dict[str, Any]:
@@ -6934,6 +7897,12 @@ class StageBOptunaOptimizer:
                 threshold_params = self._suggest_threshold_params(trial)
                 
                 # ===========================================================
+                # TIER 4.5: MULTI-HORIZON PARAMETERS (Workstream 6)
+                # ===========================================================
+                # Suggest MH params if enabled; respects 4-stage tuning strategy
+                mh_params = self._suggest_multi_horizon_params(trial)
+                
+                # ===========================================================
                 # TIER 5: Pipeline Hyperparameters (preprocessing & splitting)
                 # ===========================================================
                 pipeline_params = self._suggest_pipeline_params(trial)
@@ -6946,6 +7915,7 @@ class StageBOptunaOptimizer:
                     "sequence_model_type": sequence_model_type,
                     "lstm_params": lstm_params,
                     "mamba_params": mamba_params,
+                    "mh_params": mh_params,
                     "threshold_params": threshold_params,
                     "pipeline_params": pipeline_params,
                     "horizon": horizon,

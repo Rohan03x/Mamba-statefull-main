@@ -50,7 +50,7 @@ HF_BRAIN_MANIFEST: Dict[str, HFBrainManifestEntry] = {
         },
         data={
             "source": "artifacts/news/{symbol}.parquet",
-            "cache_glob": "data_cache/company-news_news_{symbol}_*.json",
+            "cache_glob": "cache/shared/company-news_news_{symbol}_*.json",
             "cutoff": "16:00:00",
             "timezone": "America/New_York",
         },
@@ -75,7 +75,7 @@ HF_BRAIN_MANIFEST: Dict[str, HFBrainManifestEntry] = {
             "repo_url": "https://huggingface.co/ProsusAI/finbert",
         },
         data={
-            "source": "data_cache/earnings_transcripts/{symbol}",
+            "source": "cache/shared/earnings_transcripts/{symbol}",
             "fallback": "analyzer.get_earnings_transcript",
             "cutoff": "21:00:00",
             "timezone": "America/New_York",
@@ -100,7 +100,7 @@ HF_BRAIN_MANIFEST: Dict[str, HFBrainManifestEntry] = {
         },
         data={
             "source": "artifacts/news/{symbol}.parquet",
-            "cache_glob": "data_cache/company-news_news_{symbol}_*.json",
+            "cache_glob": "cache/shared/company-news_news_{symbol}_*.json",
             "cutoff": "16:00:00",
             "timezone": "America/New_York",
         },
@@ -124,7 +124,7 @@ HF_BRAIN_MANIFEST: Dict[str, HFBrainManifestEntry] = {
             "repo_url": None,
         },
         data={
-            "source": "data_cache/macro_panel/macro_features_{symbol}.parquet",
+            "source": "cache/shared/macro_panel/macro_features_{symbol}.parquet",
             "timezone": "America/New_York",
             "frequency": "daily",
         },

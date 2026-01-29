@@ -11,7 +11,13 @@ import yfinance as yf
 from .settings import CACHE_TTL_SECONDS
 from .utils import try_float, sanitize_dt_index
 
-CACHE_DIR = os.environ.get("DCF_LAB_CACHE_DIR", "data_cache")
+# Use centralized cache path
+try:
+    from src.cache_paths import SHARED_CACHE_ROOT
+    CACHE_DIR = os.environ.get("DCF_LAB_CACHE_DIR", str(SHARED_CACHE_ROOT))
+except ImportError:
+    CACHE_DIR = os.environ.get("DCF_LAB_CACHE_DIR", "cache/shared")
+
 os.makedirs(CACHE_DIR, exist_ok=True)
 ALPHA_URL = "https://www.alphavantage.co/query"
 

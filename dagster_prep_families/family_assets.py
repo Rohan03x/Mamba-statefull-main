@@ -19,7 +19,8 @@ from dagster import (
 from .partitions import get_symbol_horizon_partitions_def, get_symbol_partitions_def
 
 
-HORIZON_BOUND_FAMILIES: set[str] = {"quantile_forecast", "calibration", "online_learning"}
+# calibration and online_learning are Phase 2 Mamba-specific - not generated as families here
+HORIZON_BOUND_FAMILIES: set[str] = {"quantile_forecast"}
 
 
 class FamilyRunConfig(Config):
@@ -123,9 +124,13 @@ def _list_families_for_dagster() -> List[str]:
 
     # Dagster-only exclusions (do not expose as assets).
     dagster_exclude = {
-        "news_sentiment_hf",
         # Universe-wide / cross-sectional snapshot; not a per-symbol family cache.
         "peer_screener_context",
+        # news_sentiment_hf - not a family, external data source with API issues
+        "news_sentiment_hf",
+        # calibration, online_learning - Phase 2 Mamba-specific governance layers, not general families
+        "calibration",
+        "online_learning",
     }
 
     out: List[str] = []
@@ -399,12 +404,12 @@ def build_family_assets() -> List[Any]:
                 merged_out=None,
                 merged_service=None,
                 manifest_scope="all",
-                manifest_exclude_families=["news_sentiment_hf"],
+                manifest_exclude_families=[],  # REMOVED: news_sentiment_hf
                 sequential_mode=True,  # Per-symbol sequential execution (no spawns)
             )
 
-            train_path = _cache_path(run_symbol, int(run_horizon), fam, "train")
-            valid_path = _cache_path(run_symbol, int(run_horizon), fam, "valid")
+            # Stage-A mode produces consolidated files (no train/valid split)
+            consolidated_path = _cache_path(run_symbol, int(run_horizon), fam, "")
 
             context.log_event(
                 AssetMaterialization(
@@ -418,8 +423,7 @@ def build_family_assets() -> List[Any]:
                         "wf_end": str(wf_end),
                         "allow_wf_override": bool(allow_wf_override),
                         "success": bool(result.success),
-                        "train_cache": str(train_path),
-                        "valid_cache": str(valid_path),
+                        "cache_path": str(consolidated_path),
                         "manifest": str(result.completeness_manifest_path) if result.completeness_manifest_path else "",
                     },
                 )
@@ -428,7 +432,7 @@ def build_family_assets() -> List[Any]:
             if not result.success:
                 raise RuntimeError(f"prepare_families failed for family={fam} {run_symbol} h{int(run_horizon)}")
 
-            return {"train": str(train_path), "valid": str(valid_path)}
+            return {"consolidated": str(consolidated_path)}
 
         @asset_check(
             asset=_family_asset,

@@ -72,6 +72,7 @@ except Exception:  # pragma: no cover - optional dependency
 from src.features.aggregator_panel import build_panel, _fetch_price_data  # type: ignore
 from src.features.canonical_feature_cols import FAMILY_FORBIDDEN_COLS, FAMILY_REQUIRED_COLS, META_COL_SUFFIXES
 from src.features.family_spec import default_hf_blocks
+from src.features.feature_governance import FeatureGovernance, GovernanceResult  # Feature Atlas enforcement
 from src.stage_b.backtest import BacktestEngine
 from src.stage_b.sequence_models import build_sequence_data, train_mamba_fold, predict_mamba_on_data
 from src.stage_b.stage_b_export import collect_fold_predictions, save_prediction_tape
@@ -1557,6 +1558,10 @@ class StageBPipeline:
         """Preferred unified panel artifact (single merged parquet per symbol).
 
         Produced by `tools/prep_families.py --write-merged yes` via Feast.
+        
+        Checks both:
+        - Legacy flat layout: cache/features/<SYMBOL>_h<H>_merged_mamba.parquet
+        - New per-symbol subdirectory: cache/merged/<SYMBOL>/<SYMBOL>_h<H>_merged_mamba.parquet
         """
         variant = os.getenv("STAGE_B_MERGED_PANEL_VARIANT", "auto").strip().lower()
         if variant in {"alpha"}:
@@ -1575,23 +1580,30 @@ class StageBPipeline:
             # auto: prefer mamba if available, then fall back to merged
             order = ["merged_mamba", "merged"]
 
+        # New merged directory with per-symbol subdirectories
+        from src.cache_paths import MERGED_CACHE_ROOT
+
         candidates: List[Path] = []
         seen: Set[str] = set()
         for sym in (self.config.symbol.upper(), self.config.symbol.lower()):
+            sym_subdir = MERGED_CACHE_ROOT / sym.upper()
             for token in order:
                 if token == "merged":
-                    candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged.parquet"
+                    base_name = f"{sym}_h{horizon}_merged.parquet"
                 elif token == "merged_mamba":
-                    candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged_mamba.parquet"
+                    base_name = f"{sym}_h{horizon}_merged_mamba.parquet"
                 elif token == "merged_portfolio":
-                    candidate = FEATURE_PANEL_DIR / f"{sym}_h{horizon}_merged_portfolio.parquet"
+                    base_name = f"{sym}_h{horizon}_merged_portfolio.parquet"
                 else:
                     continue
-                key = str(candidate)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(candidate)
+                # Check per-symbol subdirectory first (new layout), then flat (legacy)
+                for base_dir in (sym_subdir, FEATURE_PANEL_DIR):
+                    candidate = base_dir / base_name
+                    key = str(candidate)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(candidate)
         return candidates
 
     def _panel_variant_from_path(self, path: Path) -> str:
@@ -1610,19 +1622,28 @@ class StageBPipeline:
         - <SYMBOL>_<H>_features.parquet + <SYMBOL>_<H>_index.parquet
         - <SYMBOL>_h<H>__features.parquet + <SYMBOL>_h<H>__index.parquet (Dagster/Phase2 variant)
         - <SYMBOL>_<H>__features.parquet + <SYMBOL>_<H>__index.parquet (Dagster/Phase2 variant)
+        
+        Checks both:
+        - Legacy flat layout: cache/features/
+        - New per-symbol subdirectory: cache/merged/<SYMBOL>/
         """
+        from src.cache_paths import MERGED_CACHE_ROOT
+
         candidates: List[Tuple[Path, Path]] = []
         seen: Set[str] = set()
         for sym in (self.config.symbol.upper(), self.config.symbol.lower()):
+            sym_subdir = MERGED_CACHE_ROOT / sym.upper()
             for stem in (f"{sym}_h{horizon}", f"{sym}_{horizon}"):
                 for infix in ("_", "__"):
-                    feat = FEATURE_PANEL_DIR / f"{stem}{infix}features.parquet"
-                    idx = FEATURE_PANEL_DIR / f"{stem}{infix}index.parquet"
-                    key = f"{feat}||{idx}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    candidates.append((feat, idx))
+                    # Check per-symbol subdirectory first (new layout), then flat (legacy)
+                    for base_dir in (sym_subdir, FEATURE_PANEL_DIR):
+                        feat = base_dir / f"{stem}{infix}features.parquet"
+                        idx = base_dir / f"{stem}{infix}index.parquet"
+                        key = f"{feat}||{idx}"
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        candidates.append((feat, idx))
         return candidates
 
     def _peek_unified_panel_columns(self, panel_path: Path) -> List[str]:
@@ -7200,6 +7221,83 @@ class StageBPipeline:
         }
 
         for view_name, feature_frame in view_items:
+            # HYGIENE GUARD: Block governance columns from model inputs (suffix-based)
+            # These columns are for data quality tracking, NOT predictive features.
+            gov_suffixes = (
+                "_has_data", "_activity", "_days_since_update", 
+                "_source_asof_ts", "_confidence", "_conf"
+            )
+            bad_cols = [c for c in feature_frame.columns if str(c).endswith(gov_suffixes)]
+            if bad_cols:
+                raise ValueError(
+                    f"GOVERNANCE LEAKAGE DETECTED: {len(bad_cols)} columns with governance suffixes found in model inputs.\n"
+                    f"First 50: {bad_cols[:50]}\n"
+                    f"These columns must be excluded before Stage-B. Check feature_roles.py classification."
+                )
+            
+            # VARIANCE FILTER: Drop dead features (zero/near-zero variance)
+            # Applied AFTER role assignment to remove features that provide no signal.
+            # Never drop HYGIENE columns (they're already excluded above).
+            try:
+                from src.features.feature_roles import classify_feature_role, FeatureRole
+                
+                variance_threshold = 1e-6
+                dead_features = []
+                dropped_features = []
+                
+                for col in feature_frame.columns:
+                    try:
+                        # Calculate variance
+                        col_std = feature_frame[col].std()
+                        
+                        if col_std < variance_threshold:
+                            # Check role - only drop PREDICTIVE/RISK/REGIME
+                            role, _ = classify_feature_role(str(col))
+                            if role in (FeatureRole.PREDICTIVE, FeatureRole.RISK, FeatureRole.REGIME):
+                                dead_features.append({
+                                    "column": str(col),
+                                    "std": float(col_std),
+                                    "role": str(role.name)
+                                })
+                                dropped_features.append(str(col))
+                    except Exception:
+                        continue
+                
+                # Drop dead features
+                if dropped_features:
+                    feature_frame = feature_frame.drop(columns=dropped_features)
+                    self.logger.info(
+                        f"🧹 VARIANCE FILTER ({view_name}): Dropped {len(dropped_features)} dead features (std < {variance_threshold})"
+                    )
+                    
+                    # Write report
+                    try:
+                        report_path = Path(self.config.output_dir) / f"dropped_dead_features_{view_name}.csv"
+                        report_path.parent.mkdir(parents=True, exist_ok=True)
+                        pd.DataFrame(dead_features).to_csv(report_path, index=False)
+                        self.logger.info(f"📊 Dead features report saved: {report_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to save dead features report: {e}")
+            except Exception as e:
+                self.logger.warning(f"Variance filter failed for {view_name}: {e}")
+
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # FEATURE GOVERNANCE: Hard drop/mask enforcement from Feature Atlas
+            # This enforces the drop_mask.json contract generated by build_feature_atlas.py:
+            #   - DROP columns: dead (variance < 1e-10) or null% > 50%
+            #   - MASK columns: stub (zero% > 95%) → set to 0.0 with governance flag
+            # This is a foundational invariant, not optional.
+            # ═══════════════════════════════════════════════════════════════════════════════
+            try:
+                gov = FeatureGovernance.load(log_actions=False)
+                if len(gov._drop_set) > 0 or len(gov._mask_set) > 0:
+                    feature_frame, gov_result = gov.apply(feature_frame, inplace=False)
+                    if gov_result.n_dropped > 0 or gov_result.n_masked > 0:
+                        self.logger.info(
+                            f"🛡️  GOVERNANCE ({view_name}): dropped={gov_result.n_dropped}, masked={gov_result.n_masked}"
+                        )
+            except Exception as e:
+                self.logger.debug(f"Governance enforcement skipped for {view_name}: {e}")
 
             meta = lstm_features.get("__meta__", {}) if isinstance(lstm_features, dict) else {}
             track_a_cols = list(meta.get("track_a_cols", []) or [])
