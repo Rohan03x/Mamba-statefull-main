@@ -6910,38 +6910,57 @@ def evaluate_phase2_stateful_once(
                     # Observe this day's features for later maturity processing
                     linear_state.observe_day(i, X_day, sigma_exec)
                     
-                    # Reuse policy knob as linear blend weight (capped at linear_blend_max)
-                    w_L = float(np.clip(quantile_blend_weight_day, 0.0, linear_blend_max))
+                    # Compute quality-adaptive blend weight
+                    # Start with policy knob, then apply quality gates
+                    base_weight = float(np.clip(quantile_blend_weight_day, 0.0, linear_blend_max))
                     
-                    if linear_state.is_ready() and w_L > 0:
+                    if linear_state.is_ready() and base_weight > 0:
                         z_lin = linear_state.predict_z(X_day)
-                        z_before_blend = z.copy()
-                        z = (1.0 - w_L) * z + w_L * z_lin
-                        linear_blend_applied = True
                         
-                        # HARD hygiene veto must remain absolute after blend
-                        if 'hygiene_ok' in dir() and isinstance(hygiene_ok, np.ndarray):
-                            z = np.where(hygiene_ok, z, 0.0)
+                        # Apply adaptive quality gating
+                        w_L, adaptive_diag = linear_state.compute_adaptive_blend_weight(
+                            base_weight=base_weight,
+                            z_lin=z_lin,
+                            z_mamba=z,
+                            r_squared_threshold=float(cfg.get("linear_r2_threshold", 0.05)),
+                            drift_threshold=float(cfg.get("linear_drift_threshold", 0.15)),
+                            corr_threshold=float(cfg.get("linear_corr_threshold", 0.3)),
+                            sign_disagree_threshold=float(cfg.get("linear_sign_disagree_threshold", 0.4)),
+                            min_stable_updates=int(cfg.get("linear_min_stable_updates", 3)),
+                        )
                         
-                        # EMIT: LINEAR_BLEND_APPLIED
-                        try:
-                            diag = linear_state.get_daily_diagnostics(z_lin, z_before_blend)
-                            event_bus.emit(
-                                date=str(pd.Timestamp(day))[:10],
-                                day_idx=i,
-                                severity=EventSeverity.INFO,
-                                code=EventCode.LINEAR_BLEND_APPLIED,
-                                message=f"Linear blend applied with weight {w_L:.2f}",
-                                payload={
-                                    "weight": float(w_L),
-                                    "blend_type": "linear",
-                                    "corr_z_lin_z_mamba": float(diag.get("corr_z_lin_z_mamba", 0.0)),
-                                    "sign_disagreement": float(diag.get("sign_disagreement_frac", 0.0)),
-                                    "n_updates": int(diag.get("n_updates", 0)),
-                                },
-                            )
-                        except Exception:
-                            pass
+                        if w_L > 1e-6:
+                            z_before_blend = z.copy()
+                            z = (1.0 - w_L) * z + w_L * z_lin
+                            linear_blend_applied = True
+                            
+                            # HARD hygiene veto must remain absolute after blend
+                            if 'hygiene_ok' in dir() and isinstance(hygiene_ok, np.ndarray):
+                                z = np.where(hygiene_ok, z, 0.0)
+                            
+                            # EMIT: LINEAR_BLEND_APPLIED with adaptive diagnostics
+                            try:
+                                diag = linear_state.get_daily_diagnostics(z_lin, z_before_blend)
+                                event_bus.emit(
+                                    date=str(pd.Timestamp(day))[:10],
+                                    day_idx=i,
+                                    severity=EventSeverity.INFO,
+                                    code=EventCode.LINEAR_BLEND_APPLIED,
+                                    message=f"Linear blend: base={base_weight:.2f} adaptive={w_L:.2f}",
+                                    payload={
+                                        "base_weight": float(base_weight),
+                                        "adaptive_weight": float(w_L),
+                                        "blend_type": "linear_adaptive",
+                                        "corr_z_lin_z_mamba": float(diag.get("corr_z_lin_z_mamba", 0.0)),
+                                        "sign_disagreement": float(diag.get("sign_disagreement_frac", 0.0)),
+                                        "n_updates": int(diag.get("n_updates", 0)),
+                                        "quality_penalties": adaptive_diag.get("penalties_applied", []),
+                                        "r_squared": float(adaptive_diag.get("current_r_squared", 0.0)),
+                                        "drift": float(adaptive_diag.get("current_drift", 0.0)),
+                                    },
+                                )
+                            except Exception:
+                                pass
                     # else: linear not ready or w_L=0, fall through to quantile blending
                 except Exception as e:
                     logger.debug("[phase2.linear] Feature build failed: %s; falling back to quantile", e)

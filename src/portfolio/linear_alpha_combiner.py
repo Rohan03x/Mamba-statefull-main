@@ -492,6 +492,13 @@ class LinearCombinerState:
     _n_updates: int = 0
     _prev_beta: Optional[np.ndarray] = None
     
+    # Quality tracking for adaptive blending (rolling window)
+    _r_squared_history: List[float] = field(default_factory=list)
+    _drift_history: List[float] = field(default_factory=list)
+    _corr_history: List[float] = field(default_factory=list)
+    _sign_disagree_history: List[float] = field(default_factory=list)
+    _quality_window: int = 10  # Rolling window for quality metrics
+    
     def __post_init__(self):
         self.model.lambda_ = self.ridge_lambda
     
@@ -647,6 +654,11 @@ class LinearCombinerState:
         if self._prev_beta is not None and self.model.beta_ is not None:
             drift = float(np.linalg.norm(self.model.beta_ - self._prev_beta))
         
+        # Track drift for adaptive blending
+        self._drift_history.append(drift)
+        if len(self._drift_history) > self._quality_window:
+            self._drift_history = self._drift_history[-self._quality_window:]
+        
         # Build report
         report = self.model.get_coefficients_report()
         report.update({
@@ -728,6 +740,130 @@ class LinearCombinerState:
             "is_ready": self.is_ready(),
             "n_updates": self._n_updates,
         }
+    
+    def compute_adaptive_blend_weight(
+        self,
+        base_weight: float,
+        z_lin: np.ndarray,
+        z_mamba: np.ndarray,
+        *,
+        r_squared_threshold: float = 0.05,
+        drift_threshold: float = 0.15,
+        corr_threshold: float = 0.3,
+        sign_disagree_threshold: float = 0.4,
+        min_stable_updates: int = 3,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Compute quality-adaptive blend weight.
+        
+        Down-weights the linear model when:
+        - R² is weak or negative
+        - Coefficient drift spikes
+        - Correlation with Mamba collapses
+        - Sign disagreement is high
+        
+        Args:
+            base_weight: Base blend weight from policy (e.g., quantile_blend_weight_day)
+            z_lin: Linear model predictions
+            z_mamba: Original Mamba z-scores
+            r_squared_threshold: Minimum acceptable R² (below this → down-weight)
+            drift_threshold: Maximum acceptable drift (above this → down-weight)
+            corr_threshold: Minimum acceptable correlation (below this → down-weight)
+            sign_disagree_threshold: Maximum acceptable sign disagreement (above this → down-weight)
+            min_stable_updates: Require N stable updates before trusting linear model
+        
+        Returns:
+            (adaptive_weight, diagnostics_dict)
+        """
+        # Start with base weight
+        w = float(base_weight)
+        diagnostics = {}
+        
+        # If model not ready, return zero weight
+        if not self.is_ready():
+            return 0.0, {"reason": "model_not_ready", "adaptive_weight": 0.0}
+        
+        # Compute current quality metrics
+        diag = self.get_daily_diagnostics(z_lin, z_mamba)
+        current_corr = diag.get("corr_z_lin_z_mamba", 0.0)
+        current_sign_disagree = diag.get("sign_disagreement_frac", 1.0)
+        
+        # Get model R²
+        current_r_squared = float(self.model.r_squared_)
+        
+        # Get recent drift (from last refit)
+        current_drift = self._drift_history[-1] if len(self._drift_history) > 0 else 0.0
+        
+        # Track quality metrics
+        self._r_squared_history.append(current_r_squared)
+        self._corr_history.append(current_corr)
+        self._sign_disagree_history.append(current_sign_disagree)
+        
+        # Trim to window
+        if len(self._r_squared_history) > self._quality_window:
+            self._r_squared_history = self._r_squared_history[-self._quality_window:]
+            self._corr_history = self._corr_history[-self._quality_window:]
+            self._sign_disagree_history = self._sign_disagree_history[-self._quality_window:]
+        
+        # Quality gates (multiplicative penalties)
+        penalties = []
+        reasons = []
+        
+        # 1) R² penalty
+        if current_r_squared < r_squared_threshold:
+            r2_penalty = float(np.clip(current_r_squared / r_squared_threshold, 0.0, 1.0))
+            penalties.append(r2_penalty)
+            reasons.append(f"low_r2={current_r_squared:.3f}")
+            diagnostics["r_squared_penalty"] = r2_penalty
+        
+        # 2) Drift penalty
+        if current_drift > drift_threshold:
+            drift_penalty = float(np.clip(drift_threshold / (current_drift + 1e-8), 0.0, 1.0))
+            penalties.append(drift_penalty)
+            reasons.append(f"high_drift={current_drift:.3f}")
+            diagnostics["drift_penalty"] = drift_penalty
+        
+        # 3) Correlation penalty
+        if current_corr < corr_threshold:
+            corr_penalty = float(np.clip(current_corr / corr_threshold, 0.0, 1.0))
+            penalties.append(corr_penalty)
+            reasons.append(f"low_corr={current_corr:.3f}")
+            diagnostics["corr_penalty"] = corr_penalty
+        
+        # 4) Sign disagreement penalty
+        if current_sign_disagree > sign_disagree_threshold:
+            sign_penalty = float(np.clip((1.0 - current_sign_disagree) / (1.0 - sign_disagree_threshold), 0.0, 1.0))
+            penalties.append(sign_penalty)
+            reasons.append(f"high_sign_disagree={current_sign_disagree:.3f}")
+            diagnostics["sign_disagree_penalty"] = sign_penalty
+        
+        # 5) Stability gate: require min_stable_updates before trusting
+        if self._n_updates < min_stable_updates:
+            stability_mult = float(self._n_updates) / float(min_stable_updates)
+            penalties.append(stability_mult)
+            reasons.append(f"warmup={self._n_updates}/{min_stable_updates}")
+            diagnostics["stability_penalty"] = stability_mult
+        
+        # Apply all penalties multiplicatively
+        if len(penalties) > 0:
+            combined_penalty = float(np.prod(penalties))
+            w = w * combined_penalty
+            diagnostics["combined_penalty"] = combined_penalty
+            diagnostics["penalties_applied"] = reasons
+        
+        # Final clamp
+        w = float(np.clip(w, 0.0, 1.0))
+        
+        diagnostics.update({
+            "base_weight": float(base_weight),
+            "adaptive_weight": w,
+            "current_r_squared": current_r_squared,
+            "current_drift": current_drift,
+            "current_corr": current_corr,
+            "current_sign_disagree": current_sign_disagree,
+            "n_updates": self._n_updates,
+        })
+        
+        return w, diagnostics
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state for persistence.
