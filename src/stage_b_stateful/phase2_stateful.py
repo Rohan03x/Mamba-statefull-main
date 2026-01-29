@@ -4496,6 +4496,8 @@ def evaluate_phase2_stateful_once(
         linear_max_window = int(cfg.get("phase2_linear_max_window", 252))
         linear_min_samples = int(cfg.get("phase2_linear_min_samples", 63))
         linear_blend_max = float(cfg.get("phase2_linear_blend_max", 0.5))
+        linear_time_decay_halflife = int(cfg.get("phase2_linear_time_decay_halflife", 42))
+        linear_confidence_enabled = bool(cfg.get("phase2_linear_confidence_enabled", True))
 
         # Initialize robust optimizer if enabled
         robust_optimizer = None
@@ -4549,6 +4551,7 @@ def evaluate_phase2_stateful_once(
                         window=linear_window,
                         max_window=linear_max_window,
                         min_samples=linear_min_samples,
+                        time_decay_halflife=linear_time_decay_halflife,
                         symbols=syms,
                     )
                     logger.info(
@@ -6834,6 +6837,7 @@ def evaluate_phase2_stateful_once(
                     weight_smoothing_alpha_day = float(action.weight_smoothing_alpha)
                     vol_scaler_day = float(action.vol_scaler)
                     quantile_blend_weight_day = float(action.quantile_blend_weight)
+                    linear_blend_weight_day = float(action.linear_blend_weight)
                     confidence_floor_day = float(action.confidence_floor)
                     # Risk-off leverage schedule (policy-controlled)
                     if np.isfinite(action.max_leverage_schedule) and action.max_leverage_schedule >= 0:
@@ -6911,11 +6915,18 @@ def evaluate_phase2_stateful_once(
                     linear_state.observe_day(i, X_day, sigma_exec)
                     
                     # Compute quality-adaptive blend weight
-                    # Start with policy knob, then apply quality gates
-                    base_weight = float(np.clip(quantile_blend_weight_day, 0.0, linear_blend_max))
+                    # Use separate linear_blend_weight (not quantile_blend_weight)
+                    base_weight = float(np.clip(linear_blend_weight_day, 0.0, linear_blend_max))
                     
                     if linear_state.is_ready() and base_weight > 0:
-                        z_lin = linear_state.predict_z(X_day)
+                        # Predict with confidence scaling
+                        if linear_confidence_enabled:
+                            z_lin, confidence = linear_state.predict_z_with_confidence(
+                                X_day, confidence_scaling=True
+                            )
+                        else:
+                            z_lin = linear_state.predict_z(X_day)
+                            confidence = np.ones(len(z_lin))
                         
                         # Apply adaptive quality gating
                         w_L, adaptive_diag = linear_state.compute_adaptive_blend_weight(
@@ -6931,12 +6942,20 @@ def evaluate_phase2_stateful_once(
                         
                         if w_L > 1e-6:
                             z_before_blend = z.copy()
-                            z = (1.0 - w_L) * z + w_L * z_lin
+                            z = (1.0 - w_L) * z + w_L * z_lin  # z_lin already confidence-scaled
                             linear_blend_applied = True
                             
                             # HARD hygiene veto must remain absolute after blend
                             if 'hygiene_ok' in dir() and isinstance(hygiene_ok, np.ndarray):
                                 z = np.where(hygiene_ok, z, 0.0)
+                            
+                            # Optionally inflate sigma_exec for low-confidence symbols
+                            # This reduces position sizes for uncertain predictions
+                            if linear_confidence_enabled:
+                                # confidence in [0, 1]; inflate sigma when confidence < 1
+                                # sigma_exec_adjusted = sigma_exec / confidence
+                                # (lower confidence → higher sigma → smaller weights)
+                                sigma_exec = sigma_exec / np.clip(confidence, 0.3, 1.0)
                             
                             # EMIT: LINEAR_BLEND_APPLIED with adaptive diagnostics
                             try:
@@ -6946,11 +6965,13 @@ def evaluate_phase2_stateful_once(
                                     day_idx=i,
                                     severity=EventSeverity.INFO,
                                     code=EventCode.LINEAR_BLEND_APPLIED,
-                                    message=f"Linear blend: base={base_weight:.2f} adaptive={w_L:.2f}",
+                                    message=f"Linear blend: base={base_weight:.2f} adaptive={w_L:.2f} conf={float(np.mean(confidence)):.2f}",
                                     payload={
                                         "base_weight": float(base_weight),
                                         "adaptive_weight": float(w_L),
                                         "blend_type": "linear_adaptive",
+                                        "avg_confidence": float(np.mean(confidence)),
+                                        "min_confidence": float(np.min(confidence)),
                                         "corr_z_lin_z_mamba": float(diag.get("corr_z_lin_z_mamba", 0.0)),
                                         "sign_disagreement": float(diag.get("sign_disagreement_frac", 0.0)),
                                         "n_updates": int(diag.get("n_updates", 0)),

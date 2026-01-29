@@ -58,6 +58,10 @@ class PolicyAction:
     # z = (1-w_q)*z_mamba + w_q*z_quantile
     quantile_blend_weight: float = 0.0  # 0 = pure Mamba, 1 = pure quantile
     
+    # === LINEAR META-MODEL BLENDING ===
+    # z = (1-w_L)*z + w_L*z_lin (separate from quantile blending)
+    linear_blend_weight: float = 0.0  # 0 = no linear correction, 1 = full linear
+    
     # === DYNAMIC RISK CONTROLS (v2 NEW) ===
     # Risk-off duration: sessions to stay flat/low after trigger
     risk_off_duration: int = 0

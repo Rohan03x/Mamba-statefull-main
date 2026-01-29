@@ -472,6 +472,8 @@ class LinearCombinerState:
     window: int = 126
     max_window: int = 252
     min_samples: int = 63
+    time_decay_halflife: int = 42  # Days for exponential decay (0 = no decay)
+    confidence_ewma_alpha: float = 0.1  # EWMA smoothing for confidence tracking
     
     # Components
     feature_builder: LinearFeatureBuilder = field(default_factory=LinearFeatureBuilder)
@@ -498,6 +500,11 @@ class LinearCombinerState:
     _corr_history: List[float] = field(default_factory=list)
     _sign_disagree_history: List[float] = field(default_factory=list)
     _quality_window: int = 10  # Rolling window for quality metrics
+    
+    # Confidence tracking (EWMA of per-symbol absolute residuals)
+    # Confidence = 1 / (1 + residual_variance)
+    _residual_ewma: Optional[np.ndarray] = None  # EWMA of |y - y_pred|, shape (n_features,)
+    _n_confidence_updates: int = 0
     
     def __post_init__(self):
         self.model.lambda_ = self.ridge_lambda
@@ -581,6 +588,27 @@ class LinearCombinerState:
         valid_mask = np.isfinite(y_matured) & np.all(np.isfinite(X_matured), axis=1)
         
         if np.sum(valid_mask) > 0:
+            # Update confidence tracking if model is fitted
+            if self.model.beta_ is not None:
+                y_pred = self.model.predict(X_matured[valid_mask])
+                abs_residuals = np.abs(y_matured[valid_mask] - y_pred)
+                
+                # Update EWMA of absolute residuals (per-feature contribution)
+                # We track residual magnitude aggregated over all samples this day
+                if self._residual_ewma is None:
+                    # Initialize with mean absolute residual
+                    self._residual_ewma = np.full(self.model.n_features, float(np.mean(abs_residuals)))
+                else:
+                    # EWMA update: smooth the average residual magnitude
+                    current_residual = float(np.mean(abs_residuals))
+                    # Update all features equally (global confidence measure)
+                    self._residual_ewma = (
+                        self.confidence_ewma_alpha * current_residual +
+                        (1 - self.confidence_ewma_alpha) * self._residual_ewma
+                    )
+                
+                self._n_confidence_updates += 1
+            
             # Add to training buffer (per-sample for rolling window)
             # FIX Gap D: Store day_idx for proper window enforcement
             self._X_train.append(X_matured[valid_mask])
@@ -643,16 +671,28 @@ class LinearCombinerState:
         # Days with more eligible symbols shouldn't get more weight
         # Weight each day equally: w_day = 1 / sqrt(n_samples_in_day)
         # Applied as sqrt(w_day) to X and y before concatenation
+        # 
+        # ENHANCEMENT: Add exponential time-decay for older days within window
+        # More recent days get higher weight for regime responsiveness
         X_weighted = []
         y_weighted = []
         
-        for X_day, y_day, n_day in zip(X_chunks, y_chunks, day_sizes):
-            # Each day gets equal total weight
-            # Multiply each sample by sqrt(1/n_day) so that when squared in ridge,
-            # each day contributes equally
+        for idx, (X_day, y_day, n_day, day_idx) in enumerate(zip(X_chunks, y_chunks, day_sizes, self._day_idx_train[-(len(X_chunks)):])):
+            # Per-day sample normalization (equal contribution per day)
             day_weight = 1.0 / float(np.sqrt(max(n_day, 1)))
-            X_weighted.append(X_day * day_weight)
-            y_weighted.append(y_day * day_weight)
+            
+            # Time-decay: recent days get more weight
+            if self.time_decay_halflife > 0:
+                days_ago = matured_idx - day_idx
+                time_weight = np.exp(-np.log(2) * days_ago / self.time_decay_halflife)
+            else:
+                time_weight = 1.0
+            
+            # Combined weight
+            combined_weight = day_weight * time_weight
+            
+            X_weighted.append(X_day * combined_weight)
+            y_weighted.append(y_day * combined_weight)
         
         # Concatenate weighted training data
         X_all = np.vstack(X_weighted)
@@ -712,6 +752,44 @@ class LinearCombinerState:
             z_lin: Predicted z-scores, shape (n_assets,)
         """
         return self.model.predict(X_day)
+    
+    def predict_z_with_confidence(
+        self,
+        X_day: np.ndarray,
+        confidence_scaling: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Predict z_lin with per-symbol confidence scores.
+        
+        Args:
+            X_day: Feature matrix, shape (n_assets, n_features)
+            confidence_scaling: If True, scale z_lin by confidence
+        
+        Returns:
+            Tuple of:
+                z_lin: Predicted z-scores, shape (n_assets,)
+                confidence: Per-symbol confidence [0, 1], shape (n_assets,)
+        """
+        z_lin = self.model.predict(X_day)
+        
+        # Compute confidence from residual EWMA
+        if self._residual_ewma is not None and self._n_confidence_updates > 3:
+            # Global confidence based on rolling residual variance
+            # Lower residual = higher confidence
+            # confidence = 1 / (1 + avg_residual)
+            avg_residual = float(np.mean(self._residual_ewma))
+            global_confidence = 1.0 / (1.0 + avg_residual)
+            
+            # Broadcast to all symbols (global measure)
+            confidence = np.full(len(z_lin), global_confidence, dtype=float)
+        else:
+            # No confidence data yet - assume neutral
+            confidence = np.ones(len(z_lin), dtype=float)
+        
+        # Apply confidence scaling to predictions
+        if confidence_scaling:
+            z_lin = z_lin * confidence
+        
+        return z_lin, confidence
     
     def is_ready(self) -> bool:
         """Check if model is trained and ready for blending.
@@ -993,6 +1071,7 @@ def create_linear_combiner(
     window: int = 126,
     max_window: int = 252,
     min_samples: int = 63,
+    time_decay_halflife: int = 42,
     symbols: Sequence[str] = (),
 ) -> LinearCombinerState:
     """Factory function to create LinearCombinerState with config.
@@ -1004,6 +1083,7 @@ def create_linear_combiner(
         window: Rolling training window size
         max_window: Maximum samples to retain
         min_samples: Minimum samples before first fit
+        time_decay_halflife: Exponential decay halflife for time weighting (0 = no decay)
         symbols: Symbol list (for feature builder)
     
     Returns:
@@ -1023,6 +1103,7 @@ def create_linear_combiner(
         window=window,
         max_window=max_window,
         min_samples=min_samples,
+        time_decay_halflife=time_decay_halflife,
         feature_builder=feature_builder,
         model=model,
     )
