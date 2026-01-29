@@ -9,6 +9,14 @@ Architecture:
 - RidgeModel: Numpy-only Ridge regression with feature standardization
 - LinearCombinerState: Manages observation buffering, maturity gating, and online updates
 
+DATA SOURCES (All trace to EODHD as primary provider):
+- Price data (ret_1d, ret_5d, ret_21d, rv_21d): EODHD via _fetch_price_data()
+- CBOE VIX features (cboe_panic, cboe_slope, cboe_vrp): EODHD via cboe_term.fetch()
+- Mamba predictions (z_mamba): Trained on prep_families features from EODHD
+- RoleAwareDayContext: Aggregates EODHD-sourced features
+- Enforcement: Set STAGE_B_EODHD_ONLY=1 to disable non-EODHD fallbacks
+- Verification: Run verify_eodhd_data_sources.py to confirm data provenance
+
 Usage in phase2_stateful.py:
     if linear_state is not None:
         X_day = linear_state.feature_builder.build_day(...)

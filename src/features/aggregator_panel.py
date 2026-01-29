@@ -562,8 +562,14 @@ def _fetch_price_data(symbol: str, start: str, end: str) -> Optional[pd.DataFram
     """Helper to fetch real price data for feature generation.
     
     Priority order:
-    1. EODHD (paid API with comprehensive data)
+    1. EODHD (paid API with comprehensive data) - PRIMARY SOURCE
     2. Universal data fetcher (cache + EODHD + FRED fallback)
+    
+    DATA SOURCE VERIFICATION:
+    - Used by: Linear alpha combiner features (ret_1d, ret_5d, ret_21d, rv_21d)
+    - Primary: EODHD provider (requires EODHD_API_KEY)
+    - Enforcement: Set STAGE_B_EODHD_ONLY=1 to reject non-EODHD sources
+    - Verification: Run verify_eodhd_data_sources.py to confirm EODHD usage
     """
     try:
         # Calculate date range with 1 year history for rolling calculations
