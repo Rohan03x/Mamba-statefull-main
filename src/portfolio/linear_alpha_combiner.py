@@ -564,9 +564,18 @@ class LinearCombinerState:
         
         realized_ret = fwd_ret_mat[matured_idx, :]
         
-        # Compute z-space target: y = r / (sigma_exec + eps)
+        # Cross-sectional demean to get alpha residual (removes market beta)
+        # This trains the linear model on idiosyncratic return, not market mode
+        valid_ret_mask = np.isfinite(realized_ret)
+        if np.sum(valid_ret_mask) > 1:
+            ret_mean = float(np.mean(realized_ret[valid_ret_mask]))
+            r_alpha = realized_ret - ret_mean  # Alpha residual
+        else:
+            r_alpha = realized_ret
+        
+        # Compute z-space target: y = r_alpha / (sigma_exec + eps)
         eps = 1e-8
-        y_matured = realized_ret / (sigma_matured + eps)
+        y_matured = r_alpha / (sigma_matured + eps)
         
         # Filter valid samples
         valid_mask = np.isfinite(y_matured) & np.all(np.isfinite(X_matured), axis=1)
@@ -619,17 +628,35 @@ class LinearCombinerState:
         
         X_chunks = []
         y_chunks = []
+        day_sizes = []  # Track samples per day for weighting
+        
         for j in range(len(self._day_idx_train)):
             if self._day_idx_train[j] >= train_cutoff_day:
                 X_chunks.append(self._X_train[j])
                 y_chunks.append(self._y_train[j])
+                day_sizes.append(len(self._y_train[j]))
         
         if len(X_chunks) == 0:
             return {"status": "no_data", "n_samples": 0}
         
-        # Concatenate training data
-        X_all = np.vstack(X_chunks)
-        y_all = np.concatenate(y_chunks)
+        # FIX: Apply per-day weighting to equalize contribution across days
+        # Days with more eligible symbols shouldn't get more weight
+        # Weight each day equally: w_day = 1 / sqrt(n_samples_in_day)
+        # Applied as sqrt(w_day) to X and y before concatenation
+        X_weighted = []
+        y_weighted = []
+        
+        for X_day, y_day, n_day in zip(X_chunks, y_chunks, day_sizes):
+            # Each day gets equal total weight
+            # Multiply each sample by sqrt(1/n_day) so that when squared in ridge,
+            # each day contributes equally
+            day_weight = 1.0 / float(np.sqrt(max(n_day, 1)))
+            X_weighted.append(X_day * day_weight)
+            y_weighted.append(y_day * day_weight)
+        
+        # Concatenate weighted training data
+        X_all = np.vstack(X_weighted)
+        y_all = np.concatenate(y_weighted)
         
         n_samples = len(y_all)
         
