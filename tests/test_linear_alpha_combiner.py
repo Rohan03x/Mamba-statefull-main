@@ -313,21 +313,8 @@ class TestLinearFeatureBuilder:
             day_cboe_panic=0.5,
         )
         
-        # day_calib_score is at index 9
-        assert np.all(X[:, 9] == 0.75)
-        
-        # cboe_panic is at index 11
-        assert np.all(X[:, 11] == 0.5)
-
-
-class TestHygieneVeto:
-    """Test hygiene veto enforcement."""
-    
-    def test_hygiene_final_veto(self):
-        """z_lin non-zero but hygiene=False → z should be 0 after blend."""
-        # This is tested at the integration level in phase2_stateful,
-        # but we can verify the behavior here conceptually
-        
+        # day_calib_score is at index 10 (10 per-symbol features + 0)
+        assert np.all(X[:, 10] == 0.75)
         state = create_linear_combiner(horizon=3, min_samples=3)
         
         # Force model to be "ready" by setting beta

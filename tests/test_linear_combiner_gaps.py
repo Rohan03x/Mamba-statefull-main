@@ -88,7 +88,7 @@ class TestGapC_CorrHHI:
         """Verify linear feature builder accepts and uses corr_hhi parameter."""
         builder = LinearFeatureBuilder()
         n_assets = 10
-        
+
         # Build features with corr_hhi = 0.0 (low concentration)
         X_low = builder.build_day(
             i=100,
@@ -97,7 +97,7 @@ class TestGapC_CorrHHI:
             sigma_exec=np.ones(n_assets) * 0.02,
             corr_hhi=0.0,
         )
-        
+
         # Build features with corr_hhi = 0.8 (high concentration)
         X_high = builder.build_day(
             i=100,
@@ -106,12 +106,13 @@ class TestGapC_CorrHHI:
             sigma_exec=np.ones(n_assets) * 0.02,
             corr_hhi=0.8,
         )
-        
-        # Feature index 16 is corr_hhi
-        assert X_low.shape == (n_assets, 19), "19 features total"
-        assert np.allclose(X_low[:, 16], 0.0), "corr_hhi=0.0 should be stored"
-        assert np.allclose(X_high[:, 16], 0.8), "corr_hhi=0.8 should be stored"
-        assert not np.allclose(X_low[:, 16], X_high[:, 16]), "Different corr_hhi values"
+
+        # N_FEATURES = 20 (10 per-symbol + 10 global)
+        assert X_low.shape == (n_assets, 20), "20 features total"
+        # corr_hhi is at index 17 (10 per-symbol + 7 global features before it)
+        assert np.allclose(X_low[:, 17], 0.0), "corr_hhi=0.0 should be stored"
+        assert np.allclose(X_high[:, 17], 0.8), "corr_hhi=0.8 should be stored"
+        assert not np.allclose(X_low[:, 17], X_high[:, 17]), "Different corr_hhi values"
 
 
 class TestGapD_BufferPersistence:
@@ -122,7 +123,7 @@ class TestGapD_BufferPersistence:
         state = create_linear_combiner(horizon=21, window=126, max_window=252)
         
         n_assets = 5
-        n_features = 19
+        n_features = 20  # Updated: 10 per-symbol + 10 global
         
         # Observe several days
         for i in range(10):
@@ -343,7 +344,8 @@ class TestIntegration:
             state.observe_day(i, X_day, sigma_day)
             
             # Check corr_hhi was stored in features
-            assert np.allclose(X_day[:, 16], corr_hhi_val), f"Day {i}: corr_hhi should be {corr_hhi_val}"
+            # corr_hhi is at index 17 (10 per-symbol + 7 global features before it)
+            assert np.allclose(X_day[:, 17], corr_hhi_val), f"Day {i}: corr_hhi should be {corr_hhi_val}"
         
         # Process matured observations
         fwd_ret_mat = np.random.randn(150, n_assets) * 0.01

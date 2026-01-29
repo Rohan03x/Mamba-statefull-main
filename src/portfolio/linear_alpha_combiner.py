@@ -56,8 +56,37 @@ FEATURE_NAMES_GLOBAL = [
     "cost_prev",         # Previous day cost
 ]
 
+# NEW: Interaction features for capturing non-linear relationships
+FEATURE_NAMES_INTERACTIONS = [
+    "z_mamba_x_rv",      # z_mamba * rv_21d (volatility-conditional signal)
+    "z_mamba_x_regime",  # z_mamba * regime_multiplier (regime-conditional)
+    "z_mamba_squared",   # z_mamba^2 (non-linear signal strength)
+    "ret_1d_x_rv",       # ret_1d * rv_21d (momentum-volatility interaction)
+    "regime_x_panic",    # regime_multiplier * cboe_panic (risk-off interaction)
+]
+
+# NEW: Sector indicators (if sector_map provided)
+FEATURE_NAMES_SECTORS = [
+    "sector_tech",       # Technology sector indicator
+    "sector_finance",    # Financial sector indicator
+    "sector_healthcare", # Healthcare sector indicator
+    "sector_consumer",   # Consumer sector indicator
+    "sector_industrial", # Industrial sector indicator
+    "sector_energy",     # Energy sector indicator
+    "sector_other",      # Other sectors
+]
+
 ALL_FEATURE_NAMES = FEATURE_NAMES_PER_SYMBOL + FEATURE_NAMES_GLOBAL
 N_FEATURES = len(ALL_FEATURE_NAMES)
+
+# Extended features (optional, enabled via config)
+ALL_FEATURE_NAMES_EXTENDED = (
+    FEATURE_NAMES_PER_SYMBOL + 
+    FEATURE_NAMES_GLOBAL + 
+    FEATURE_NAMES_INTERACTIONS +
+    FEATURE_NAMES_SECTORS
+)
+N_FEATURES_EXTENDED = len(ALL_FEATURE_NAMES_EXTENDED)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -152,11 +181,20 @@ class LinearFeatureBuilder:
     Features are split into per-symbol (varying across assets) and global
     (same for all assets, broadcast). All features use only past information
     to avoid lookahead bias.
+    
+    NEW: Optional extended features for non-linear modeling:
+    - Interaction terms (z_mamba * volatility, regime interactions)
+    - Sector indicators (one-hot encoding by sector)
     """
     
     symbols: List[str] = field(default_factory=list)
     n_features: int = N_FEATURES
     feature_names: List[str] = field(default_factory=lambda: list(ALL_FEATURE_NAMES))
+    
+    # NEW: Extended features config
+    use_interactions: bool = False  # Enable interaction terms
+    use_sectors: bool = False        # Enable sector indicators
+    sector_map: Optional[Dict[str, str]] = None  # Symbol -> sector mapping
     
     def build_day(
         self,
@@ -200,7 +238,8 @@ class LinearFeatureBuilder:
             X_day: Feature matrix, shape (n_assets, n_features)
         """
         n_assets = len(syms)
-        X = np.zeros((n_assets, self.n_features), dtype=float)
+        # Always start with base features, then extend if needed
+        X = np.zeros((n_assets, N_FEATURES), dtype=float)
         
         # === Per-symbol features ===
         
@@ -299,7 +338,107 @@ class LinearFeatureBuilder:
         if costs is not None and i > 0:
             X[:, 19] = _safe_float(costs[i - 1], 0.0)
         
+        # === Extended features (if enabled) ===
+        if self.use_interactions or self.use_sectors:
+            X_extended = self._build_extended_features(
+                X=X,
+                n_assets=n_assets,
+                syms=syms,
+            )
+            return X_extended
+        
         return X
+    
+    def _build_extended_features(
+        self,
+        X: np.ndarray,
+        n_assets: int,
+        syms: Sequence[str],
+    ) -> np.ndarray:
+        """Build extended feature matrix with interactions and sectors.
+        
+        Args:
+            X: Base feature matrix, shape (n_assets, N_FEATURES)
+            n_assets: Number of assets
+            syms: Symbol list
+        
+        Returns:
+            X_extended: Extended matrix, shape (n_assets, N_FEATURES_EXTENDED)
+        """
+        feature_list = [X]  # Start with base features
+        
+        # === Interaction features ===
+        if self.use_interactions:
+            X_interact = np.zeros((n_assets, len(FEATURE_NAMES_INTERACTIONS)), dtype=float)
+            
+            # z_mamba_x_rv: z_mamba * rv_21d
+            X_interact[:, 0] = X[:, 0] * X[:, 8]
+            
+            # z_mamba_x_regime: z_mamba * regime_multiplier
+            X_interact[:, 1] = X[:, 0] * X[:, 3]
+            
+            # z_mamba_squared: z_mamba^2 (non-linear)
+            X_interact[:, 2] = X[:, 0] ** 2
+            
+            # ret_1d_x_rv: ret_1d * rv_21d
+            X_interact[:, 3] = X[:, 5] * X[:, 8]
+            
+            # regime_x_panic: regime_multiplier * cboe_panic
+            X_interact[:, 4] = X[:, 3] * X[:, 12]
+            
+            feature_list.append(X_interact)
+        
+        # === Sector indicators ===
+        if self.use_sectors and self.sector_map is not None:
+            X_sector = np.zeros((n_assets, len(FEATURE_NAMES_SECTORS)), dtype=float)
+            
+            sector_indices = {
+                "Technology": 0,
+                "Financial Services": 1,
+                "Healthcare": 2,
+                "Consumer": 3,  # Consumer Cyclical + Defensive
+                "Industrials": 4,
+                "Energy": 5,
+            }
+            
+            for i, sym in enumerate(syms):
+                sector = self.sector_map.get(sym, "Other")
+                
+                # Map to simplified sectors
+                if "Technology" in sector:
+                    X_sector[i, 0] = 1.0
+                elif "Financial" in sector:
+                    X_sector[i, 1] = 1.0
+                elif "Healthcare" in sector:
+                    X_sector[i, 2] = 1.0
+                elif "Consumer" in sector:
+                    X_sector[i, 3] = 1.0
+                elif "Industrial" in sector:
+                    X_sector[i, 4] = 1.0
+                elif "Energy" in sector:
+                    X_sector[i, 5] = 1.0
+                else:
+                    X_sector[i, 6] = 1.0  # Other
+            
+            feature_list.append(X_sector)
+        
+        # Concatenate all feature groups
+        X_extended = np.hstack(feature_list)
+        
+        return X_extended
+
+    def __post_init__(self):
+        """Update feature count and names if extended features are enabled."""
+        if self.use_interactions or self.use_sectors:
+            self.feature_names = list(FEATURE_NAMES_PER_SYMBOL + FEATURE_NAMES_GLOBAL)
+            
+            if self.use_interactions:
+                self.feature_names.extend(FEATURE_NAMES_INTERACTIONS)
+            
+            if self.use_sectors:
+                self.feature_names.extend(FEATURE_NAMES_SECTORS)
+            
+            self.n_features = len(self.feature_names)
 
 
 @dataclass
@@ -1072,6 +1211,9 @@ def create_linear_combiner(
     max_window: int = 252,
     min_samples: int = 63,
     time_decay_halflife: int = 42,
+    use_interactions: bool = False,
+    use_sectors: bool = False,
+    sector_map: Optional[Dict[str, str]] = None,
     symbols: Sequence[str] = (),
 ) -> LinearCombinerState:
     """Factory function to create LinearCombinerState with config.
@@ -1084,15 +1226,24 @@ def create_linear_combiner(
         max_window: Maximum samples to retain
         min_samples: Minimum samples before first fit
         time_decay_halflife: Exponential decay halflife for time weighting (0 = no decay)
+        use_interactions: Enable interaction features (z_mamba * volatility, etc.)
+        use_sectors: Enable sector indicator features
+        sector_map: Symbol -> sector mapping (required if use_sectors=True)
         symbols: Symbol list (for feature builder)
     
     Returns:
         Configured LinearCombinerState
     """
-    feature_builder = LinearFeatureBuilder(symbols=list(symbols))
+    feature_builder = LinearFeatureBuilder(
+        symbols=list(symbols),
+        use_interactions=use_interactions,
+        use_sectors=use_sectors,
+        sector_map=sector_map,
+    )
     
+    # n_features is updated in __post_init__ based on enabled features
     model = RidgeModel(
-        n_features=N_FEATURES,
+        n_features=feature_builder.n_features,
         lambda_=ridge_lambda,
     )
     
