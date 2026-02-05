@@ -86,6 +86,8 @@ LEGACY_LOCAL_CACHE_DIR = REPO_ROOT / "data" / "local_cache"
 LEGACY_EODHD_CACHE_DIR = REPO_ROOT / "data" / "cache" / "eodhd"
 LEGACY_GDELT_CACHE_DIR = REPO_ROOT / "data" / "cache" / "gdelt"
 LEGACY_GDELT_GLOBAL_CACHE_DIR = REPO_ROOT / "data" / "cache" / "gdelt_global"
+# Primary GDELT global cache location (cache/gdelt_global/merged/)
+PRIMARY_GDELT_GLOBAL_CACHE_DIR = CACHE_ROOT / "gdelt_global"
 LEGACY_UNIVERSE_CACHE_DIR = REPO_ROOT / "data" / "cache" / "universe"
 LEGACY_SHORT_INTEREST_CACHE_DIR = REPO_ROOT / "data" / "short_interest_cache"
 
@@ -125,7 +127,22 @@ def gdelt_events_dir(date_str: str) -> Path:
 
 
 def gdelt_global_merged_dir() -> Path:
-    """Return path to GDELT global merged cache."""
+    """Return path to GDELT global merged cache.
+    
+    Checks paths in order:
+    1. cache/gdelt_global/merged/ (primary)
+    2. data/cache/gdelt_global/merged/ (legacy)
+    3. cache/data_sources/gdelt_global/merged/ (fallback)
+    """
+    # Check primary location first
+    primary = PRIMARY_GDELT_GLOBAL_CACHE_DIR / "merged"
+    if primary.exists():
+        return primary
+    # Check legacy location
+    legacy = LEGACY_GDELT_GLOBAL_CACHE_DIR / "merged"
+    if legacy.exists():
+        return legacy
+    # Default to data_sources location
     return GDELT_GLOBAL_CACHE_ROOT / "merged"
 
 
@@ -246,6 +263,33 @@ def family_features_cache_path(symbol: str, horizon: int, family: str, split: st
 # Shared cache paths (symbol-invariant, used across ALL symbols)
 # -----------------------------------------------------------------------------
 
+# HF inference and external data caches (shared or per-symbol)
+EARNINGS_TRANSCRIPTS_CACHE_ROOT = SHARED_CACHE_ROOT / "earnings_transcripts"
+HF_TRANSCRIPT_INFERENCE_CACHE_ROOT = SHARED_CACHE_ROOT / "hf_transcript_inference"
+GOOGLE_TRENDS_CACHE_ROOT = SHARED_CACHE_ROOT / "google_trends"
+MACRO_PANEL_CACHE_ROOT = SHARED_CACHE_ROOT / "macro_panel"
+
+
+def earnings_transcripts_dir(symbol: str) -> Path:
+    """Return the path to earnings transcripts cache for a symbol."""
+    return EARNINGS_TRANSCRIPTS_CACHE_ROOT / symbol.upper()
+
+
+def hf_transcript_inference_dir(symbol: str) -> Path:
+    """Return the path to HF transcript inference cache for a symbol."""
+    return HF_TRANSCRIPT_INFERENCE_CACHE_ROOT / symbol.upper()
+
+
+def google_trends_cache_path(symbol: str) -> Path:
+    """Return the path to Google Trends cache for a symbol."""
+    return GOOGLE_TRENDS_CACHE_ROOT / f"{symbol.upper()}.json"
+
+
+def macro_panel_cache_path(symbol: str) -> Path:
+    """Return the path to macro panel features parquet for a symbol."""
+    return MACRO_PANEL_CACHE_ROOT / f"macro_features_{symbol.upper()}.parquet"
+
+
 def doc_embedding_shared_path() -> Path:
     """Return the path to the shared doc_embedding_novelty_hf parquet.
     
@@ -260,6 +304,65 @@ def shared_hf_block_path(hf_block: str) -> Path:
     Use this for blocks like doc_embedding_novelty_hf that don't depend on symbol.
     """
     return SHARED_CACHE_ROOT / hf_block / f"{hf_block}.parquet"
+
+
+# -----------------------------------------------------------------------------
+# HF Block Merged Parquet Paths (Phase-2 intermediate outputs)
+# -----------------------------------------------------------------------------
+# HF blocks are model outputs (meta-opinions), NOT features.
+# They live in a SEPARATE parquet from mamba/portfolio streams.
+# Phase-2 loads these AFTER Mamba inference to modulate exposure.
+#
+# Architecture:
+#   1. Load base family parquets
+#   2. Run Mamba → z_mamba(t)
+#   3. Load HF block parquets  ← HERE
+#   4. Compute stateful confidence & stress
+#   5. Produce final signal package
+#   6. Hand off to portfolio engine
+
+def symbol_hf_merged_dir(symbol: str) -> Path:
+    """Return the HF merged directory for a symbol.
+    
+    This is where all HF block outputs are merged for Phase-2 consumption.
+    Separate from mamba/portfolio parquets.
+    """
+    return symbol_cache_dir(symbol) / "hf_merged"
+
+
+def symbol_hf_merged_path(symbol: str, horizon: int) -> Path:
+    """Return the path to the HF merged parquet for Phase-2.
+    
+    This single parquet contains all HF block outputs merged together.
+    Schema: {hf_block}_score, {hf_block}_conf for each HF block.
+    
+    NOT the same as mamba/portfolio streams - those go through feature_roles.py.
+    HF blocks are model outputs handled directly by Phase-2.
+    """
+    return symbol_hf_merged_dir(symbol) / f"{symbol.upper()}_h{horizon}_hf_merged.parquet"
+
+
+def symbol_hf_merged_meta_path(symbol: str, horizon: int) -> Path:
+    """Return the path to the HF merged metadata JSON."""
+    return symbol_hf_merged_dir(symbol) / f"{symbol.upper()}_h{horizon}_hf_merged.meta.json"
+
+
+# Individual HF block paths (per-symbol, horizon-invariant)
+def hf_block_path(symbol: str, hf_block: str) -> Path:
+    """Return the path to an individual HF block cache parquet.
+    
+    Use symbol_hf_dir() for horizon-invariant HF blocks.
+    """
+    return symbol_hf_dir(symbol) / f"{hf_block}.parquet"
+
+
+# Individual HF block paths (per-symbol, horizon-specific)
+def hf_block_horizon_path(symbol: str, horizon: int, hf_block: str) -> Path:
+    """Return the path to a horizon-specific HF block cache parquet.
+    
+    Use this for HF blocks like forecast_hf that depend on horizon.
+    """
+    return symbol_horizon_dir(symbol, horizon) / f"{hf_block}.parquet"
 
 
 # -----------------------------------------------------------------------------
@@ -378,7 +481,11 @@ def resolve_gdelt_cache_dir() -> Path:
 
 
 def resolve_gdelt_global_cache_dir() -> Path:
-    """Return the GDELT global cache directory, checking legacy first."""
+    """Return the GDELT global cache directory, checking primary and legacy paths."""
+    # Primary location: cache/gdelt_global/
+    if PRIMARY_GDELT_GLOBAL_CACHE_DIR.exists():
+        return PRIMARY_GDELT_GLOBAL_CACHE_DIR
+    # Legacy location: data/cache/gdelt_global/
     if LEGACY_GDELT_GLOBAL_CACHE_DIR.exists():
         return LEGACY_GDELT_GLOBAL_CACHE_DIR
     return GDELT_GLOBAL_CACHE_ROOT

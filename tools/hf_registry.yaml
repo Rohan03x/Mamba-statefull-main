@@ -78,6 +78,97 @@ generators:
       batch_size: 32
       lookback_days: 30
       similarity_threshold: 0.7
+  
+  # Twitter/X Sentiment and Attention (twikit)
+  twitter_twikit_hf:
+    generator: "tools.hf_generators.twitter_twikit"
+    description: "Twitter/X 3-channel sentiment, attention, and novelty using Reddit/YARS (NO AUTH) + FinBERT"
+    enabled: false  # DISABLED - Too many API calls needed for historical data
+    default_raw_source_cfg:
+      twikit_cache_dir: "data/cache/twitter_twikit"
+      max_tweets_per_day: 200
+      lookback_days: 30
+      
+      # THREE-CHANNEL ARCHITECTURE
+      channels:
+        cashtag:
+          enabled: true
+          query_template: "${SYMBOL}"  # e.g., $AAPL
+          product: "Latest"
+          max_results: 100
+        
+        name_intent:
+          enabled: true
+          query_template: "${COMPANY_NAME} (stock OR earnings OR guidance OR $${SYMBOL})"
+          product: "Latest"
+          max_results: 100
+          # Only enable if quality filters are strong
+        
+        curated_accounts:
+          enabled: true
+          # List of official IR, news wires, sector analysts per symbol
+          # To be populated in per-symbol configs or dynamic lookup
+          account_list: []  # Empty for now, populate during implementation
+          tweet_type: "Tweets"
+      
+      # SAMPLING RULES (prevent engagement bias)
+      sampling:
+        max_per_author: 3  # Cap per author per day
+        split_strategy: "balanced"  # 50% top-engagement, 50% random
+        include_retweets: false  # Treat as amplification signal only
+        include_replies: false  # Usually noisy
+        include_quotes: true  # Quote-tweets are informative
+      
+      # QUALITY FILTERS
+      quality_filters:
+        # User-level credibility
+        min_followers: 100
+        min_account_age_days: 30
+        max_posts_per_day: 100  # Flag extreme posting rates
+        use_verified_weight: true  # Weight by verified/blue_verified
+        
+        # Text-level spam filters
+        deduplication_threshold: 0.95  # Text similarity threshold
+        spam_keywords: ["giveaway", "airdrop", "promo", "contest", "win", "free"]
+        max_hashtags: 5
+        max_links: 3
+        
+        # Language filter
+        language: "en"  # Start with English only
+    
+    default_compute_cfg:
+      # Sentiment (FinBERT)
+      sentiment_model: "yiyanghkust/finbert-tone"
+      sentiment_batch_size: 32
+      sent_neg_threshold: -0.1  # For sent_neg_frac
+      sent_pos_threshold: 0.1   # For sent_pos_frac
+      neg_tail_threshold: -0.5  # For neg_tail_frac (extreme negative)
+      
+      # Novelty (sentence-transformers)
+      embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+      novelty_window_days: 7
+      
+      # Topics (keyword matching)
+      topic_keywords:
+        earnings: ["earnings", "revenue", "profit", "EPS", "guidance", "forecast"]
+        lawsuit: ["lawsuit", "litigation", "SEC", "settlement", "investigation", "fine"]
+        guidance: ["outlook", "guidance", "forecast", "expects", "targeting", "projections"]
+      
+      # Portfolio overlays (regime-aware risk throttles)
+      event_risk:
+        use_sigmoid: true
+        attention_z_multiplier: 1.0
+      
+      panic:
+        attention_z_threshold: 2.0
+        sent_mean_threshold: -0.2
+        sent_std_weight: 1.0
+      
+      sent_regime:
+        risk_off_sent_threshold: -0.15
+        risk_off_neg_frac_threshold: 0.4
+        risk_on_sent_threshold: 0.15
+        risk_on_pos_frac_threshold: 0.4
     
   # Macroeconomic Text Signals Transformer
   macro_tst_hf:
@@ -98,9 +189,13 @@ generators:
       use_gpu: true  # Enable GPU acceleration for transformer models
 
   # HF Blocks (composite generators built from cached base families)
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ACTIVE HF Blocks - proven signal-to-noise
+  # ═══════════════════════════════════════════════════════════════════════════
   tech_micro_hf:
     generator: "tools.hf_generators.tech_micro_hf"
     description: "Technical + microstructure HF block leveraging cached ml/micro/correlation families"
+    enabled: true
     default_raw_source_cfg:
       cache_dir: null  # fallback to prep_families cache root
     default_compute_cfg:
@@ -110,15 +205,50 @@ generators:
   forecast_hf:
     generator: "tools.hf_generators.forecast_hf"
     description: "Forecast ensemble HF block combining quantile/calibration/ARIMA/TFT caches"
+    enabled: true
     default_raw_source_cfg:
       cache_dir: null
     default_compute_cfg:
       view: "both"
       materialize_block_cache: true
 
+  event_risk_hf:
+    generator: "tools.hf_generators.event_risk_hf"
+    description: "Event risk management for Portfolio parquet - explicit earnings/macro event flags"
+    enabled: true
+    default_raw_source_cfg:
+      cache_dir: null  # Falls back to prep_families cache root
+    default_compute_cfg:
+      materialize_block_cache: true
+    features:
+      # Binary flags (0/1)
+      - event_risk_hf_earnings_next_1d
+      - event_risk_hf_earnings_next_3d
+      - event_risk_hf_macro_next_1d
+      # Continuous scores (0..1)
+      - event_risk_hf_earnings_imminent
+      - event_risk_hf_macro_imminent
+      - event_risk_hf_score
+    routing:
+      all_columns: "portfolio_only"  # All columns → RISK role → Portfolio parquet ONLY
+      role: "risk"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DISABLED HF Blocks - noise/redundancy/sparsity concerns
+  # ═══════════════════════════════════════════════════════════════════════════
+  # These blocks are disabled for the following reasons:
+  #   - vol_deriv_hf        : Duplicates portfolio risk module
+  #   - macro_regime_hf     : Macro data is low-frequency, ≠ sequence learning
+  #   - fundamental_val_hf  : Low frequency, sparse updates (quarterly)
+  #   - news_nlp_hf         : Noise amplification, sentiment already in base families
+  #
+  # This restraint is what real hedge funds do: fewer signals, higher conviction.
+  # ═══════════════════════════════════════════════════════════════════════════
+
   vol_deriv_hf:
     generator: "tools.hf_generators.vol_deriv_hf"
-    description: "Volatility + derivatives HF block using garch/cboe/options caches"
+    description: "DISABLED - Duplicates portfolio risk module"
+    enabled: false  # Duplicates portfolio risk
     default_raw_source_cfg:
       cache_dir: null
     default_compute_cfg:
@@ -127,7 +257,8 @@ generators:
 
   macro_regime_hf:
     generator: "tools.hf_generators.macro_regime_hf"
-    description: "Macro regime HF block combining macro_tst/regime/multiasset/cross_asset caches"
+    description: "DISABLED - Macro data is low-frequency, not suited for sequence learning"
+    enabled: false  # Macro ≠ sequence learning
     default_raw_source_cfg:
       cache_dir: null
     default_compute_cfg:
@@ -136,7 +267,8 @@ generators:
 
   fundamental_val_hf:
     generator: "tools.hf_generators.fundamental_val_hf"
-    description: "Fundamental valuation HF block aggregating fin_g/earnings/dividends caches"
+    description: "DISABLED - Low frequency, sparse updates (quarterly)"
+    enabled: false  # Low frequency, sparse
     default_raw_source_cfg:
       cache_dir: null
     default_compute_cfg:
@@ -145,7 +277,8 @@ generators:
 
   news_nlp_hf:
     generator: "tools.hf_generators.news_nlp_hf"
-    description: "News/NLP HF block using finbert, transcript, news_sentiment_HF caches"
+    description: "DISABLED - Noise amplification, sentiment already in base families"
+    enabled: false  # Noise amplification
     default_raw_source_cfg:
       cache_dir: null
     default_compute_cfg:

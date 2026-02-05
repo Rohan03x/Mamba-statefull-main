@@ -235,6 +235,19 @@ class BacktestEngine:
         overlap = bool(strategy_cfg.get("overlap", True))
         sigma_floor = float(strategy_cfg.get("sigma_floor", 0.02))
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # VOL_SCALER → POSITION CAP: Minimal wiring for risk-aware sizing
+        # vol_scaler ∈ [0.0, 1.0] acts as a multiplicative cap on max_exposure.
+        # When vol_scaler is low (high vol regime), positions are scaled down.
+        # This is a bridge until Workstream 7 (robust optimization) is complete.
+        # ═══════════════════════════════════════════════════════════════════════════════
+        vol_scaler_cap = strategy_cfg.get("vol_scaler_position_cap")
+        if vol_scaler_cap is not None:
+            # Clamp to [0.1, 1.0] to prevent division by zero / too small positions
+            effective_cap = float(np.clip(vol_scaler_cap, 0.1, 1.0))
+            max_exposure = max_exposure * effective_cap
+            leverage = min(leverage, max_exposure)
+
         mu = df.get("mu_hat", pd.Series(index=df.index, data=0.0)).astype(float)
         sigma = df.get("sigma_hat", pd.Series(index=df.index, data=sigma_floor)).astype(float)
         sigma = sigma.replace(0.0, np.nan).fillna(sigma_floor)

@@ -31,6 +31,27 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class RoleAwareDayContext:
+    """
+    Point-in-time context for role-aware portfolio overlays.
+    
+    IMPORTANT ARCHITECTURAL NOTE:
+    ────────────────────────────────────────────────────────────────────────────
+    calibration_overall_score and online_trust_score are now SECONDARY sources.
+    
+    The AUTHORITATIVE calibration for learning decisions is the Mamba-based
+    MambaCalibrationTracker in src/stage_b_stateful/mamba_calibration.py, which
+    tracks Mamba (μ, σ²) predictions vs realized returns at RUNTIME.
+    
+    The values in this context come from quantile-based family parquets and are
+    used ONLY as:
+    1. Warm-up fallback before Mamba tracker has enough observations
+    2. Secondary diagnostic (20-30% weight) blended into Mamba calibration
+    
+    Hierarchy:
+    - PRIMARY (70-80%): Mamba (μ, σ²) vs realized returns (phase2_stateful.py)
+    - SECONDARY (20-30%): Quantile forecasts (this context, from prep_families)
+    ────────────────────────────────────────────────────────────────────────────
+    """
     symbols: List[str]
     hygiene_ok: np.ndarray  # shape (n_assets,) bool
     risk_scale: np.ndarray  # shape (n_assets,) float in (0,1]
@@ -39,12 +60,23 @@ class RoleAwareDayContext:
     quantile_z: np.ndarray  # shape (n_assets,) float, z_q = mu_q / sigma_q
     # Split stress for execution discipline: max(flag, post_5d, post_20d) * abs(log_ratio)
     split_stress: np.ndarray  # shape (n_assets,) float in [0, ~2]
+    # Event risk features for explicit, controllable risk management
+    event_risk_earnings_next_1d: np.ndarray  # shape (n_assets,) 0/1 flag
+    event_risk_earnings_next_3d: np.ndarray  # shape (n_assets,) 0/1 flag
+    event_risk_macro_next_1d: float = 0.0  # global scalar 0/1 flag
+    event_risk_score: np.ndarray = None  # shape (n_assets,) 0..1 composite
     # Policy controller state features from portfolio families
     cboe_panic_premium: float = 0.0
     cboe_term_slope: float = 0.0
     cboe_vol_risk_premium_z: float = 0.0
-    calibration_overall_score: float = 1.0
-    online_trust_score: float = 1.0
+    # SECONDARY calibration sources (see docstring above)
+    calibration_overall_score: float = 1.0  # Quantile-based, secondary fallback
+    online_trust_score: float = 1.0  # Quantile-based, secondary fallback
+    
+    def __post_init__(self) -> None:
+        """Initialize event_risk_score if not provided."""
+        if self.event_risk_score is None:
+            object.__setattr__(self, 'event_risk_score', np.zeros(len(self.symbols), dtype=float))
 
 
 def _safe_bool(v: object) -> bool:
@@ -153,6 +185,9 @@ class RoleAwareContext:
         # Corp actions splits columns for split_stress computation
         self._splits_cols: Dict[str, List[str]] = {}  # flag, post_5d, post_20d, log_ratio, recency
 
+        # Event risk columns (from event_risk_hf family)
+        self._event_risk_cols: Dict[str, List[str]] = {}  # earnings_next_1d, macro_next_1d, score, etc.
+
         # Column → family mapping for per-family staleness thresholds
         self._col_family: Dict[str, Dict[str, str]] = {}
 
@@ -193,25 +228,62 @@ class RoleAwareContext:
         usages, reasons = infer_allowed_usages_with_reasons(feature_role=fr, family_meta=fam_meta)
         return usages, reasons
 
+    def _parse_date_column_to_int(self, date_col: pd.Series) -> pd.Series:
+        """Parse a date column to YYYYMMDD integer format."""
+        try:
+            is_dt = pd.api.types.is_datetime64_any_dtype(date_col)
+        except Exception:
+            is_dt = False
+
+        if is_dt:
+            dt = pd.to_datetime(date_col, errors="coerce")
+            return dt.dt.strftime("%Y%m%d").fillna("-1").astype(int)
+        else:
+            date_num = pd.to_numeric(date_col, errors="coerce")
+            # Heuristic: YYYYMMDD ints live around 2e7; nanosecond epochs are ~1e18.
+            if date_num.notna().any() and float(date_num.dropna().median()) < 1e10:
+                return date_num.fillna(-1).astype(int)
+            else:
+                dt = pd.to_datetime(date_col, errors="coerce")
+                return dt.dt.strftime("%Y%m%d").fillna("-1").astype(int)
+
     def _load_all(self) -> None:
         for sym in self.symbols:
             h = int(self.horizon)
 
+            # Support both flat (parquet_dir/AAPL_h63_...) and per-symbol subdirectory
+            # (parquet_dir/AAPL/AAPL_h63_...) layouts. The merged folder uses subdirectories.
+            sym_subdir = self.parquet_dir / sym.upper()
+            sym_subdir_lower = self.parquet_dir / sym.lower()
+
             # Be permissive about symbol casing (workspace has mixed conventions).
             # Try new .meta.json format first, then legacy .provenance.json
+            # Check both flat and per-symbol subdirectory layouts.
             prov_path = _first_existing(
                 [
+                    # Per-symbol subdirectory (cache/merged/AAPL/AAPL_h63_merged.meta.json)
+                    sym_subdir / f"{sym}_h{h}_merged.meta.json",
+                    sym_subdir / f"{sym.upper()}_h{h}_merged.meta.json",
+                    sym_subdir_lower / f"{sym.lower()}_h{h}_merged.meta.json",
+                    # Flat layout (cache/features/AAPL_h63_merged.meta.json)
                     self.parquet_dir / f"{sym}_h{h}_merged.meta.json",
                     self.parquet_dir / f"{sym.lower()}_h{h}_merged.meta.json",
                     # Legacy paths for backward compatibility
+                    sym_subdir / f"{sym}_h{h}_merged.provenance.json",
                     self.parquet_dir / f"{sym}_h{h}_merged.provenance.json",
                     self.parquet_dir / f"{sym.lower()}_h{h}_merged.provenance.json",
                 ]
             )
 
             # There are multiple filename conventions in this workspace; be permissive.
+            # Check both flat and per-symbol subdirectory layouts.
             index_path = _first_existing(
                 [
+                    # Per-symbol subdirectory
+                    sym_subdir / f"{sym}_{h}_index.parquet",
+                    sym_subdir / f"{sym}_h{h}_index.parquet",
+                    sym_subdir / f"{sym}_h{h}__index.parquet",
+                    # Flat layout
                     self.parquet_dir / f"{sym}_{h}_index.parquet",
                     self.parquet_dir / f"{sym}_h{h}_index.parquet",
                     self.parquet_dir / f"{sym}_h{h}__index.parquet",
@@ -219,14 +291,38 @@ class RoleAwareContext:
             )
             features_path = _first_existing(
                 [
+                    # Per-symbol subdirectory
+                    sym_subdir / f"{sym}_{h}_features.parquet",
+                    sym_subdir / f"{sym}_h{h}_features.parquet",
+                    sym_subdir / f"{sym}_h{h}__features.parquet",
+                    # Flat layout
                     self.parquet_dir / f"{sym}_{h}_features.parquet",
                     self.parquet_dir / f"{sym}_h{h}_features.parquet",
                     self.parquet_dir / f"{sym}_h{h}__features.parquet",
                 ]
             )
-            merged_path = self.parquet_dir / f"{sym}_h{h}_merged.parquet"
-            merged_mamba_path = self.parquet_dir / f"{sym}_h{h}_merged_mamba.parquet"
-            merged_portfolio_path = self.parquet_dir / f"{sym}_h{h}_merged_portfolio.parquet"
+            # Merged paths: check per-symbol subdirectory first, then flat
+            merged_path = _first_existing(
+                [
+                    sym_subdir / f"{sym}_h{h}_merged.parquet",
+                    sym_subdir / f"{sym.upper()}_h{h}_merged.parquet",
+                    self.parquet_dir / f"{sym}_h{h}_merged.parquet",
+                ]
+            )
+            merged_mamba_path = _first_existing(
+                [
+                    sym_subdir / f"{sym}_h{h}_merged_mamba.parquet",
+                    sym_subdir / f"{sym.upper()}_h{h}_merged_mamba.parquet",
+                    self.parquet_dir / f"{sym}_h{h}_merged_mamba.parquet",
+                ]
+            )
+            merged_portfolio_path = _first_existing(
+                [
+                    sym_subdir / f"{sym}_h{h}_merged_portfolio.parquet",
+                    sym_subdir / f"{sym.upper()}_h{h}_merged_portfolio.parquet",
+                    self.parquet_dir / f"{sym}_h{h}_merged_portfolio.parquet",
+                ]
+            )
 
             # Load provenance from JSON only (CSV was redundant and removed)
             prov = _load_json(prov_path) if prov_path is not None else {}
@@ -240,12 +336,9 @@ class RoleAwareContext:
             gating_ok_map = dict(_as_dict(prov, "column_gating_ok_map") or {})
             veto_ok_map = dict(_as_dict(prov, "column_veto_ok_map") or {})
 
-            if index_path is None or not index_path.exists():
-                if self.strict:
-                    raise FileNotFoundError(f"Missing index parquet for {sym} (h={h}) in {self.parquet_dir}")
-                continue
-
             # Decide which data parquet to use for values.
+            # Note: merged_path, merged_mamba_path, merged_portfolio_path are now Optional[Path]
+            # from _first_existing(), so we check `is not None` instead of `.exists()`.
             use_features = self.data_source in {"auto", "features"}
             use_merged = self.data_source in {"auto", "merged"}
 
@@ -253,24 +346,24 @@ class RoleAwareContext:
             if self.data_source == "features":
                 data_path = features_path
             elif self.data_source == "merged":
-                data_path = merged_path if merged_path.exists() else None
+                data_path = merged_path  # Already validated by _first_existing
             elif self.data_source == "portfolio":
-                if merged_portfolio_path.exists():
+                if merged_portfolio_path is not None:
                     data_path = merged_portfolio_path
-                elif merged_path.exists() and not self.strict:
+                elif merged_path is not None and not self.strict:
                     data_path = merged_path
             elif self.data_source == "mamba":
-                if merged_mamba_path.exists():
+                if merged_mamba_path is not None:
                     data_path = merged_mamba_path
-                elif merged_path.exists() and not self.strict:
+                elif merged_path is not None and not self.strict:
                     data_path = merged_path
             else:
                 # auto: prefer session-aligned features parquet (it matches *_index.parquet rows).
                 if features_path is not None and features_path.exists():
                     data_path = features_path
-                elif merged_path.exists():
+                elif merged_path is not None:
                     data_path = merged_path
-                elif merged_portfolio_path.exists():
+                elif merged_portfolio_path is not None:
                     data_path = merged_portfolio_path
 
             if data_path is None or not data_path.exists():
@@ -278,53 +371,40 @@ class RoleAwareContext:
                     raise FileNotFoundError(f"Missing data parquet for {sym} (h={h}) in {self.parquet_dir}")
                 continue
 
-            idx_df = pd.read_parquet(index_path)
             data_df = pd.read_parquet(data_path)
 
             # Build date->row map.
-            date_int = pd.to_numeric(idx_df.get("date"), errors="coerce").fillna(-1).astype(int)
-            row_id = pd.to_numeric(idx_df.get("row_id"), errors="coerce").fillna(-1).astype(int)
-
-            # Map session YYYYMMDD -> row in the chosen data_df.
-            # - If using *_features.parquet, row_id matches data_df row index.
-            # - If using *_merged.parquet, it is calendar-aligned; map by date column.
+            # If index_path exists, use it. Otherwise, derive from data_df's date column directly.
             m: Dict[int, int] = {}
-            if data_path.name.endswith("_merged.parquet"):
-                merged_date_col = data_df.get("date")
-                if merged_date_col is None:
-                    merged_dates = pd.Series([-1] * len(data_df), dtype=int)
-                else:
-                    # Support either YYYYMMDD ints or datetime-like values.
-                    try:
-                        is_dt = pd.api.types.is_datetime64_any_dtype(merged_date_col)
-                    except Exception:
-                        is_dt = False
+            if index_path is not None and index_path.exists():
+                idx_df = pd.read_parquet(index_path)
+                date_int = pd.to_numeric(idx_df.get("date"), errors="coerce").fillna(-1).astype(int)
+                row_id = pd.to_numeric(idx_df.get("row_id"), errors="coerce").fillna(-1).astype(int)
 
-                    if is_dt:
-                        dt = pd.to_datetime(merged_date_col, errors="coerce")
-                        merged_dates = dt.dt.strftime("%Y%m%d").fillna("-1").astype(int)
-                    else:
-                        merged_dates_num = pd.to_numeric(merged_date_col, errors="coerce")
-                        # Heuristic: YYYYMMDD ints live around 2e7; nanosecond epochs are ~1e18.
-                        if merged_dates_num.notna().any() and float(merged_dates_num.dropna().median()) < 1e10:
-                            merged_dates = merged_dates_num.fillna(-1).astype(int)
-                        else:
-                            dt = pd.to_datetime(merged_date_col, errors="coerce")
-                            merged_dates = dt.dt.strftime("%Y%m%d").fillna("-1").astype(int)
-                merged_row_by_date: Dict[int, int] = {}
-                for j, d in enumerate(merged_dates.to_list()):
-                    if int(d) > 0:
-                        merged_row_by_date[int(d)] = int(j)
-                for d in date_int.to_list():
-                    di = int(d)
-                    r = merged_row_by_date.get(di)
-                    if di > 0 and r is not None and int(r) >= 0:
-                        m[di] = int(r)
+                # Map session YYYYMMDD -> row in the chosen data_df.
+                # - If using *_features.parquet, row_id matches data_df row index.
+                # - If using *_merged.parquet, it is calendar-aligned; map by date column.
+                if "_merged" in str(data_path.name):
+                    # For merged parquets, build mapping from data_df date column directly
+                    merged_date_col = data_df.get("date")
+                    if merged_date_col is not None:
+                        merged_dates = self._parse_date_column_to_int(merged_date_col)
+                        for j, d in enumerate(merged_dates.to_list()):
+                            if int(d) > 0:
+                                m[int(d)] = int(j)
+                else:
+                    for d, r in zip(date_int.to_list(), row_id.to_list()):
+                        if int(d) <= 0 or int(r) < 0:
+                            continue
+                        m[int(d)] = int(r)
             else:
-                for d, r in zip(date_int.to_list(), row_id.to_list()):
-                    if int(d) <= 0 or int(r) < 0:
-                        continue
-                    m[int(d)] = int(r)
+                # No index file - derive date→row mapping from data_df date column directly
+                merged_date_col = data_df.get("date")
+                if merged_date_col is not None:
+                    merged_dates = self._parse_date_column_to_int(merged_date_col)
+                    for j, d in enumerate(merged_dates.to_list()):
+                        if int(d) > 0:
+                            m[int(d)] = int(j)
 
             self._row_by_date[sym] = m
 
@@ -360,6 +440,27 @@ class RoleAwareContext:
                 ]
             )
 
+            # =========================================================================
+            # HYGIENE WHITELIST: Only these families can participate in hygiene veto.
+            # This prevents quarterly fundamentals (fin_g1-7) from accidentally vetoing
+            # entire trading days just because their days_since_update > 10.
+            # Families NOT in this whitelist are informative but non-blocking.
+            # =========================================================================
+            hygiene_whitelist_families = set(
+                [
+                    s.strip().lower()
+                    for s in str(
+                        os.getenv(
+                            "PORTFOLIO_HYGIENE_WHITELIST_FAMILIES",
+                            "ohlcv,candle_mechanics,garch_iv,cboe_term,vix_futures,microstructure_intraday,"
+                            "correlation,exchange_calendar,listing_status,alternative_signals",
+                        )
+                    ).split(",")
+                    if s.strip()
+                ]
+            )
+            use_hygiene_whitelist = str(os.getenv("PORTFOLIO_USE_HYGIENE_WHITELIST", "1")).strip() in {"1", "true", "yes"}
+
             def _is_optional_snapshot_family(family_id: str) -> bool:
                 fid = str(family_id or "").strip().lower()
                 if not fid:
@@ -379,7 +480,21 @@ class RoleAwareContext:
             }
 
             def _is_optional_hygiene_family(family_id: str, col_name: str) -> bool:
+                """Return True if this family should NOT participate in hygiene veto.
+                
+                If WHITELIST mode is enabled (default), only families in the whitelist
+                can veto. All others (including quarterly fundamentals) are optional.
+                This prevents fin_g1-7 from accidentally zeroing out entire trading days.
+                """
                 fid = str(family_id or "").strip().lower()
+                
+                # WHITELIST mode (default): family is optional unless in whitelist
+                if use_hygiene_whitelist:
+                    if fid and fid in hygiene_whitelist_families:
+                        return False  # NOT optional - can veto
+                    return True  # Optional - cannot veto
+                
+                # Legacy BLACKLIST mode: family is optional if in blacklist
                 if fid and fid in optional_hygiene_families:
                     return True
                 # Treat HF / LLM / transcript-derived snapshot feeds as optional for portfolio-wide veto.
@@ -459,14 +574,40 @@ class RoleAwareContext:
             hygiene_cols = _uniq([c for c in hygiene_cols if c in data_df.columns])
 
             # Identify quantile forecast columns for z_q blending
+            # FIX Gap E: Extended fallback for quantile uncertainty/sigma column
+            # Priority order (highest to lowest):
+            # 1. quantile_forecast_q_spread_95_5 (ideal: 95th - 5th percentile spread)
+            # 2. quantile_forecast_q_vol_forecast (predicted volatility)
+            # 3. quantile_forecast_uncertainty (general uncertainty metric)
+            # 4. quantile_forecast_width (full forecast range)
+            # 5. quantile_forecast_iqr (interquartile range: q75 - q25)
             quantile_mu_col = None
             quantile_sigma_col = None
+            
+            # Search for mu column (median/q50)
             for c in data_df.columns:
                 c_lower = str(c).lower()
                 if c_lower in {"quantile_forecast_q50", "quantile_forecast_q_median_50"}:
                     quantile_mu_col = str(c)
-                if c_lower in {"quantile_forecast_q_spread_95_5", "quantile_forecast_q_vol_forecast"}:
-                    quantile_sigma_col = str(c)
+                    break
+            
+            # Search for sigma column with fallback priority order
+            sigma_candidates = [
+                ("quantile_forecast_q_spread_95_5", 1),      # Priority 1: best
+                ("quantile_forecast_q_vol_forecast", 2),     # Priority 2: volatility forecast
+                ("quantile_forecast_uncertainty", 3),        # Priority 3: uncertainty
+                ("quantile_forecast_width", 4),              # Priority 4: full width
+                ("quantile_forecast_iqr", 5),                # Priority 5: IQR
+            ]
+            
+            best_priority = 999
+            for c in data_df.columns:
+                c_lower = str(c).lower()
+                for candidate, priority in sigma_candidates:
+                    if c_lower == candidate and priority < best_priority:
+                        quantile_sigma_col = str(c)
+                        best_priority = priority
+            
             self._quantile_mu_col[sym] = quantile_mu_col
             self._quantile_sigma_col[sym] = quantile_sigma_col
 
@@ -490,7 +631,12 @@ class RoleAwareContext:
             splits_cols = [c for c in data_df.columns if str(c).lower().startswith("corp_actions_splits_")]
             self._splits_cols[sym] = splits_cols
 
-            # Subselect for memory - include quantile/cboe/calibration/online/splits for policy state
+            # Identify event_risk_hf columns for explicit event risk management
+            # These columns are from the event_risk_hf family for earnings/macro event overlays
+            event_risk_cols = [c for c in data_df.columns if str(c).lower().startswith("event_risk_hf_")]
+            self._event_risk_cols[sym] = event_risk_cols
+
+            # Subselect for memory - include quantile/cboe/calibration/online/splits/event_risk for policy state
             extra_cols = []
             if quantile_mu_col:
                 extra_cols.append(quantile_mu_col)
@@ -500,6 +646,7 @@ class RoleAwareContext:
             extra_cols.extend(calibration_cols)
             extra_cols.extend(online_cols)
             extra_cols.extend(splits_cols)
+            extra_cols.extend(event_risk_cols)
 
             use_cols = _uniq([*risk_cols, *regime_cols, *hygiene_cols, *extra_cols])
             if not use_cols:
@@ -621,6 +768,12 @@ class RoleAwareContext:
         regime_multiplier = np.ones(n, dtype=float)
         quantile_z = np.zeros(n, dtype=float)
         split_stress = np.zeros(n, dtype=float)  # Per-asset split stress for execution discipline
+        
+        # Event risk arrays for explicit earnings/macro event management
+        event_risk_earnings_1d = np.zeros(n, dtype=float)
+        event_risk_earnings_3d = np.zeros(n, dtype=float)
+        event_risk_score = np.zeros(n, dtype=float)
+        event_risk_macro_1d_vals: List[float] = []  # Global scalar (cross-sectional max)
 
         # Policy state feature collectors (cross-sectional aggregation)
         cboe_panic_premium_vals: List[float] = []
@@ -744,7 +897,9 @@ class RoleAwareContext:
                 if "vol_risk_premium" in c_lower and np.isfinite(v):
                     cboe_vol_risk_premium_vals.append(v)
 
-            # Policy state: calibration overall_score
+            # Policy state: calibration overall_score (with confidence fallback)
+            # Fallback: if overall_score is missing, use calibration_confidence
+            found_overall_score = False
             for c in self._calibration_cols.get(sym, []):
                 c_lower = str(c).lower()
                 j = idx_map.get(c)
@@ -753,6 +908,18 @@ class RoleAwareContext:
                 v = float(mat[row, j])
                 if "overall_score" in c_lower and np.isfinite(v):
                     calibration_score_vals.append(v)
+                    found_overall_score = True
+            # Fallback: use calibration_confidence or calibration_summary_score if overall_score missing
+            if not found_overall_score:
+                for c in self._calibration_cols.get(sym, []):
+                    c_lower = str(c).lower()
+                    j = idx_map.get(c)
+                    if j is None:
+                        continue
+                    v = float(mat[row, j])
+                    if ("confidence" in c_lower or "summary_score" in c_lower) and np.isfinite(v):
+                        calibration_score_vals.append(v)
+                        break  # Take first fallback match
 
             # Policy state: online learning trust_score
             for c in self._online_cols.get(sym, []):
@@ -795,11 +962,33 @@ class RoleAwareContext:
             split_event_strength = max(split_flag, split_post_5d, split_post_20d, split_recency)
             split_stress[i] = float(split_event_strength * abs(split_log_ratio))
 
+            # Event risk extraction: earnings_next_1d, earnings_next_3d, macro_next_1d, score
+            # These come from the event_risk_hf family for explicit event risk management
+            for c in self._event_risk_cols.get(sym, []):
+                c_lower = str(c).lower()
+                j = idx_map.get(c)
+                if j is None:
+                    continue
+                v = float(mat[row, j])
+                if not np.isfinite(v):
+                    v = 0.0
+                if c_lower.endswith("_earnings_next_1d"):
+                    event_risk_earnings_1d[i] = v
+                elif c_lower.endswith("_earnings_next_3d"):
+                    event_risk_earnings_3d[i] = v
+                elif c_lower.endswith("_macro_next_1d"):
+                    event_risk_macro_1d_vals.append(v)
+                elif c_lower.endswith("_score"):
+                    event_risk_score[i] = v
+
         # Enforce hygiene last: if vetoed, kill exposure.
         risk_scale = np.where(hygiene_ok, risk_scale, 0.0)
         regime_multiplier = np.where(hygiene_ok, regime_multiplier, 0.0)
         quantile_z = np.where(hygiene_ok, quantile_z, 0.0)
         split_stress = np.where(hygiene_ok, split_stress, 0.0)
+        event_risk_earnings_1d = np.where(hygiene_ok, event_risk_earnings_1d, 0.0)
+        event_risk_earnings_3d = np.where(hygiene_ok, event_risk_earnings_3d, 0.0)
+        event_risk_score = np.where(hygiene_ok, event_risk_score, 0.0)
 
         # Aggregate policy state features (cross-sectional means)
         cboe_panic = float(np.mean(cboe_panic_premium_vals)) if cboe_panic_premium_vals else 0.0
@@ -807,6 +996,9 @@ class RoleAwareContext:
         cboe_vrp = float(np.mean(cboe_vol_risk_premium_vals)) if cboe_vol_risk_premium_vals else 0.0
         calib_score = float(np.mean(calibration_score_vals)) if calibration_score_vals else 1.0
         online_trust = float(np.mean(online_trust_vals)) if online_trust_vals else 1.0
+        
+        # Event risk macro is global (max across all assets that have the feature)
+        event_risk_macro_1d = float(max(event_risk_macro_1d_vals)) if event_risk_macro_1d_vals else 0.0
 
         return RoleAwareDayContext(
             symbols=list(self.symbols),
@@ -815,6 +1007,10 @@ class RoleAwareContext:
             regime_multiplier=regime_multiplier,
             quantile_z=quantile_z,
             split_stress=split_stress,
+            event_risk_earnings_next_1d=event_risk_earnings_1d,
+            event_risk_earnings_next_3d=event_risk_earnings_3d,
+            event_risk_macro_next_1d=event_risk_macro_1d,
+            event_risk_score=event_risk_score,
             cboe_panic_premium=cboe_panic,
             cboe_term_slope=cboe_slope,
             cboe_vol_risk_premium_z=cboe_vrp,

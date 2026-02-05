@@ -70,7 +70,7 @@ class PrepFamiliesConfig(Config):
     strict: bool = False
     workers: int = 1
     hf_workers: Optional[int] = None
-    mode: str = "stage-b"
+    mode: str = "stage-b"  # Stage-B mode with consolidated files (no train/valid splits)
     
     # Sequential execution mode (default: True)
     # When True, all tasks run sequentially within a symbol run:
@@ -252,10 +252,20 @@ def prep_families_manifest(context) -> str:
     # These are already supported by src.features.aggregator_panel + universal fetchers.
     import os
 
+    # Stage-B mode: Always allow live fallback (generate when caches don't exist)
+    # Use consolidated files (no train/valid splits)
+    stage_mode_normalized = (cfg.mode or "stage-b").lower()
+    if stage_mode_normalized == "walkforward":
+        stage_mode_normalized = "stage-b"
+    
+    is_stage_a = stage_mode_normalized == "stage-a"
+    
     if cfg.enforce_no_proxy_sources:
         os.environ["STAGE_B_NO_PROXY_SOURCES"] = "1"
-    if cfg.enforce_no_live_fallback:
-        os.environ["STAGE_B_NO_LIVE_FALLBACK"] = "1"
+    
+    # Always enable live fallback - allow generation when caches don't exist
+    os.environ["STAGE_B_NO_LIVE_FALLBACK"] = "0"
+    
     if cfg.enforce_eodhd_only:
         os.environ["STAGE_B_EODHD_ONLY"] = "1"
 

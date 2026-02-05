@@ -620,6 +620,36 @@ Role‑aware context outputs (per day):
 
 These are consumed by the portfolio/backtest engine via role‑aware context in [src/portfolio/role_aware_context.py](src/portfolio/role_aware_context.py).
 
+### 8.1 Hygiene Whitelist (Jan 2026)
+
+**Problem:** Quarterly fundamentals (fin_g1-7) have `days_since_update > 20` most of the time (legitimate - quarterly refresh). If hygiene veto checks ALL `*_days_since_update` columns, it accidentally zeros out entire trading days when fundamentals haven't updated.
+
+**Solution:** WHITELIST approach - only families in the whitelist can participate in hygiene veto.
+
+| Family Type | Hygiene Veto? | Reason |
+|-------------|---------------|--------|
+| `ohlcv`, `candle_mechanics` | ✅ Yes | Daily feeds, staleness = problem |
+| `garch_iv`, `cboe_term` | ✅ Yes | Daily risk feeds |
+| `vix_futures`, `correlation` | ✅ Yes | Daily market structure |
+| `exchange_calendar`, `listing_status` | ✅ Yes | Trading eligibility |
+| `fin_g1` - `fin_g7` | ❌ No | Quarterly, legitimately stale 60-90 days |
+| `options`, `options_anchoring` | ❌ No | Snapshot feeds |
+| `finbert`, `short_interest` | ❌ No | Sparse/snapshot |
+
+**Environment Variables:**
+```bash
+# Whitelist of families that CAN veto (default: daily feeds only)
+export PORTFOLIO_HYGIENE_WHITELIST_FAMILIES="ohlcv,candle_mechanics,garch_iv,cboe_term,vix_futures,microstructure_intraday,correlation,exchange_calendar,listing_status,alternative_signals"
+
+# Enable whitelist mode (default: 1)
+export PORTFOLIO_USE_HYGIENE_WHITELIST="1"
+
+# Per-family staleness thresholds (automatic, no config needed)
+# - Quarterly families: 130 days
+# - Monthly families: 45 days  
+# - Daily families: 10 days
+```
+
 ---
 
 ## 9) Prediction tape export (optional for Stage C)

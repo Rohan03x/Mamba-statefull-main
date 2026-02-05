@@ -1,7 +1,7 @@
 # Dagster Feature Families Reference
 
 > Generated: January 22, 2026  
-> Total Families: **48**
+> Total Families: **44** (active)
 
 ---
 
@@ -13,9 +13,9 @@ The Dagster pipeline materializes feature families as partitioned assets. Famili
 |----------|-------|-------------|
 | Base Families | 37 | Core feature generators |
 | HF Modules | 4 | High-frequency modules requiring special compute |
-| HF Blocks | 6 | High-frequency aggregation blocks |
+| HF Blocks | 2 (4 disabled) | High-frequency aggregation blocks |
 | Meta Families | 1 | Derived aggregation families |
-| **Total** | **48** | |
+| **Total Active** | **44** | |
 
 ---
 
@@ -69,25 +69,138 @@ High-frequency modules requiring specialized compute resources:
 
 | # | Family | Description |
 |---|--------|-------------|
-| 1 | `doc_embedding_novelty_hf` | Document embedding novelty detection (symbol-independent, shared cache) |
-| 2 | `earnings_transcript_hf` | Earnings call transcript analysis |
-| 3 | `macro_tst_hf` | Macro time-series transformer |
-| 4 | `news_sentiment_hf` | News sentiment analysis (excluded from Dagster assets) |
+| 1 | `doc_embedding_novelty_hf` | Document embedding novelty detection (15 features, symbol-independent shared cache) - [See full feature list](#doc_embedding_novelty_hf-family-full-feature-reference) |
+| 2 | `earnings_transcript_hf` | Earnings call transcript analysis (10 features, confidence-weighted) - [See full feature list](#earnings_transcript_hf-family-full-feature-reference) |
+| 3 | `macro_tst_hf` | Macro time-series transformer with HF embeddings (~25-30 features) - [See full feature list](#macro_tst_hf-family-full-feature-reference) |
+| 4 | `news_sentiment_hf` | News sentiment analysis (2 features, excluded from Dagster assets) - [See full feature list](#news_sentiment_hf-family-full-feature-reference) |
 
 ---
 
-## HF Blocks (6)
+## HF Blocks (2 Active, 4 Disabled)
 
-High-frequency aggregation blocks that combine multiple signal types:
+**CRITICAL ARCHITECTURE NOTE**: HF blocks are **MODEL OUTPUTS**, not features.
 
-| # | Family | Horizon-Bound | Description |
-|---|--------|---------------|-------------|
-| 1 | `forecast_hf` | ✅ Yes | Forecast aggregation features |
-| 2 | `fundamental_val_hf` | ❌ No | Fundamental valuation HF features |
-| 3 | `macro_regime_hf` | ❌ No | Macro regime HF indicators |
-| 4 | `news_nlp_hf` | ❌ No | News NLP HF features |
-| 5 | `tech_micro_hf` | ❌ No | Technical/microstructure HF features |
-| 6 | `vol_deriv_hf` | ❌ No | Volatility/derivatives HF features |
+They live entirely inside Phase-2, **AFTER** Mamba inference and **BEFORE** portfolio allocation:
+
+```
+Phase-2 Canonical Order:
+1. Load base family parquets
+2. Run Mamba → z_mamba(t)
+3. Load HF block parquets     ← HF blocks enter here
+4. Compute stateful confidence & stress
+5. Produce final signal package: z_final(t) = α(t) × z_mamba(t)
+6. Hand off to portfolio engine
+```
+
+**HF blocks do NOT participate in `feature_roles.py`**. They are handled by Phase-2 logic, not by role classifiers.
+
+### Effective Roles (Conceptual, Not Token-Based)
+
+| Column Pattern | Effective Role | Why |
+|----------------|----------------|-----|
+| `*_hf_score` | PREDICTIVE-META | Directional opinion (0-1, 0.5 = neutral) |
+| `*_hf_conf` | RISK | Uncertainty / agreement metric |
+| `*_hf_score_raw` | DEBUG | Never used downstream |
+
+### HF Block Confidence Synthesis
+
+**You do NOT average HF scores. You only use confidence agreement.**
+
+```
+C_i(t) = Σ(w_b × c_i^b(t))          # Weighted confidence aggregation
+Δs_i(t) = |s_i^a(t) - s_i^b(t)|     # Pairwise disagreement
+P_i(t) = exp(-k × max_disagreement)  # Penalty term
+Ĉ_i(t) = C_i(t) × P_i(t)            # Final confidence
+α_i(t) = clamp(Ĉ_i(t), α_min, 1.0)  # Exposure scaler
+z_final(t) = α_i(t) × z_mamba(t)    # Final signal
+```
+
+**Properties**:
+- `sign(z_final) = sign(z_mamba)` **always**
+- HF blocks **cannot flip direction**
+- Worst case: exposure shrinks toward zero
+
+### HF Block Input Eligibility (Non-Negotiable)
+
+A base family may be consumed by an HF block **ONLY IF ALL THREE** are true:
+
+| Criterion | Requirement | Failure Example |
+|-----------|-------------|-----------------|
+| **Dense in time** | Meaningful values on ≥80% of trading days | `earnings` (quarterly) |
+| **Stationary** | Changes, spreads, ratios; NOT raw levels | `marketcap_history` (raw levels) |
+| **Sequence-native** | Information is in patterns across days | `corp_actions_splits` (impulse) |
+
+**If any one fails → DO NOT FEED HF.** This rule separates hedge-fund ML from Kaggle ML.
+
+### HF Block Registry
+
+#### ✅ Active HF Blocks (2)
+
+| # | Family | Horizon-Bound | Dependencies | Description |
+|---|--------|---------------|--------------|-------------|
+| 1 | `tech_micro_hf` | ❌ No | 7 families | Technical/microstructure + vol + positioning |
+| 2 | `forecast_hf` | ✅ Yes | 8 families | Forecast ensemble + regime + forward vol |
+
+#### `tech_micro_hf` Dependencies (7 families)
+
+| Family | Constraint | Features Used |
+|--------|------------|---------------|
+| `ml_framework` | Full | All (normalized technicals) |
+| `microstructure` | Full | All (price mechanics are sequence-native) |
+| `correlation` | Full | All (rolling windows, stationary) |
+| `candle_mechanics` | Normalized anatomy only | No raw returns if duplicated |
+| `garch_iv` | Cap ~6 features | Changes, ratios, residuals only |
+| `options` | Filtered | Flows, skews, changes (no OI/levels) |
+| `options_anchoring` | Narrow | Distance-to-strike, pinning strength only |
+
+#### `forecast_hf` Dependencies (8 families)
+
+| Family | Constraint | Features Used |
+|--------|------------|---------------|
+| `quantile_forecast` | Full | All (probability distributions) |
+| `calibration` | Full | All (ECE, reliability metrics) |
+| `online_learning` | Full | All (drift detection, stationary) |
+| `arima_forecast` | Full | All (forecast residuals, changes) |
+| `tft_features` | Full | All (temporal patterns, normalized) |
+| `regime` | Full | All (regime states are sequence-native) |
+| `cboe_term` | Filtered | Slope & curvature changes only |
+| `short_interest` | Filtered | Smoothed deltas, z-scores only (no raw SI%) |
+
+#### 🚫 Disabled HF Blocks (4)
+
+The following blocks are **FULLY DISABLED** - no generation, no usage, no processing.
+
+| # | Family | Reason for Disabling |
+|---|--------|---------------------|
+| 1 | `vol_deriv_hf` | Duplicates portfolio risk module - redundant signals |
+| 2 | `macro_regime_hf` | Macro data is low-frequency (monthly), not suited for sequence learning |
+| 3 | `fundamental_val_hf` | Low frequency, sparse updates (quarterly earnings) |
+| 4 | `news_nlp_hf` | Noise amplification - sentiment already captured in base finbert family |
+
+**Rationale**: This restraint is what real hedge funds do. Fewer signals, higher conviction. Each additional HF block increases complexity without proportional edge.
+
+### HF Block Parquet Structure (SEPARATE from Mamba/Portfolio)
+
+HF blocks **MUST** live in a separate merged parquet, not in mamba or portfolio streams:
+
+```
+cache/
+└── symbols/
+    └── {SYMBOL}/
+        ├── hf/                              # Individual HF blocks (horizon-invariant)
+        │   ├── tech_micro_hf.parquet
+        │   └── ...                          # Only active blocks
+        ├── h{HORIZON}/                      # Horizon-specific HF blocks
+        │   └── forecast_hf.parquet
+        └── hf_merged/                       # All HF blocks merged for Phase-2
+            └── {SYMBOL}_h{HORIZON}_hf_merged.parquet
+```
+
+**Reasons for separation**:
+- Prevent feature contamination
+- Prevent accidental reuse in Mamba training
+- Clean dependency graph
+- Easier audits and ablations
 
 ---
 
@@ -133,6 +246,9 @@ These HF blocks use symbol-only caching (no horizon dimension):
 | Standard (horizon-linked) | `cache/symbols/<SYMBOL>/h<H>/<family>.parquet` |
 | Symbol-only HF blocks | `cache/symbols/<SYMBOL>/hf/<family>.parquet` |
 | Shared (doc_embedding) | `cache/shared/doc_embedding/doc_embedding_novelty_hf.parquet` |
+| **HF merged (Phase-2 input)** | `cache/symbols/<SYMBOL>/hf_merged/<SYMBOL>_h<H>_hf_merged.parquet` |
+| Mamba stream | `cache/merged/<SYMBOL>_h<H>_merged_mamba.parquet` |
+| Portfolio stream | `cache/merged/<SYMBOL>_h<H>_merged_portfolio.parquet` |
 
 ---
 
@@ -155,7 +271,7 @@ Each family produces three governance columns:
 |--------|-------------|
 | `{family}_has_data` | Boolean indicating data presence |
 | `{family}_activity` | Activity score (0-1) |
-| `{family}_days_since_update` | Days since last data update |
+| `{family}_days_since_update` | **Data freshness** measured as trading days since last cache update. NOTE: This measures **update staleness**, not event recency. Event distance is modeled explicitly in event-specific features (e.g., `days_since_split`, `days_since_earnings`). Quarterly families (fin_g1-7) legitimately report 20-130 days due to quarterly refresh cycles. |
 
 ---
 
@@ -187,7 +303,17 @@ class FamilyRunConfig:
 
 Columns that are portfolio-only by default can be optionally routed to Mamba stream via environment variables.
 
-### Unified Format (Recommended)
+### Master Switch (All Optional → Mamba)
+
+```bash
+# ONE COMMAND: Route ALL optional columns from ALL families to Mamba
+export MAMBA_OPTIONAL_COLUMNS="all:all"
+
+# Turn off (unset or empty)
+unset MAMBA_OPTIONAL_COLUMNS
+```
+
+### Unified Format (Per-Family Control)
 
 Use a single `MAMBA_OPTIONAL_COLUMNS` environment variable with semicolon-separated family blocks:
 
@@ -1445,7 +1571,7 @@ This ensures:
 ## dividends Family — Full Feature Reference
 
 **Source:** EODHD Dividends API  
-**Columns:** 13 (9 features + 4 governance)  
+**Columns:** 12 (8 features + 4 governance)  
 **Philosophy:** Event timing + intensity, NOT dividend policy/quality. Policy features belong in FIN_G7.
 
 **Hedge-Fund Grade:** Binary ex_dividend_flag removed → replaced with continuous window_strength.
@@ -1462,6 +1588,12 @@ This ensures:
 - If returns use **raw close**: dividend-event signals create fake alpha (model "learns" ex-date drop)
 - If returns use **adjusted close**: safe to include event_intensity in Mamba
 - Action: Confirm return source before enabling dividend features in Mamba
+
+**Implementation Status (Jan 2026):**
+- Returns builder uses `adj_close` / `Adj Close` first if present, else falls back to `close`
+- Conditional routing is currently driven by env/config toggles (`DIVIDENDS_MAMBA_OPTIONAL`, `MAMBA_OPTIONAL_COLUMNS`)
+- Automatic enforcement ("labels are dividend-adjusted") is NOT implemented yet
+- **TODO**: Add explicit pipeline check in prep_families.py to auto-detect adjusted vs raw close
 
 ### Governance Columns (4)
 
@@ -1535,7 +1667,7 @@ dividend_event_stress = window_strength × clip(|dividend_amount / price|, 0, 0.
 ## earnings Family — Full Feature Reference
 
 **Source:** EODHD Fundamentals (via EarningsAnalyzer)  
-**Columns:** 21 (17 features + 4 governance)  
+**Columns:** 22 (18 features + 4 governance)  
 **Philosophy:** Surprises + consistency + revisions, NOT raw levels. Raw EPS/revenue removed (scale issues, not cross-sectionally comparable).
 
 **Hedge-Fund Grade:** Growth winsorized ±200%. Binary flags → continuous. Event decay added. **Surprises SHIFTED by 1 day to prevent leakage.**
@@ -1552,6 +1684,11 @@ dividend_event_stress = window_strength × clip(|dividend_amount / price|, 0, 0.
 - Surprise features (`eps_surprise_pct`, `revenue_surprise_pct`) are **SHIFTED by 1 day**
 - If day t bar includes earnings reaction, surprise is only known after release
 - Safe rule: surprise at t can only be used for decision at t+1
+
+**Implementation Status (Jan 2026): VERIFIED**
+- `.shift(1)` applied in `EarningsAnalyzer._build_daily_features()` at line ~608
+- Columns shifted: `eps_surprise_pct`, `revenue_surprise_pct`, `surprise_percent`
+- Also applies: `surprise_percent` is alias → also shifted
 
 ### Governance Columns (4)
 
@@ -2245,8 +2382,8 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 ## fin_g4 Family — Full Feature Reference
 
 **Source:** EODHD Fundamentals API (Cash Flow + Income Statement + Balance Sheet, quarterly)  
-**Columns:** 12 (9 features + 3 governance)  
-**Philosophy:** Cash flow & earnings quality. Measures cash generation and quality of reported earnings.
+**Columns:** 20 (17 features + 3 governance)  
+**Philosophy:** Cash flow & earnings quality. Measures cash generation, quality of reported earnings, and normalized metrics for cross-sectional comparability.
 
 ### Governance Columns (3)
 
@@ -2256,33 +2393,63 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | 2 | `fin_g4_activity` | HYGIENE | Activity score (0-1) |
 | 3 | `fin_g4_days_since_update` | HYGIENE | Days since last data update |
 
-### Cash Flow Core (2)
+### Cash Flow Core (2) — NOT SCALE-FREE
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 4 | `fin_g4_operating_cash_flow` | PREDICTIVE | Total Cash from Operating Activities |
-| 5 | `fin_g4_free_cash_flow` | PREDICTIVE | Operating CF - CapEx (cash available to shareholders) |
+| 4 | `fin_g4_operating_cash_flow` | REGIME | Total Cash from Operating Activities (dollar amount, NOT cross-sectionally comparable) |
+| 5 | `fin_g4_free_cash_flow` | REGIME | Operating CF - CapEx (dollar amount, NOT cross-sectionally comparable) |
+
+> **WARNING:** Raw OCF/FCF are in dollars and NOT scale-free. Use normalized versions for cross-sectional models.
+
+### Scale-Free Normalized Metrics (3) — NEW Jan 2026
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 6 | `fin_g4_cfo_to_assets` | PREDICTIVE | Operating CF / Total Assets (scale-free cash generation efficiency) |
+| 7 | `fin_g4_fcf_to_assets` | PREDICTIVE | Free CF / Total Assets (scale-free free cash flow efficiency) |
+| 8 | `fin_g4_cfo_margin` | PREDICTIVE | Operating CF / Revenue (like profit margin but cash-based) |
 
 ### Cash Flow Quality Ratios (4)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 6 | `fin_g4_fcf_to_revenue` | PREDICTIVE | Free Cash Flow / Revenue (cash conversion efficiency) |
-| 7 | `fin_g4_fcf_to_net_income` | PREDICTIVE | FCF / Net Income (earnings quality: >1 = high quality) |
-| 8 | `fin_g4_fcf_margin` | PREDICTIVE | FCF / Revenue (profitability after growth investment) |
-| 9 | `fin_g4_cfo_to_net_income` | PREDICTIVE | Operating CF / Net Income (cash backing of earnings) |
+| 9 | `fin_g4_fcf_to_revenue` | PREDICTIVE | Free Cash Flow / Revenue (cash conversion efficiency) |
+| 10 | `fin_g4_fcf_to_net_income` | PREDICTIVE | FCF / Net Income (earnings quality: >1 = high quality) |
+| 11 | `fin_g4_fcf_margin` | PREDICTIVE | FCF / Revenue (profitability after growth investment) |
+| 12 | `fin_g4_cfo_to_net_income` | PREDICTIVE | Operating CF / Net Income (cash backing of earnings) |
 
 ### Capital Intensity (1)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 10 | `fin_g4_capex_to_revenue` | REGIME | |CapEx| / Revenue (capital intensity of business model) |
+| 13 | `fin_g4_capex_to_revenue` | REGIME | |CapEx| / Revenue (capital intensity of business model) |
 
 ### Earnings Quality (1)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 11 | `fin_g4_accruals_ratio` | RISK | (Net Income - Operating CF) / Total Assets. HIGH = lower quality |
+| 14 | `fin_g4_accruals_ratio` | RISK | (Net Income - Operating CF) / Total Assets. HIGH = lower quality |
+
+### Time-Series Z-Scores (4) — NEW Jan 2026
+
+Rolling 3-year z-scores for key cash flow metrics (scale-free, cross-sectionally comparable):
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 15 | `fin_g4_cfo_to_assets_zscore_3y` | PREDICTIVE | Z-score of cfo_to_assets vs 3Y history |
+| 16 | `fin_g4_fcf_to_assets_zscore_3y` | PREDICTIVE | Z-score of fcf_to_assets vs 3Y history |
+| 17 | `fin_g4_cfo_margin_zscore_3y` | PREDICTIVE | Z-score of cfo_margin vs 3Y history |
+| 18 | `fin_g4_fcf_margin_zscore_3y` | PREDICTIVE | Z-score of fcf_margin vs 3Y history |
+
+### STRESS Features for Portfolio Risk (2) — NEW Jan 2026
+
+Higher = WORSE (safe for portfolio risk aggregation):
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 19 | `fin_g4_cash_flow_stress` | RISK | max(0, -cfo_to_assets_zscore_3y). Deteriorating cash = stress |
+| 20 | `fin_g4_earnings_quality_stress` | RISK | max(0, accruals_ratio). High accruals = low quality = stress |
 
 ---
 
@@ -2303,6 +2470,8 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | `fcf_margin` < 5% | Weak cash generation | Capital-intensive, margin pressure |
 | `capex_to_revenue` > 15% | Capital-intensive | Heavy reinvestment needs (manufacturing) |
 | `capex_to_revenue` < 5% | Asset-light | Low reinvestment needs (software, services) |
+| `cash_flow_stress` > 0.5 | Deteriorating CF | Reduce position size, elevated risk |
+| `earnings_quality_stress` > 0.1 | Low quality earnings | Caution on earnings-driven moves |
 
 ---
 
@@ -2312,6 +2481,11 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 **Columns:** 11 (8 features + 3 governance)  
 **Philosophy:** STRICT growth metrics only. Measures revenue, earnings, and cash flow growth.
 
+**Stream Routing (Jan 2026):**
+- **Mamba (optional, later):** YoY growth + margin_expansion (clip/winsorize first)
+- **Portfolio (REGIME):** Multi-year CAGR (slow style classification)
+- **Portfolio (RISK):** growth_volatility_3y (downweight unstable growers)
+
 ### Governance Columns (3)
 
 | # | Column | Role | Description |
@@ -2320,7 +2494,9 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | 2 | `fin_g5_activity` | HYGIENE | Activity score (0-1) |
 | 3 | `fin_g5_days_since_update` | HYGIENE | Days since last data update |
 
-### Year-over-Year Growth (4)
+### Year-over-Year Growth (3) — PREDICTIVE (Optional for Mamba)
+
+Medium-horizon drivers. Initially exclude from Mamba until portfolio loop is stable.
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
@@ -2328,24 +2504,26 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | 5 | `fin_g5_ebitda_growth_yoy` | PREDICTIVE | EBITDA YoY growth (operating leverage) |
 | 6 | `fin_g5_cf_growth_yoy` | PREDICTIVE | Operating Cash Flow YoY growth |
 
-### Multi-Year Growth (2)
+### Multi-Year Growth (2) — REGIME (Style Classification)
+
+Slow style tilt (growth vs value). Not short-term alpha.
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 7 | `fin_g5_revenue_cagr_3y` | PREDICTIVE | 3-year revenue CAGR (compound annual growth rate) |
-| 8 | `fin_g5_eps_cagr_3y` | PREDICTIVE | 3-year EPS CAGR |
+| 7 | `fin_g5_revenue_cagr_3y` | REGIME | 3-year revenue CAGR (growth vs value style) |
+| 8 | `fin_g5_eps_cagr_3y` | REGIME | 3-year EPS CAGR (growth vs value style) |
 
-### Margin Dynamics (1)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 9 | `fin_g5_margin_expansion` | PREDICTIVE | Change in net margin YoY (operating leverage indicator) |
-
-### Growth Quality (1)
+### Margin Dynamics (1) — PREDICTIVE
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 10 | `fin_g5_growth_volatility_3y` | RISK | Rolling std of revenue_growth_yoy (growth stability) |
+| 9 | `fin_g5_margin_expansion` | PREDICTIVE | Change in net margin YoY (leads price re-rating) |
+
+### Growth Quality (1) — RISK
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 10 | `fin_g5_growth_volatility_3y` | RISK | Rolling std of revenue_growth_yoy (downweight unstable growers) |
 
 ---
 
@@ -2373,8 +2551,8 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 ## fin_g6 Family — Full Feature Reference
 
 **Source:** EODHD Fundamentals API (quarterly) + Daily Price Data  
-**Columns:** 12 (9 features + 3 governance)  
-**Philosophy:** Time-varying valuation multiples using daily prices + forward-filled quarterly fundamentals.
+**Columns:** 16 (13 features + 3 governance)  
+**Philosophy:** Time-varying valuation multiples using daily prices + forward-filled quarterly fundamentals. Split roles: z-scores for Mamba value factor, richness stress for portfolio risk.
 
 **Design:** Ratios computed DAILY (price changes daily, fundamentals persist until next quarterly report).
 
@@ -2386,23 +2564,53 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | 2 | `fin_g6_activity` | HYGIENE | Activity score (0-1) |
 | 3 | `fin_g6_days_since_update` | HYGIENE | Days since last data update |
 
-### Core Valuation Multiples (5)
+### Core Valuation Multiples (5) — RISK (Not for Mamba)
+
+Raw multiples are RISK, not alpha. Pathological values (negative EPS), industry-structural.
+Do NOT feed to Mamba — use only z-scores for value factor alpha.
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 4 | `fin_g6_pe_ratio` | RISK | Price / TTM EPS (earnings multiple) |
+| 4 | `fin_g6_pe_ratio` | RISK | Price / TTM EPS (pathological when EPS negative) |
 | 5 | `fin_g6_pb_ratio` | RISK | Price / Book Value per Share (asset multiple) |
-| 6 | `fin_g6_ps_ratio` | RISK | Price / TTM Revenue per Share (sales multiple) |
+| 6 | `fin_g6_ps_ratio` | RISK | Price / TTM Revenue per Share (more stable for loss-makers) |
 | 7 | `fin_g6_ev_ebitda` | RISK | Enterprise Value / EBITDA (snapshot from API) |
-| 8 | `fin_g6_dividend_yield` | RISK | Dividend Yield % (snapshot from API) |
+| 8 | `fin_g6_dividend_yield` | RISK | Dividend Yield % (defensive style indicator) |
 
-### Historical Normalization (3)
+### Historical Normalization (3) — PREDICTIVE (Value Factor for Mamba)
+
+Z-scores are PREDICTIVE: positive z = expensive vs history = potential mean reversion candidate.
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 9 | `fin_g6_pe_ratio_zscore_5y` | RISK | PE ratio z-score vs 5-year rolling mean |
-| 10 | `fin_g6_pb_ratio_zscore_5y` | RISK | PB ratio z-score vs 5-year rolling mean |
-| 11 | `fin_g6_ev_ebitda_zscore_5y` | RISK | EV/EBITDA z-score vs 5-year rolling mean |
+| 9 | `fin_g6_pe_ratio_zscore_5y` | PREDICTIVE | PE ratio z-score vs 5-year rolling mean |
+| 10 | `fin_g6_pb_ratio_zscore_5y` | PREDICTIVE | PB ratio z-score vs 5-year rolling mean |
+| 11 | `fin_g6_ev_ebitda_zscore_5y` | PREDICTIVE | EV/EBITDA z-score vs 5-year rolling mean |
+
+### Valuation Richness STRESS (4) — NEW Jan 2026
+
+Higher = WORSE (safe for portfolio risk aggregation). Expensive stocks are fragile.
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 12 | `fin_g6_pe_ratio_richness` | RISK | max(0, pe_zscore_5y). Expensive = fragile |
+| 13 | `fin_g6_pb_ratio_richness` | RISK | max(0, pb_zscore_5y). Expensive = fragile |
+| 14 | `fin_g6_ev_ebitda_richness` | RISK | max(0, ev_ebitda_zscore_5y). Expensive = fragile |
+| 15 | `fin_g6_valuation_richness` | RISK | Mean of *_richness. Composite expensive-fragility score |
+
+---
+
+### Role Split Philosophy (Jan 2026)
+
+**PREDICTIVE (z-scores → Mamba):**
+- Z-scores capture value factor alpha for slow horizons (21-252d)
+- Positive z = expensive vs own history = potential short/reduce
+- Negative z = cheap vs own history = value opportunity
+
+**RISK (richness → Portfolio):**
+- `valuation_richness = max(0, zscore)` for portfolio risk scaling
+- Expensive stocks have more downside risk if sentiment shifts
+- Higher richness → reduce position size in portfolio optimizer
 
 ---
 
@@ -2430,6 +2638,8 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | `pe_zscore_5y` < -2 | Cheap vs history | Value opportunity or structural decline |
 | `pb_zscore_5y` > 2 | Premium to history | Re-rating or bubble |
 | `ev_ebitda_zscore_5y` < -1 | Below normal | Margin pressure or cyclical trough |
+| `valuation_richness` > 1.0 | Elevated stress | Reduce position size (expensive = fragile) |
+| `valuation_richness` < 0.3 | Low stress | Full position size OK |
 
 ---
 
@@ -2454,7 +2664,7 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | # | Column | Role | Description |
 |---|--------|------|-------------|
 | 4 | `fin_g7_payout_ratio` | RISK | |Dividends Paid| / Net Income (dividend sustainability) |
-| 5 | `fin_g7_dividend_yield_proxy` | REGIME | Payout ratio as dividend yield proxy |
+| 5 | `fin_g7_dividend_yield_proxy` | RISK | Payout ratio as dividend yield proxy |
 
 ### Policy Stability (3)
 
@@ -2468,7 +2678,7 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 9 | `fin_g7_yield_zscore_5y` | RISK | Dividend yield proxy z-score vs 20-quarter history |
+| 9 | `fin_g7_yield_zscore_5y` | PREDICTIVE | Dividend yield proxy z-score vs 20-quarter history |
 | 10 | `fin_g7_shares_outstanding` | HYGIENE | Common stock shares outstanding (raw value) |
 
 ---
@@ -2492,6 +2702,17 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | `yield_zscore_5y` < -2 | Low yield vs history | Dividend cut or reinvestment shift |
 
 **Cross-Family Linkage:** Payout ratio used with ROE (fin_g0) to compute sustainable growth rate.
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (PREDICTIVE) | `yield_zscore_5y` | Scale-free z-score safe for model input |
+| **Portfolio** (RISK) | `payout_ratio`, `dividend_yield_proxy`, `dividend_policy_stability`, `share_dilution_3y` | Risk overlays (payout sustainability, dilution risk) |
+| **Portfolio** (REGIME) | `buyback_consistency` | Slow style factor (capital allocation pattern) |
+| **Portfolio** (HYGIENE) | Governance columns, `shares_outstanding` | Data quality + raw counts |
+
+**CRITICAL: Only z-scored metrics flow to Mamba.** Raw payout/dilution metrics are non-stationary and belong in Portfolio for risk management.
 
 ---
 
@@ -2551,6 +2772,16 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 - Combine with `finbert_confidence` to filter high-quality signals
 - Use gap_thresh parameter to exclude stale news periods
 
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (PREDICTIVE) | `finbert_score` | Directional sentiment signal for alpha |
+| **Portfolio** (REGIME) | `finbert_neutral` | Market regime detection (low-info environments) |
+| **Portfolio** (HYGIENE) | Governance columns, `finbert_confidence` | Data quality + model uncertainty (never alpha input) |
+
+**CRITICAL: `finbert_confidence` is HYGIENE, not PREDICTIVE.** Model uncertainty should filter rows, not be a feature. The global HYGIENE_TOKENS include "confidence" to enforce this pattern.
+
 ---
 
 ## garch_iv Family — Full Feature Reference
@@ -2597,20 +2828,20 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 | # | Column | Role | Description |
 |---|--------|------|-------------|
 | 12 | `garch_iv_garch_ratio_1d_20d` | RISK | Short-term vs medium-term forecast ratio (spike = near-term shock) |
-| 13 | `garch_iv_garch_spike_flag` | PREDICTIVE | Binary: 1 if garch_1d > 1.5 * garch_20d (regime shock detector) |
+| 13 | `garch_iv_garch_spike_flag` | REGIME | Binary: 1 if garch_1d > 1.5 * garch_20d (regime shock detector) ⚠️ Should be continuous |
 | 14 | `garch_iv_garch_zscore` | RISK | Z-score of garch_1d vs 60-day distribution |
 | 15 | `garch_iv_garch_residual_vol` | RISK | Std dev of standardized residuals (20d) - model uncertainty |
-| 16 | `garch_iv_garch_standardized_residual` | HYGIENE | Returns / conditional volatility (last value from model) |
+| 16 | `garch_iv_garch_standardized_residual` | HYGIENE | Returns / conditional volatility (single-point noise, REMOVE from models) |
 
 ### High-Alpha Features (6)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 17 | `garch_iv_garch_vol_of_vol` | PREDICTIVE | Std dev of garch_1d over 20 days (regime instability indicator) |
+| 17 | `garch_iv_garch_vol_of_vol` | REGIME | Std dev of garch_1d over 20 days (regime instability indicator, NOT predictive) |
 | 18 | `garch_iv_garch_short_long_ratio` | RISK | garch_1d / long_run_variance (deviation from steady state) |
 | 19 | `garch_iv_garch_vol_norm_20d` | RISK | garch_20d / realized_vol_20d (model vs actual calibration) |
-| 20 | `garch_iv_garch_vol_momentum` | PREDICTIVE | 10-day slope of garch_1d (volatility trend) |
-| 21 | `garch_iv_garch_shock_indicator` | PREDICTIVE | Binary: 1 if |standardized_residual| > 2.0 (outlier event) |
+| 20 | `garch_iv_garch_vol_momentum` | REGIME | 10-day slope of garch_1d (volatility trend - Policy state, optional Mamba if normalized) |
+| 21 | `garch_iv_garch_shock_indicator` | REGIME | Binary: 1 if |standardized_residual| > 2.0 (outlier event) ⚠️ Should be abs(residual) |
 
 ---
 
@@ -2642,6 +2873,21 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 **Model:** GARCH(1,1) with 252-day rolling estimation windows  
 **Requirements:** Minimum 252 days of price history for GARCH fitting  
 **Fallback:** If `arch` library unavailable, only legacy features (RV spread, skew proxy) computed
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Portfolio** (RISK) | `garch30_minus_garch180`, `skew_proxy`, `garch_1d/5d/20d`, `ratio_1d_20d`, `zscore`, `residual_vol`, `short_long_ratio`, `vol_norm_20d` | Vol targeting, risk scaling, execution |
+| **Portfolio** (REGIME) | `garch_persistence`, `long_run_variance`, `vol_of_vol`, `vol_momentum`, `spike_flag`, `shock_indicator` | Policy Controller state, regime classification |
+| **Portfolio** (HYGIENE) | Governance columns, `log_likelihood`, `standardized_residual` | Data quality + model diagnostics (REMOVE standardized_residual) |
+| **Mamba** | ❌ **NO** (except optional `vol_momentum` if normalized/clipped) | Not predictive returns |
+
+**CRITICAL: GARCH outputs are slow, persistent, and regime-level.** Feeding them into Mamba hurts pattern learning (non-stationary, cross-sectionally weak). This is a risk + regime diagnostics family, not a return generator.
+
+**Binary → Continuous Migration:**
+- `spike_flag` → Replace with `garch_ratio_1d_20d` (already continuous)
+- `shock_indicator` → Replace with `abs(standardized_residual)` clipped
 
 ---
 
@@ -2685,8 +2931,8 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 10 | `index_constituents_added_gspc` | PREDICTIVE | Binary pulse: 1 on session after S&P 500 addition (index inclusion effect) |
-| 11 | `index_constituents_added_dji` | PREDICTIVE | Binary pulse: 1 on session after Dow Jones addition |
+| 10 | `index_constituents_added_gspc` | REGIME | Binary pulse: 1 on session after S&P 500 addition ⚠️ Should be exp(-days/τ) |
+| 11 | `index_constituents_added_dji` | REGIME | Binary pulse: 1 on session after Dow Jones addition ⚠️ Should be exp(-days/τ) |
 | 12 | `index_constituents_days_since_add_gspc` | REGIME | Days since last S&P 500 addition (9999 if never added) |
 | 13 | `index_constituents_days_since_add_dji` | REGIME | Days since last Dow Jones addition |
 
@@ -2694,8 +2940,8 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 14 | `index_constituents_removed_gspc` | PREDICTIVE | Binary pulse: 1 on session after S&P 500 removal (index deletion effect) |
-| 15 | `index_constituents_removed_dji` | PREDICTIVE | Binary pulse: 1 on session after Dow Jones removal |
+| 14 | `index_constituents_removed_gspc` | REGIME | Binary pulse: 1 on session after S&P 500 removal ⚠️ Should be exp(-days/τ) |
+| 15 | `index_constituents_removed_dji` | REGIME | Binary pulse: 1 on session after Dow Jones removal ⚠️ Should be exp(-days/τ) |
 | 16 | `index_constituents_days_since_remove_gspc` | REGIME | Days since last S&P 500 removal (9999 if never removed) |
 | 17 | `index_constituents_days_since_remove_dji` | REGIME | Days since last Dow Jones removal |
 
@@ -2710,10 +2956,10 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 20 | `index_constituents_add_flow_5d` | PREDICTIVE | Rolling 5-day sum of addition events across tracked indices |
-| 21 | `index_constituents_add_flow_20d` | PREDICTIVE | Rolling 20-day sum of addition events (rebalancing wave) |
-| 22 | `index_constituents_remove_flow_5d` | PREDICTIVE | Rolling 5-day sum of removal events across tracked indices |
-| 23 | `index_constituents_remove_flow_20d` | PREDICTIVE | Rolling 20-day sum of removal events |
+| 20 | `index_constituents_add_flow_5d` | PREDICTIVE | Rolling 5-day sum of addition events (short-term flow) |
+| 21 | `index_constituents_add_flow_20d` | REGIME | Rolling 20-day sum of addition events (slow rebalancing wave) |
+| 22 | `index_constituents_remove_flow_5d` | PREDICTIVE | Rolling 5-day sum of removal events (short-term flow) |
+| 23 | `index_constituents_remove_flow_20d` | REGIME | Rolling 20-day sum of removal events (slow rebalancing wave) |
 
 ---
 
@@ -2741,6 +2987,22 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 **Look-Ahead Policy:** Membership changes applied on next session after event date (tradable timing)  
 **Tracked Indices:** S&P 500 (GSPC.INDX), Dow Jones (DJI.INDX) by default  
 **Weight Caveat:** Weights are current snapshots (last session), NOT historical time series
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Portfolio** (HYGIENE) | Governance columns, `has_hist_*` | Data quality + availability |
+| **Portfolio** (RISK) | `weight_gspc`, `weight_dji` | Liquidity scaling, position sizing |
+| **Portfolio** (REGIME) | `member_*`, `num_indices`, `days_since_*`, `added_*`, `removed_*`, `*_flow_20d` | Membership state, flow regime |
+| **Portfolio** (PREDICTIVE) | `add_flow_5d`, `remove_flow_5d` | Short-term flow signals (Portfolio use only) |
+| **Mamba** | ❌ **NO** | Not sequence learning material |
+
+**CRITICAL: This is flow + liquidity + institutional behavior, NOT sequence learning.** Binary pulses (added_*, removed_*) are too sharp for Mamba. They should be replaced with decaying pulses: `event_strength = exp(-days_since_event / τ)` where τ ≈ 10-20 sessions.
+
+**Binary → Decaying Pulse Migration:**
+- `added_gspc` → `exp(-days_since_add_gspc / 15)`
+- `removed_gspc` → `exp(-days_since_remove_gspc / 15)`
 
 ---
 
@@ -2850,50 +3112,45 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 
 ## marketcap_history Family — Full Feature Reference
 
-**Source:** EODHD Historical Market Capitalization API (weekly points, forward-filled to daily)  
+**Source:** EODHD Fundamentals API (SharesStats, Historical Market Cap)  
 **Columns:** 9 (8 features + 1 governance)  
-**Philosophy:** Size dynamics with +1 session leakage-safe shift and fundamentals-based fallback.
+**Philosophy:** Size, liquidity, and institutional regime conditioning. NOT pattern learning.
 
-**Design:** 
-- Primary: EODHD weekly market cap points (often starts ~2021)
-- Fallback: Close price × shares_outstanding from quarterly fundamentals (full history)
-- All points shifted +1 session for leakage safety
-- Forward-filled to daily (ffill_limit=10 to avoid stale data)
-- Log returns for statistical stability
+**Design:** Historical market cap dynamics with change metrics, volatility, and liquidity proxies. Core Portfolio + Policy Controller conditioning family.
 
 ### Governance Columns (1)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 1 | `marketcap_history_has_data` | HYGIENE | Boolean: market cap data available (>0) |
+| 1 | `marketcap_history_has_data` | HYGIENE | Boolean: market cap data available |
 
-### Core Market Cap Metrics (2)
+### Core Market Cap Level (2)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 2 | `marketcap_history_mcap` | REGIME | Market capitalization ($) - raw value |
-| 3 | `marketcap_history_log_mcap` | REGIME | Log(market cap) - for statistical stability |
+| 2 | `marketcap_history_mcap` | REGIME | Raw market cap (determines liquidity caps, turnover tolerance) |
+| 3 | `marketcap_history_log_mcap` | REGIME | Log market cap (Policy state, max_name, gross exposure) |
 
 ### Size Change Metrics (3)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 4 | `marketcap_history_mcap_chg_20d` | RISK | Log(mcap_t) - log(mcap_t-20) - 20-day size change |
-| 5 | `marketcap_history_mcap_chg_63d` | RISK | Log(mcap_t) - log(mcap_t-63) - 63-day size change (quarter) |
-| 6 | `marketcap_history_mcap_chg_252d` | RISK | Log(mcap_t) - log(mcap_t-252) - 252-day size change (year) |
+| 4 | `marketcap_history_mcap_chg_20d` | RISK | 20-day market cap change (dilution/M&A/short squeeze detector) |
+| 5 | `marketcap_history_mcap_chg_63d` | REGIME | 63-day market cap change (Policy state, size migration) |
+| 6 | `marketcap_history_mcap_chg_252d` | REGIME | 252-day market cap change (Policy state, bubble risk) |
 
-### Volatility Metrics (1)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 7 | `marketcap_history_mcap_vol_63d` | RISK | Rolling 63-day std of daily log market cap changes |
-
-### Liquidity Metrics (2)
+### Market Cap Volatility (1)
 
 | # | Column | Role | Description |
 |---|--------|------|-------------|
-| 8 | `marketcap_history_float_turnover` | RISK | Volume / shares_float (daily turnover ratio) |
-| 9 | `marketcap_history_turnover_z_252d` | RISK | Z-score of float_turnover vs 252-day distribution |
+| 7 | `marketcap_history_mcap_vol_63d` | RISK | 63-day std dev of log mcap (penalize unstable size) |
+
+### Liquidity & Turnover (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 8 | `marketcap_history_float_turnover` | RISK | Volume / float (liquidity proxy, turnover cap) |
+| 9 | `marketcap_history_turnover_z_252d` | REGIME | Z-score of turnover vs 252-day history (liquidity regime) |
 
 ---
 
@@ -2901,167 +3158,33 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 
 | Condition | Size Regime | Trading Implication |
 |-----------|-------------|---------------------|
-| `log_mcap` > 11 (e−11 ≈ $60B) | Mega-cap | Highly liquid, index-heavy, lower alpha |
-| `log_mcap` 9-11 ($8B-$60B) | Large-cap | S&P 500 territory, institutional ownership |
-| `log_mcap` 7-9 ($1B-$8B) | Mid-cap | Growth potential, moderate liquidity |
-| `log_mcap` < 7 (<$1B) | Small-cap | High alpha potential, illiquidity risk |
-| `mcap_chg_20d` > 0.2 | Rapid expansion | +22% in 20 days, momentum or bubble |
-| `mcap_chg_20d` < -0.2 | Rapid contraction | -18% in 20 days, distress or correction |
-| `mcap_chg_63d` > 0.5 | Major expansion | +65% in quarter, hyper-growth or acquisition |
-| `mcap_chg_252d` > 1.0 | Doubled in year | 2.7x annual return, extreme momentum |
-| `mcap_chg_252d` < -0.5 | Halved in year | -39% drawdown, distress or secular decline |
-| `mcap_vol_63d` > 0.05 | High volatility | Size unstable, price-driven or dilution events |
-| `mcap_vol_63d` < 0.02 | Low volatility | Stable size, predictable growth |
-| `float_turnover` > 0.05 | High turnover | 5% of float trades daily, very liquid |
-| `float_turnover` < 0.005 | Low turnover | <0.5% daily, illiquid or tightly held |
-| `turnover_z_252d` > 2 | Turnover spike | Unusual volume (news, event, rebalancing) |
-| `turnover_z_252d` < -2 | Turnover drought | Unusually low volume (holiday, neglect) |
+| `log_mcap` > 25 | Mega-cap (>$100B) | High liquidity, low impact cost |
+| `log_mcap` 23-25 | Large-cap ($10-100B) | Normal institutional liquidity |
+| `log_mcap` 21-23 | Mid-cap ($1-10B) | Moderate liquidity, capacity limits |
+| `log_mcap` < 21 | Small-cap (<$1B) | Low liquidity, high impact cost |
+| `mcap_chg_20d` > 0.15 | Rapid size increase | M&A target, squeeze, or momentum |
+| `mcap_chg_20d` < -0.15 | Rapid size decrease | Distress or correction |
+| `mcap_chg_252d` > 1.0 | Doubled in year | Bubble risk, sustainability check |
+| `mcap_vol_63d` > 0.3 | High size volatility | Unstable name, reduce leverage |
+| `float_turnover` > 0.1 | High turnover | Active trading, liquid but volatile |
+| `turnover_z_252d` > 2 | Unusual turnover | Event-driven activity |
 
-**Fallback Strategy:** If EODHD historical-market-cap unavailable or starts late, uses Close × shares_outstanding from quarterly fundamentals  
-**Leakage Policy:** Market cap points shifted +1 session after original date  
-**Forward-Fill:** Weekly points forward-filled to daily (max 10 sessions to avoid stale data)  
-**Turnover Caveat:** Requires shares_float from EODHD; fallback uses shares_outstanding as proxy
+### Stream Routing (Jan 2026)
 
----
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Portfolio** (REGIME) | `mcap`, `log_mcap`, `mcap_chg_63d`, `mcap_chg_252d`, `turnover_z_252d` | Liquidity caps, max_name, gross exposure |
+| **Portfolio** (RISK) | `mcap_chg_20d`, `mcap_vol_63d`, `float_turnover` | Risk scaling, turnover penalties |
+| **Portfolio** (HYGIENE) | `has_data` | Data quality gate |
+| **Policy Controller** | `log_mcap`, `mcap_chg_*`, `turnover_z_252d` | Aggression calibration by size regime |
+| **Mamba** | ❌ **NEVER** | Level ≠ alpha, size determines constraints not predictions |
 
-## microstructure Family — Full Feature Reference
-
-**Source:** Daily OHLCV from EODHD (primary) or UniversalDataFetcher (fallback)  
-**Columns:** 34 (31 features + 3 governance)  
-**Philosophy:** Raw mathematical microstructure features derived from OHLCV bars—NO ML, NO HF complexity.
-
-**Design:** 
-- **Scale-free**: All features normalized by price, volume, or ATR
-- **Continuous**: No binary flags (gradient-friendly for deep learning)
-- **Mathematically pure**: Direct OHLCV transformations
-- **Intraday fallback**: If intraday data available (≤30 days), uses minute bars; otherwise daily proxy
-- **Quote enhancement**: Last-row quote snapshot from EODHD (bid/ask/size) for near-real-time windows
-
-### Governance Columns (3)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 1 | `microstructure_has_data` | HYGIENE | Boolean: microstructure data available |
-| 2 | `microstructure_activity` | HYGIENE | Activity score (0-1) |
-| 3 | `microstructure_days_since_update` | HYGIENE | Days since last data update |
-
-### Range & Volatility Ratios (8)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 4 | `micro_true_range` | RISK | True range (max of H-L, |H-C_prev|, |L-C_prev|) |
-| 5 | `micro_atr_ratio` | RISK | ATR(14) / Close (volatility regime indicator) |
-| 6 | `micro_range_pct` | RISK | (High - Low) / Close (daily range as % of price) |
-| 7 | `micro_body_pct` | PREDICTIVE | |Close - Open| / Close (candle body size) |
-| 8 | `micro_wick_top` | PREDICTIVE | (High - max(Open,Close)) / Close (upper wick) |
-| 9 | `micro_wick_bottom` | PREDICTIVE | (min(Open,Close) - Low) / Close (lower wick) |
-| 10 | `micro_shadow_ratio` | PREDICTIVE | (Wick_top + Wick_bottom) / (Body + ε) (wick dominance) |
-| 11 | `micro_range_scaled` | RISK | (High - Low) / (ATR(14) + ε) (volatility normalization) |
-
-### Volume & Liquidity Proxies (6)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 12 | `micro_volume_zscore` | PREDICTIVE | (Volume - μ_20d) / σ_20d (volume surprise) |
-| 13 | `micro_volume_surge` | PREDICTIVE | Volume / μ_20d (relative volume) |
-| 14 | `micro_volume_liquidity` | RISK | Volume × Range (liquidity proxy) |
-| 15 | `micro_turnover` | RISK | Volume × Close (dollar turnover) |
-| 16 | `micro_amihud` | RISK | |Return| / (Volume + ε) × 1e6 (illiquidity measure) |
-| 17 | `micro_hl_volume_corr` | REGIME | Corr_20d(Range, Volume) (volume-volatility relationship) |
-
-### Order Flow Proxies (5)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 18 | `micro_ofi_proxy` | PREDICTIVE | sign(Close - Open) × Volume (order flow imbalance) |
-| 19 | `micro_signed_volume` | PREDICTIVE | Volume × Return_1d (signed volume) |
-| 20 | `micro_pressure_proxy` | PREDICTIVE | (Close - Open) / (Range + ε) (buying pressure) |
-| 21 | `micro_demand_supply_ratio` | PREDICTIVE | (Close - Low) / (High - Close + ε) (bid/ask dominance) |
-| 22 | `micro_liquidity_imbalance` | PREDICTIVE | demand_supply_ratio - 0.5 (centered imbalance) |
-
-### Volatility & Price Impact (5)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 23 | `micro_impact_ratio` | RISK | Range / (Volume + ε) × 1e9 (price impact per unit volume) |
-| 24 | `micro_impact_volatility` | RISK | RV_5d / (Volume + ε) × 1e9 (volatility impact) |
-| 25 | `micro_spread_proxy` | RISK | impact_ratio × 100 (bid-ask spread proxy) |
-| 26 | `micro_vol_of_vol` | RISK | RollingStd_5d(RV_5d) (volatility of volatility) |
-| 27 | `micro_intraday_vol_proxy` | RISK | Range / (Open + ε) (intraday volatility) |
-
-### Staleness (Inactivity) Proxies (3)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 28 | `micro_stale_tick` | HYGIENE | Binary: 1 if High == Low (zero range) |
-| 29 | `micro_zero_range_flag` | HYGIENE | Alias for stale_tick |
-| 30 | `micro_low_liquidity_flag` | HYGIENE | Binary: 1 if Volume < 30% of μ_20d |
-
-### Overnight Features (4)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 31 | `micro_overnight_gap` | PREDICTIVE | Open_t - Close_t-1 (overnight gap) |
-| 32 | `micro_overnight_vol` | RISK | |Overnight_gap| / Close_t-1 (gap magnitude) |
-| 33 | `micro_intraday_vs_overnight_vol` | RISK | Range / (|Gap| + ε) (intraday vs overnight ratio) |
-| 34 | `micro_gap_direction` | PREDICTIVE | sign(Overnight_gap) (gap direction) |
-
-### Optional Quote Features (9)
-
-**Note:** Only populated on last row for near-real-time windows (end date within 2 days of today)
-
-| # | Column | Role | Description |
-|---|--------|------|-------------|
-| 35 | `micro_quote_bid_price` | HYGIENE | Top-of-book bid price (EODHD delayed quote) |
-| 36 | `micro_quote_ask_price` | HYGIENE | Top-of-book ask price |
-| 37 | `micro_quote_bid_size` | HYGIENE | Bid size (shares) |
-| 38 | `micro_quote_ask_size` | HYGIENE | Ask size (shares) |
-| 39 | `micro_quote_mid_price` | HYGIENE | (Bid + Ask) / 2 |
-| 40 | `micro_quote_spread_abs` | RISK | Ask - Bid (absolute spread) |
-| 41 | `micro_quote_spread_bps` | RISK | 10,000 × Spread / Mid (spread in basis points) |
-| 42 | `micro_quote_imbalance` | PREDICTIVE | (Bid_size - Ask_size) / (Bid_size + Ask_size) |
-| 43 | `micro_quote_has_data` | HYGIENE | Binary: 1 if quote data available |
+**CRITICAL: Size level determines liquidity caps, turnover tolerance, max_name, gross exposure. These are constraints, not alpha.**
 
 ---
 
-### Interpretation Guide
 
-| Condition | Microstructure State | Trading Implication |
-|-----------|----------------------|---------------------|
-| `amihud` > 100 | High illiquidity | Wide spreads, high impact cost |
-| `amihud` < 10 | High liquidity | Tight spreads, low impact cost |
-| `ofi_proxy` > 0 | Net buying pressure | Demand exceeds supply |
-| `ofi_proxy` < 0 | Net selling pressure | Supply exceeds demand |
-| `volume_surge` > 2 | Abnormal volume | News event, institutional activity |
-| `volume_surge` < 0.5 | Below-average volume | Low participation, illiquid |
-| `pressure_proxy` > 0.5 | Strong buying | Close near high |
-| `pressure_proxy` < -0.5 | Strong selling | Close near low |
-| `demand_supply_ratio` > 2 | Bid dominance | Buyers willing to pay up |
-| `demand_supply_ratio` < 0.5 | Ask dominance | Sellers pressing |
-| `spread_proxy` > 50 | Wide spread | Illiquid, high transaction costs |
-| `spread_proxy` < 10 | Tight spread | Liquid, low transaction costs |
-| `vol_of_vol` spike | Regime instability | Volatility regime changing |
-| `stale_tick` = 1 | No trading | Halted or extremely illiquid |
-| `low_liquidity_flag` = 1 | Illiquid session | Caution: high impact cost |
-| `overnight_gap` > 2% | Major gap | News overnight, revaluation |
-| `quote_imbalance` > 0.3 | Bid-heavy order book | Buying interest, support |
-| `quote_imbalance` < -0.3 | Ask-heavy order book | Selling pressure, resistance |
 
-**Data Sources:**
-- **Primary**: EODHD daily OHLCV
-- **Intraday (≤30d)**: EODHD 5m bars or AlphaVantage 1m/5m/15m bars
-- **Quote Snapshot**: EODHD delayed quotes (last row only, near-real-time windows)
-
-**Feature Categories:**
-1. Range & Volatility Ratios (8)
-2. Volume & Liquidity Proxies (6)
-3. Order Flow Proxies (5)
-4. Volatility & Price Impact (5)
-5. Staleness Proxies (3)
-6. Overnight Features (4)
-7. Quote Features (9, optional)
-
----
 
 ## ml_framework Family — Full Feature Reference
 
@@ -3150,6 +3273,131 @@ ccc_stress = 1 / (1 + exp(-(ccc - 60) / 30))
 **Data Consistency:** All indicators sourced from EODHD API ensure reproducibility across different environments (no local calculation variance).
 
 **Lookback Strategy:** 365-day lookback ensures sufficient history for all rolling calculations, then restricted to requested date range.
+
+---
+
+## microstructure Family — Full Feature Reference
+
+**Source:** Daily OHLCV data (universal fetcher)  
+**Columns:** 34 (31 features + 3 governance)  
+**Philosophy:** Primary Mamba input family. Surgically clean separation of candle geometry/order-flow (Mamba) vs volatility/spreads (Portfolio).
+
+**Design:** This is the most important family for Mamba. Candle geometry, volume surprises, order-flow proxies, and overnight gaps are predictive. Impact, spreads, liquidity, and volatility are risk/regime overlays.
+
+### Governance Columns (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `microstructure_has_data` | HYGIENE | Boolean: OHLCV data available |
+| 2 | `microstructure_activity` | HYGIENE | Activity score (0-1) |
+| 3 | `microstructure_days_since_update` | HYGIENE | Days since last data update |
+
+### Range & Volatility Ratios (8) → Portfolio
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 4 | `microstructure_true_range` | RISK | High - Low (daily range) |
+| 5 | `microstructure_atr_ratio` | RISK | True Range / ATR (volatility normalization) |
+| 6 | `microstructure_range_pct` | RISK | Range / Close (% volatility) |
+| 7 | `microstructure_body_pct` | PREDICTIVE | |Close - Open| / Range (candle body → Mamba) |
+| 8 | `microstructure_wick_top` | PREDICTIVE | (High - max(O,C)) / Range (upper shadow → Mamba) |
+| 9 | `microstructure_wick_bottom` | PREDICTIVE | (min(O,C) - Low) / Range (lower shadow → Mamba) |
+| 10 | `microstructure_shadow_ratio` | PREDICTIVE | Wick / Body ratio (indecision → Mamba) |
+| 11 | `microstructure_range_scaled` | RISK | Range scaled by historical volatility |
+
+### Volume & Liquidity Proxies (6)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 12 | `microstructure_volume_zscore` | PREDICTIVE | Volume z-score vs rolling mean (surprise → Mamba) |
+| 13 | `microstructure_volume_surge` | PREDICTIVE | Volume / MA(20) (breakout detector → Mamba) |
+| 14 | `microstructure_volume_liquidity` | RISK | Volume * Close (dollar volume → Portfolio) |
+| 15 | `microstructure_turnover` | RISK | Volume / Shares Outstanding (→ Portfolio) |
+| 16 | `microstructure_amihud` | RISK | |Return| / Dollar Volume (illiquidity → Portfolio) |
+| 17 | `microstructure_hl_volume_corr` | REGIME | Correlation(range, volume) over 20d (regime) |
+
+### Order-Flow Proxies (5) → Mamba Gold
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 18 | `microstructure_ofi_proxy` | PREDICTIVE | Order flow imbalance proxy → Mamba |
+| 19 | `microstructure_signed_volume` | PREDICTIVE | Sign(close-open) * volume → Mamba |
+| 20 | `microstructure_pressure_proxy` | PREDICTIVE | Buying/selling pressure → Mamba |
+| 21 | `microstructure_demand_supply_ratio` | PREDICTIVE | Demand vs supply ratio → Mamba |
+| 22 | `microstructure_liquidity_imbalance` | PREDICTIVE | Bid/ask liquidity imbalance → Mamba |
+
+### Volatility & Price Impact (5) → Portfolio
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 23 | `microstructure_impact_ratio` | RISK | Price impact per dollar traded |
+| 24 | `microstructure_impact_volatility` | RISK | Volatility of impact ratio |
+| 25 | `microstructure_spread_proxy` | RISK | Bid-ask spread proxy from OHLC |
+| 26 | `microstructure_vol_of_vol` | REGIME | Std dev of realized vol (regime instability → Policy) |
+| 27 | `microstructure_intraday_vol_proxy` | RISK | Intraday volatility estimate |
+
+### Staleness / Inactivity Flags (3) → HYGIENE Only
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 28 | `microstructure_stale_tick` | HYGIENE | Binary: stale/unchanged price (gating only) |
+| 29 | `microstructure_zero_range_flag` | HYGIENE | Binary: H=L (duplicate, REMOVE) ⚠️ |
+| 30 | `microstructure_low_liquidity_flag` | HYGIENE | Binary: below liquidity threshold (gating only) |
+
+### Overnight Features (4)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 31 | `microstructure_overnight_gap` | PREDICTIVE | (Open_t - Close_t-1) / Close_t-1 (gap → Mamba) |
+| 32 | `microstructure_overnight_vol` | RISK | Overnight gap volatility → Portfolio |
+| 33 | `microstructure_intraday_vs_overnight_vol` | RISK | Intraday / Overnight vol ratio → Portfolio |
+| 34 | `microstructure_gap_direction` | REGIME | Sign of gap {-1, 0, 1} (optional if embedded) |
+
+### Quote Features (9) → Mixed (Careful Time-Gating Required)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 35 | `microstructure_quote_has_data` | HYGIENE | Boolean: quote data available |
+| 36 | `microstructure_bid` | HYGIENE | Bid price (last row only, NOT historical) |
+| 37 | `microstructure_ask` | HYGIENE | Ask price (last row only, NOT historical) |
+| 38 | `microstructure_bid_size` | HYGIENE | Bid size (last row only) |
+| 39 | `microstructure_ask_size` | HYGIENE | Ask size (last row only) |
+| 40 | `microstructure_spread_abs` | RISK | Absolute spread (ask - bid) → Portfolio |
+| 41 | `microstructure_spread_bps` | RISK | Spread in basis points → Portfolio |
+| 42 | `microstructure_quote_imbalance` | PREDICTIVE | (bid_size - ask_size) / (bid_size + ask_size) → Mamba ⚠️ time-gate |
+
+---
+
+### Interpretation Guide
+
+| Condition | Microstructure State | Trading Implication |
+|-----------|---------------------|---------------------|
+| `body_pct` > 0.8 | Strong conviction | Directional momentum likely |
+| `body_pct` < 0.3 | Indecision (doji-like) | Reversal or pause |
+| `shadow_ratio` > 2 | Long wicks | Rejection, reversal signal |
+| `volume_zscore` > 2 | Volume surge | Breakout or news event |
+| `ofi_proxy` extreme | Order imbalance | Direction pressure |
+| `overnight_gap` > 0.02 | 2% gap up | Event-driven, check news |
+| `overnight_gap` < -0.02 | 2% gap down | Risk event, check news |
+| `amihud` high | Illiquid | High impact cost, reduce size |
+| `spread_bps` > 50 | Wide spread | Execution cost, avoid |
+| `stale_tick` = 1 | No price change | Data issue or halt, gate |
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (PREDICTIVE) | `body_pct`, `wick_top`, `wick_bottom`, `shadow_ratio`, `volume_zscore`, `volume_surge`, `ofi_proxy`, `signed_volume`, `pressure_proxy`, `demand_supply_ratio`, `liquidity_imbalance`, `overnight_gap`, `quote_imbalance` | Candle geometry, order-flow, gaps |
+| **Portfolio** (RISK) | `true_range`, `atr_ratio`, `range_pct`, `range_scaled`, `volume_liquidity`, `turnover`, `amihud`, `impact_*`, `spread_*`, `overnight_vol`, `intraday_*` | Impact, spreads, liquidity |
+| **Portfolio** (REGIME) | `hl_volume_corr`, `vol_of_vol`, `gap_direction` | Liquidity regime, vol regime |
+| **Portfolio** (HYGIENE) | Governance, `stale_tick`, `zero_range_flag`, `low_liquidity_flag`, quote levels | Gating, NOT learning |
+| **Policy Controller** | `vol_of_vol`, `hl_volume_corr` | Regime instability |
+
+**CRITICAL: Binary flags (stale_tick, zero_range_flag, low_liquidity_flag) kill gradients. They are for gating ONLY, never learning.**
+
+**Quote Time-Gating:** Quotes exist only on last row. You must mask or time-gate them so Mamba never treats them as historical sequences.
+
+**Explicit Removal:** `zero_range_flag` is duplicate of `stale_tick`. Remove from models.
 
 ---
 
@@ -3268,6 +3516,25 @@ The multiasset family provides institutional-grade equity benchmark correlation 
 - Source: Tiingo price data
 - Method: Equity benchmark exposure analysis
 - Full time series (not snapshot)
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Portfolio** (RISK) | `corr_*_120`, `beta_*_120`, `equity_factor_market` | Systematic exposure, position sizing |
+| **Portfolio** (REGIME) | `equity_factor_growth_value`, `equity_factor_size` | Style factor regime |
+| **Portfolio** (PREDICTIVE) | `spread_spy_20` | Relative strength allocator (Portfolio use only) |
+| **Portfolio** (HYGIENE) | Governance columns | Data quality gate |
+| **Policy Controller** | `beta_*_120`, `equity_factor_growth_value`, `equity_factor_size` | Aggression calibration by systematic exposure |
+| **Mamba** | ❌ **NO** (except optional clipped `spread_spy_20`) | Not short-horizon price formation |
+
+**CRITICAL: This family measures systematic exposure, not short-horizon price formation.** Betas and correlations are slow-moving (120-day windows) and break sequence stationarity. PCA factors are structural, not predictive.
+
+**Optional Mamba Exception:**
+- `spread_spy_20` can go to Mamba ONLY IF:
+  - Clipped tightly (e.g., ±3σ)
+  - NOT combined with absolute returns
+- Default recommendation: Portfolio allocator only
 
 ---
 
@@ -3415,6 +3682,23 @@ The options family provides raw options chain metrics for detecting:
 - Source: `eodhd_options_api`
 - Feature type: `raw_options_metrics`
 - No directional signals — Stage A learns patterns
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Portfolio** (RISK) | `atm_iv`, `call_iv_avg`, `put_iv_avg`, `iv_spread`, `bid_ask_spread_pct` | IV scaling, liquidity |
+| **Portfolio** (HYGIENE) | `has_data`, `strikes_available`, `expiries_available`, `confidence`, pricing columns | Chain health, gating |
+| **Policy Controller** (REGIME) | `call/put_volume`, `put_call_volume_ratio`, `call/put_oi`, `put_call_oi_ratio`, `otm_*_pct`, `nearest_expiry_days` | Sentiment, positioning, event proximity |
+| **Mamba** | ❌ **NO** | Snapshot architecture destroys temporal learning |
+
+**CRITICAL: Snapshot-only data with zero-fill on non-snapshot dates destroys temporal learning.** This family is for Policy conditioning + Portfolio constraints only.
+
+**Pricing Features (bid/ask/last):** These are chain health diagnostics, NOT signals. Route to HYGIENE.
+
+**Optional Mamba Exposure:** If you really want Mamba to see options:
+- Use `options_anchoring` family instead (has temporal decay)
+- Only allow: `zscore(atm_iv vs 60d realized vol)` (not in this family)
 
 ---
 ## `options_anchoring` Family (Full Feature Reference)
@@ -3565,6 +3849,27 @@ The options family provides raw options chain metrics for detecting:
 - Source: `eodhd_options_api_with_yfinance_fallback`
 - Feature type: `institutional_options_anchoring`
 - Decay model: `exponential_halflife_3_5_20`
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (10 cols) | `iv_anchor_pct`, `iv_percentile_30d`, `iv_percentile_1yr`, `iv_skew_anchor`, `iv_skew_zscore`, `risk_reversal_25d`, `expected_move_pct`, `em_vs_real_vol_ratio`, `put_call_vol_ratio_anchor`, `put_call_oi_ratio_anchor` | IV regime, skew, expected move, positioning |
+| **Portfolio** (all 12) | All columns | Risk mgmt + gating + monitoring |
+| **Portfolio** (HYGIENE) | `days_since_update`, `confidence` | Freshness gating, NOT alpha |
+| **Policy Controller** | `iv_anchor_pct`, `iv_percentile_*`, `iv_skew_*`, `put_call_*_ratio_anchor` | Regime conditioning, aggression calibration |
+
+**Role Corrections (Jan 2026):**
+| Column | Old Role | Corrected Role | Rationale |
+|--------|----------|----------------|----------|
+| `iv_anchor_pct` | RISK | REGIME | Z-score describes IV environment, not portfolio risk scaling |
+| `iv_percentile_30d` | RISK | REGIME | Percentile is regime context |
+| `iv_percentile_1yr` | RISK | REGIME | Slow regime context |
+| `iv_skew_anchor` | RISK | REGIME | Skew = sentiment/fear regime variable |
+| `iv_skew_zscore` | RISK | REGIME | Normalized skew state |
+| `risk_reversal_25d` | RISK | REGIME | Institutional skew proxy → regime |
+
+**CRITICAL: This family goes to BOTH Mamba and Portfolio.** Daily time-series, leakage-safe, continuous, decay-weighted. Only HYGIENE columns excluded from Mamba.
 
 ---
 
@@ -3717,6 +4022,30 @@ The options family provides raw options chain metrics for detecting:
 - Source: `tiingo_price_data`
 - Method: `regime_classification_institutional`
 - Features: 9 (no separate governance columns)
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (8 cols, recommended) | `bull_probability`, `bear_probability`, `neutral_probability`, `duration`, `change_flag`, `trend_ratio`, `trend_ratio_zscore`, `volatility_20d` | Regime conditioning, trend strength, extreme detection |
+| **Mamba** (optional) | `regime_label` | Discrete label (recommend exclude — prefer probabilities) |
+| **Portfolio** (all 9) | All columns | Gating, risk scaling, regime awareness |
+| **Policy Controller** | `bull_probability`, `bear_probability`, `duration`, `change_flag`, `volatility_20d` | Aggression calibration, regime-aware behavior |
+
+**Mamba Column Recommendations:**
+| Column | Mamba? | Rationale |
+|--------|--------|----------|
+| `bull_probability` | ✅ YES | Continuous (0-1), best for gradient learning |
+| `bear_probability` | ✅ YES | Continuous (0-1), best for gradient learning |
+| `neutral_probability` | ✅ YES | Continuous (0-1), derived but informative |
+| `regime_label` | ⚠️ Optional | Discrete (0/1/2), introduces discontinuities — prefer probabilities |
+| `duration` | ✅ YES | Fresh vs mature regime context |
+| `change_flag` | ✅ YES | Transition risk indicator |
+| `trend_ratio` | ✅ YES | Continuous trend strength |
+| `trend_ratio_zscore` | ✅ YES | Extreme detector, good conditioning |
+| `volatility_20d` | ✅ YES | Sizing control + conditioning variable |
+
+**CRITICAL: This family is inherently model conditioning + portfolio gating.** All columns go to BOTH streams. Only recommendation: exclude `regime_label` from Mamba (probabilities carry same info without discontinuities).
 
 ---
 
@@ -3948,6 +4277,31 @@ When data unavailable, returns stub DataFrame with:
 - Status: 'ok', 'dormant:*', or 'error'
 - Features: 21 columns (20 features + 1 governance)
 
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (6 cols) | `change_1m`, `change_3m`, `momentum`, `squeeze_risk_flag`, `squeeze_risk_score`, `squeeze_probability` | Directional positioning evolution, squeeze forecasting |
+| **Portfolio** (RISK) | `percent`, `ratio`, `days_to_cover`, `float_short_pct`, `shares_on_loan_pct`, `borrow_rate` | Risk constraints, sizing limits |
+| **Portfolio** (REGIME) | `zscore_1y`, `pct_zscore_3y`, `short_to_oi_ratio`, `short_vs_institutional`, `borrow_rate_zscore_3y` | Crowdedness regime gating |
+| **Portfolio** (HYGIENE) | `has_data`, `confidence`, `conf`, `score_raw`, `score` | Data quality, governance |
+| **Policy Controller** | `float_short_pct`, `squeeze_probability`, `borrow_rate` | Crowded-short risk awareness |
+
+**Role Summary:**
+| Role | Columns | Mamba? | Rationale |
+|------|---------|--------|----------|
+| HYGIENE | `has_data`, `confidence`, `conf`, `score_raw`, `score` | ❌ NO | Governance/quality |
+| RISK | `percent`, `ratio`, `days_to_cover`, `float_short_pct`, `shares_on_loan_pct`, `borrow_rate` | ❌ NO | Portfolio constraints |
+| PREDICTIVE | `change_1m`, `change_3m`, `momentum`, `squeeze_*` | ✅ YES | Directional signals |
+| REGIME | `zscore_*`, `short_to_oi_ratio`, `short_vs_institutional`, `borrow_rate_zscore_3y` | ❌ NO | Crowdedness gating |
+
+**CRITICAL: Bi-monthly data is forward-filled.** Avoid letting Mamba learn data-availability patterns from REGIME columns. Only PREDICTIVE columns (change/momentum/squeeze) go to Mamba.
+
+**Alias Warning (Implementation Note):**
+- `conf` is alias of `confidence` — consider dropping one
+- `days_to_cover` is alias of `ratio` — consider dropping one
+- Keeping aliases risks (a) double-counting in feature selection and (b) inflated importance from duplicated signal
+
 ---
 
 ## `subsidiary` Family (Full Feature Reference)
@@ -4128,6 +4482,35 @@ When data unavailable, returns stub DataFrame with:
 - Source: `eodhd_quarterly_income_statement`
 - Metrics: `['rd', 'opex', 'rd_intensity', 'rd_qoq_growth', 'opex_qoq_growth', 'rd_yoy_growth', 'opex_yoy_growth', 'complexity_score']`
 - Type: `quarterly_opex_rd`
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Portfolio** (REGIME) | `rd_spending`, `opex_spending`, `complexity_score`, `rd_intensity`, `*_qoq_growth`, `*_yoy_growth` | Operational scale context, complexity regime |
+| **Portfolio** (HYGIENE) | `has_data`, `activity`, `days_since_update`, `confidence` | Governance |
+| **Policy Controller** | `complexity_score`, `rd_intensity` | Operational complexity calibration |
+| **Mamba** | ❌ **NO** | Quarterly, slow-moving, publication-lagged |
+
+**Role Corrections (Jan 2026):**
+| Column | Spec Role | Corrected Role | Rationale |
+|--------|-----------|----------------|----------|
+| `rd_intensity` | PREDICTIVE | REGIME | Quarterly, slow-moving; better as context |
+| `rd_qoq_growth` | PREDICTIVE | REGIME | Quarterly, publication-lagged |
+| `opex_qoq_growth` | PREDICTIVE | REGIME | Quarterly, publication-lagged |
+| `rd_yoy_growth` | PREDICTIVE | REGIME | Quarterly, slow-moving |
+| `opex_yoy_growth` | PREDICTIVE | REGIME | Quarterly, slow-moving |
+
+**CRITICAL: All columns are slow-moving structural descriptors.** Quarterly financials are publication-lagged (30-45 days after quarter end) and move slowly. They work best as context (complexity regime, operational scale normalization), not short-horizon alpha.
+
+**Exception for Long-Horizon Models:**
+If you have a long-horizon head (30-252d targets), move growth/intensity features to PREDICTIVE for that head only.
+
+**Root Cause Check:**
+If this family "doesn't plug in" correctly, verify:
+1. Family is in `family_meta` mapping with `primary_intent=REGIME`
+2. Role inference isn't defaulting to PREDICTIVE
+3. Routing sends all columns to Portfolio parquet only
 
 ---
 
@@ -4361,6 +4744,31 @@ This family is designed as **input features for time-series forecasting models**
 - Lookback days: `365`
 - Features: 17 columns
 
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (4 cols) | `trend_short_strength`, `trend_long_strength`, `trend_signal_to_noise`, `trend_importance` | Multi-scale trend signals |
+| **Portfolio** (RISK) | `vol_short`, `vol_long`, `vol_trend`, `volatility_importance` | Volatility for sizing |
+| **Portfolio** (REGIME) | `trend_consistency`, `vol_regime_zscore`, `weekday_effect`, `month_phase`, `seasonality_importance`, `stability_short`, `stability_long`, `stability_score` | Seasonality, stability, vol regime |
+| **Portfolio** (HYGIENE) | `CONFIDENCE` | Dynamic confidence score |
+| **Policy Controller** | `vol_regime_zscore`, `stability_long`, `trend_consistency` | Regime awareness, predictability |
+
+**Role Summary:**
+| Role | Columns | Mamba? | Rationale |
+|------|---------|--------|----------|
+| PREDICTIVE | `trend_short_strength`, `trend_long_strength`, `trend_signal_to_noise`, `trend_importance` | ✅ YES | Trend direction + strength |
+| RISK | `vol_short`, `vol_long`, `vol_trend`, `volatility_importance` | ❌ NO | Sizing constraints |
+| REGIME | `trend_consistency`, `vol_regime_zscore`, `weekday_effect`, `month_phase`, `seasonality_importance`, `stability_*` | ❌ NO | Market state descriptors |
+| HYGIENE | `CONFIDENCE` | ❌ NO | Data quality gating |
+
+**CRITICAL: High misclassification risk.** These columns often lack "risk/regime" tokens and default to PREDICTIVE incorrectly:
+- `trend_consistency` → actually REGIME (fraction positive, not trend direction)
+- `weekday_effect`, `month_phase` → actually REGIME (calendar patterns)
+- `stability_*` → actually REGIME (predictability, not alpha)
+
+The explicit role override ensures correct routing.
+
 ---
 
 ## `peer_screener_context` Family (Full Feature Reference)
@@ -4554,5 +4962,1570 @@ This family is designed as **input features for time-series forecasting models**
 - `leakage`: "peer metrics shifted +1 NYSE session(s)"
 - `universe_source`: "env", "DEFAULT_CANDIDATE_UNIVERSE", or "target_only"
 - `min_peers_configured`, `min_peers_effective`: Adaptive gating thresholds
+
+### Stream Routing (Jan 2026)
+
+| Stream | Columns | Purpose |
+|--------|---------|---------|  
+| **Mamba** (10 cols) | `sector_pe_ratio_cheap_pct`, `sector_pb_ratio_cheap_pct`, `sector_ev_ebitda_cheap_pct`, `industry_pe_ratio_cheap_pct`, `industry_pb_ratio_cheap_pct`, `industry_ev_ebitda_cheap_pct`, `universe_momentum_z`, `universe_valuation_z`, `universe_momentum_pct`, `universe_valuation_pct` | Relative value + universe momentum/valuation |
+| **Portfolio** (REGIME) | `sector_pe_ratio_pct`, `sector_pb_ratio_pct`, `sector_ev_ebitda_pct`, `industry_pe_ratio_pct`, `industry_pb_ratio_pct`, `industry_ev_ebitda_pct` | Peer percentile context |
+| **Portfolio** (RISK) | `universe_options_iv_z`, `universe_options_skew_z`, `universe_short_interest_z`, `universe_options_iv_pct`, `universe_options_skew_pct` | Portfolio risk constraints |
+| **Portfolio** (HYGIENE) | `has_data`, `sector_peer_count`, `industry_peer_count` | Governance, peer data quality |
+| **Policy Controller** | `universe_momentum_z`, `universe_valuation_z`, `sector_*_cheap_pct` | Cross-sectional regime awareness |
+
+**Role Summary:**
+| Role | Columns | Mamba? | Rationale |
+|------|---------|--------|----------|
+| HYGIENE | `has_data`, `*_peer_count` | ❌ NO | Data quality, not alpha |
+| PREDICTIVE | `*_cheap_pct`, `universe_momentum_*`, `universe_valuation_*` | ✅ YES | Relative value signals |
+| REGIME | `sector_*_pct`, `industry_*_pct` | ❌ NO | Context, not direct alpha |
+| RISK | `universe_options_iv_z`, `universe_options_skew_z`, `universe_short_interest_z`, `universe_*_pct` | ❌ NO | Portfolio constraints |
+
+**CRITICAL: High misclassification risk.** These columns often default to PREDICTIVE incorrectly:
+- `*_peer_count` → actually HYGIENE (data quality)
+- `sector_*_pct`, `industry_*_pct` → actually REGIME (context, not alpha)
+- `universe_options_iv_z`, `universe_options_skew_z`, `universe_short_interest_z` → actually RISK (constraints)
+
+The explicit role override ensures correct routing.
+
+---
+
+## doc_embedding_novelty_hf-family-full-feature-reference
+
+**Family**: `doc_embedding_novelty_hf`  
+**Total Columns**: 15 features (no separate governance)  
+**Data Source**: GDELT Global Events (GKG + Event 2.0)  
+**Symbol-Independent**: Yes (shared cache across all symbols)  
+**Embedding Model**: sentence-transformers/all-mpnet-base-v2
+
+**Governance**: None (symbol-independent family with shared global cache)
+
+---
+
+### Feature List (15)
+
+#### Overall Novelty Metrics (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `doc_embedding_novelty_hf_score` | PREDICTIVE | Overall novelty score (0-1) measuring semantic distance from baseline |
+| 2 | `doc_embedding_novelty_hf_conf` | RISK | Confidence score based on event count and coherence |
+
+#### Event Counts (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 3 | `doc_embedding_novelty_hf_n_events` | HYGIENE | Number of GDELT events on this date |
+| 4 | `doc_embedding_novelty_hf_n_articles` | HYGIENE | Number of source articles for events |
+
+#### Cluster-Specific Novelty (6)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 5 | `doc_embedding_novelty_hf_novelty_macro` | REGIME | Novelty score for macro/economic cluster |
+| 6 | `doc_embedding_novelty_hf_novelty_geopolitical` | REGIME | Novelty score for geopolitical cluster |
+| 7 | `doc_embedding_novelty_hf_novelty_regulatory` | REGIME | Novelty score for regulatory/policy cluster |
+| 8 | `doc_embedding_novelty_hf_novelty_energy` | REGIME | Novelty score for energy/commodities cluster |
+| 9 | `doc_embedding_novelty_hf_novelty_conflict` | REGIME | Novelty score for conflict/crisis cluster |
+| 10 | `doc_embedding_novelty_hf_novelty_tech` | REGIME | Novelty score for technology/innovation cluster |
+
+#### Metadata & Flags (5)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 11 | `doc_embedding_novelty_hf_top_theme` | HYGIENE | Most prominent GDELT theme on this date |
+| 12 | `doc_embedding_novelty_hf_theme_weight` | HYGIENE | Weight/relevance of top theme |
+| 13 | `doc_embedding_novelty_hf_baseline_mean` | HYGIENE | Mean embedding from 90-day baseline period |
+| 14 | `doc_embedding_novelty_hf_novelty_spike_flag` | REGIME | Binary flag for >2σ novelty spikes (0 or 1) |
+| 15 | `doc_embedding_novelty_hf_novelty_persistence_5d` | REGIME | Fraction of last 5 days with high novelty (0-1) |
+
+---
+
+### Interpretation Guide
+
+**Overall Novelty:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7 | High global novelty | Regime shift underway, prices lag |
+| `score` > 0.5, `conf` > 0.8 | Confirmed regime change | High-confidence structural break |
+| `score` < 0.3 | Business as usual | Normal market conditions |
+| `conf` < 0.3 | Low event coherence | Noisy/scattered signals, low actionability |
+
+**Cluster-Specific Novelty:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `novelty_macro` > 0.7 | Macro regime shift | Central bank policy change, inflation shock |
+| `novelty_geopolitical` > 0.7 | Geopolitical event | Trade war, sanctions, elections |
+| `novelty_regulatory` > 0.7 | Regulatory change | New policy, deregulation, antitrust |
+| `novelty_energy` > 0.7 | Energy shock | Oil price disruption, OPEC decision |
+| `novelty_conflict` > 0.7 | Crisis event | Military action, political crisis |
+| `novelty_tech` > 0.7 | Tech disruption | Major innovation, breakthrough |
+
+**Spike Detection:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `novelty_spike_flag` = 1 | Anomalous day | >2σ deviation from baseline, event-driven |
+| `novelty_persistence_5d` > 0.6 | Sustained novelty | 3+ high-novelty days in last 5, regime ongoing |
+| `novelty_persistence_5d` < 0.2 | Transient spike | 1-day event, likely reversal |
+
+**Event Quality:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `n_events` > 1000 | High coverage day | Major global event, widespread impact |
+| `n_events` < 100 | Quiet day | Limited event activity, baseline conditions |
+| `n_articles` / `n_events` > 5 | High media attention | Events with multiple source confirmations |
+
+---
+
+### Design Notes
+
+**Architecture:**
+- **Symbol-Independent**: Single shared cache for ALL symbols (global events don't vary by symbol)
+- **Cache Path**: `cache/shared/doc_embedding/doc_embedding_novelty_hf.parquet`
+- **GDELT Sources**: 
+  - GKG (Global Knowledge Graph): themes, entities, tone, locations
+  - Event 2.0: event codes, actors, Goldstein scale (conflict intensity)
+- **Embedding Model**: sentence-transformers/all-mpnet-base-v2 (768-dim embeddings)
+- **Baseline Period**: 90 days BEFORE training period (fixed reference for novelty)
+
+**Sampling Strategy:**
+- **Month-by-Month Stratified Sampling**: ~350 events per cluster per month
+- **Target**: Max 1500 events per period (balanced across clusters)
+- **Event Clusters**: macro, geopolitical, regulatory, energy, conflict, tech
+- **Quality Filters**: Min 20 chars, <50% numeric words, valid metadata
+
+**Novelty Calculation:**
+- **Metric**: Cosine distance from 90-day baseline mean embedding
+- **Threshold**: 0.15 for confidence conversion (novelty > 0.15 → conf=1)
+- **Confidence**: Based on event count, coherence, and cluster consistency
+
+**GDELT Event Classification:**
+- **Theme Keywords**: Automatic classification using EVENT_CLUSTERS dictionary
+- **Examples**:
+  - Macro: ECON, TAX, BUDGET, INFLATION, UNEMPLOYMENT
+  - Geopolitical: DIPLOMACY, ELECTION, SANCTION, TRADE_WAR
+  - Regulatory: REGULATION, POLICY, ANTITRUST, COMPLIANCE
+  - Energy: ENERGY, OIL, GAS, RENEWABLE, OPEC
+  - Conflict: MILITARY, CRISIS, CONFLICT, PROTEST
+  - Tech: TECH, AI, INNOVATION, DIGITAL, CYBER
+
+**Parallel Processing:**
+- **Workers**: Configurable via `fetcher_workers` (default=40)
+- **Batch Size**: Embedding batch size (default=32)
+- **GPU Support**: Auto-detects CUDA availability
+
+**Decay & Rebalancing:**
+- Global events have no symbol-specific decay
+- Rebalanced daily as new events arrive
+- Baseline recomputed for each training period
+
+**Telemetry:**
+- `source`: "GDELTGlobalFetcher" or "cache"
+- `model`: "sentence-transformers/all-mpnet-base-v2"
+- `baseline_days`: 90
+- `max_events_per_period`: 1500
+- `cluster_coverage`: Distribution of events across clusters
+
+**Data Quality:**
+- Returns empty DataFrame if GDELT fetcher unavailable
+- Skips corrupted/low-quality event texts
+- Validates embedding coherence before storing
+- Logs cluster distribution for monitoring
+
+---
+
+### Stream Routing
+
+**Mamba Parquet: 1 column ONLY**
+| Column | Role | Signal |
+|--------|------|--------|
+| `doc_embedding_novelty_hf_score` | PREDICTIVE | Overall novelty score (0-1) |
+
+**Portfolio Parquet: 14 columns**
+| Column | Role | Signal |
+|--------|------|--------|
+| `doc_embedding_novelty_hf_conf` | RISK | Confidence based on event count/coherence |
+| `doc_embedding_novelty_hf_n_events` | HYGIENE | Event count (data quality) |
+| `doc_embedding_novelty_hf_n_articles` | HYGIENE | Article count (data quality) |
+| `doc_embedding_novelty_hf_top_theme` | HYGIENE | Top theme (string - may coerce to 0.0) |
+| `doc_embedding_novelty_hf_theme_weight` | HYGIENE | Theme relevance weight |
+| `doc_embedding_novelty_hf_baseline_mean` | HYGIENE | Baseline mean (may not be scalar) |
+| `doc_embedding_novelty_hf_novelty_macro` | REGIME | Macro/economic cluster novelty |
+| `doc_embedding_novelty_hf_novelty_geopolitical` | REGIME | Geopolitical cluster novelty |
+| `doc_embedding_novelty_hf_novelty_regulatory` | REGIME | Regulatory/policy cluster novelty |
+| `doc_embedding_novelty_hf_novelty_energy` | REGIME | Energy/commodities cluster novelty |
+| `doc_embedding_novelty_hf_novelty_conflict` | REGIME | Conflict/crisis cluster novelty |
+| `doc_embedding_novelty_hf_novelty_tech` | REGIME | Technology/innovation cluster novelty |
+| `doc_embedding_novelty_hf_novelty_spike_flag` | REGIME | Binary flag for >2σ novelty spikes |
+| `doc_embedding_novelty_hf_novelty_persistence_5d` | REGIME | Fraction of last 5 days with high novelty |
+
+**Key Issue:** Cluster novelty metrics (REGIME) are Portfolio-only by default. If Mamba needs to see cluster-specific novelty for pattern detection:
+1. Add `doc_embedding_novelty_hf_` to forced-mamba prefix list, OR
+2. Keep current routing (Mamba sees overall novelty only, Portfolio handles cluster-specific regime detection)
+
+**WARNING:** `top_theme` is a string and will coerce to 0.0 downstream. `baseline_mean` may not be scalar. Consider moving these to attrs instead of feature columns.
+
+---
+
+## earnings_transcript_hf-family-full-feature-reference
+
+**Family**: `earnings_transcript_hf`  
+**Total Columns**: 10 features (no separate governance)  
+**Data Source**: Earnings call transcripts (SEC filings, defeatbeta-api, cached JSON/TXT/MD/HTML)  
+**Sentiment Model**: ProsusAI/finbert (FinBERT)  
+**Philosophy**: Confidence-weighted narrative changes, NOT raw sentiment levels
+
+**Governance**: None (governance metadata embedded in attrs)
+
+---
+
+### Feature List (10)
+
+#### Overall Sentiment (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `earnings_transcript_hf_score` | PREDICTIVE | Normalized sentiment (-1 to 1), cross-sectionally comparable |
+| 2 | `earnings_transcript_hf_conf` | RISK | CRITICAL - confidence = intensity × volume × dispersion penalty |
+
+#### Sectional Sentiment (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 3 | `earnings_transcript_hf_score_prepared` | REGIME | Management prepared remarks sentiment (often upward biased) |
+| 4 | `earnings_transcript_hf_score_qa` | REGIME | Q&A section sentiment (reveals stress/defensiveness) |
+
+#### Tone Dimensions (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 5 | `earnings_transcript_hf_uncertainty_score` | RISK | Information asymmetry score (NOT bearish, volatility amplifier) |
+| 6 | `earnings_transcript_hf_risk_score` | RISK | Explicit downside language (pairs with cboe_term + credit spreads) |
+
+#### Time-Series Changes (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 7 | `earnings_transcript_hf_score_delta_qoq` | PREDICTIVE | Quarter-over-quarter sentiment change (HIGH ALPHA) |
+| 8 | `earnings_transcript_hf_score_delta_yoy` | PREDICTIVE | Year-over-year sentiment change (removes seasonality) |
+
+#### Interaction Features (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 9 | `earnings_transcript_hf_sentiment_divergence` | PREDICTIVE | score_prepared - score_qa (management defensiveness) |
+| 10 | `earnings_transcript_hf_sentiment_shock` | PREDICTIVE | score_delta_qoq × conf (confidence-weighted change) |
+
+---
+
+### Interpretation Guide
+
+**Overall Sentiment:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.5, `conf` > 0.7 | Strong positive | Bullish narrative, high conviction |
+| `score` < -0.5, `conf` > 0.7 | Strong negative | Bearish narrative, high conviction |
+| `score` near 0, `conf` < 0.3 | Neutral/low signal | Routine call, limited alpha |
+
+**Sectional Divergence:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `sentiment_divergence` > 0.3 | Management defensive | Prepared positive, Q&A reveals stress |
+| `sentiment_divergence` < -0.3 | Q&A exceeds prepared | Analysts more optimistic than management |
+| `score_prepared` > 0.5, `score_qa` < 0 | Red flag | Scripted optimism contradicted in Q&A |
+
+**Tone Analysis:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `uncertainty_score` > 0.6 | High uncertainty | Information asymmetry, vol amplifier |
+| `risk_score` > 0.5 | Explicit downside | Management highlighting risks, defensive |
+| `uncertainty_score` > 0.6, `risk_score` > 0.5 | Double flag | High uncertainty + explicit risk = caution |
+
+**Narrative Changes (HIGH ALPHA):**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score_delta_qoq` > +0.3 | Improving narrative | Sentiment inflection, positive trajectory |
+| `score_delta_qoq` < -0.3 | Deteriorating narrative | Sentiment decline, negative trajectory |
+| `score_delta_yoy` > +0.5 | Long-term improvement | Sustained turnaround, removes seasonality |
+| `score_delta_yoy` < -0.5 | Long-term decline | Persistent deterioration, credibility loss |
+
+**Confidence-Weighted Shocks:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `sentiment_shock` > +0.4 | High-confidence improvement | Real narrative change, not noise |
+| `sentiment_shock` < -0.4 | High-confidence decline | Real deterioration, actionable signal |
+| `abs(score_delta_qoq)` > 0.3, `conf` < 0.3 | Low-confidence change | Noisy sentiment shift, ignore |
+
+---
+
+### Design Notes
+
+**Philosophy - Hedge Fund Grade:**
+- **NOT raw sentiment levels**: Deltas far more predictive than absolute scores
+- **Confidence is CRITICAL**: Intensity × volume × dispersion penalty
+- **Sectional divergence**: Explicit signal for management defensiveness
+- **Stop exactly here**: More NLP causes overfitting (transcripts are events, not streams)
+
+**Data Sources:**
+- **Cached transcripts**: `data_cache/earnings_transcripts/{SYMBOL}/*.{json,txt,md,html}`
+- **Live fallback**: defeatbeta-api (auto-fetch when cache empty)
+- **Supported formats**: JSON payloads, plain text, markdown, HTML
+
+**Transcript Parsing:**
+- **Section splitting**: Auto-detects Q&A section using common markers
+  - "question-and-answer", "question and answer", "q&a session"
+  - "operator\n", "operator:", "first question", "our first question"
+- **Prepared remarks**: Everything before Q&A marker
+- **Q&A section**: Everything after Q&A marker
+- **Fallback**: If no Q&A marker found, treat entire transcript as prepared remarks
+
+**Sentiment Analysis:**
+- **Model**: ProsusAI/finbert (FinBERT - financial domain-specific)
+- **Inference Cache**: `data_cache/hf_transcript_inference/{model_id}/{symbol}/{doc_key}.json`
+- **Token chunks**: Max length 256 tokens
+- **Batch size**: 16 (configurable)
+
+**Time-Series Delta Calculation:**
+- **QoQ**: Compare current quarter to previous quarter (sequential)
+- **YoY**: Compare current quarter to same quarter last year (removes seasonality)
+- **Quarterly history**: Stored in cache for delta computation
+
+**Confidence Formula:**
+```python
+intensity = abs(score - 0.5) * 2.0  # How far from neutral (0-1)
+volume = log1p(n_paragraphs) / log(10)  # Log-scaled volume (0.2-1.0)
+dispersion = 1.0 - std(sectional_scores)  # Coherence across sections
+conf = intensity × volume × dispersion
+```
+
+**Decay Design:**
+- **Strongest**: Earnings day (event-driven spike)
+- **Rapid decay**: 3-4 trading sessions
+- **Confidence decay**: Slower than score (lingering uncertainty)
+- **Matches market pricing**: Fast reaction, quick saturation
+
+**Interaction Features:**
+- **sentiment_divergence**: `score_prepared - score_qa`
+  - Positive → Management more optimistic than Q&A reveals
+  - Negative → Analysts more optimistic than management
+- **sentiment_shock**: `score_delta_qoq × conf`
+  - Distinguishes noise from real narrative change
+  - Confidence-weighted to filter low-quality deltas
+
+**Cache Hygiene:**
+- **Persistence**: Cached transcripts never expire (historical events)
+- **Inference cache**: Keyed by (model_id, symbol, quarter, text_hash)
+- **Auto-population**: Fetches from defeatbeta-api when cache empty
+
+**Governance (NOT separate columns, in attrs):**
+- `philosophy`: "Confidence-weighted narrative changes"
+- `high_alpha_features`: `['score_delta_qoq', 'score_delta_yoy', 'sentiment_shock']`
+- `vol_amplifiers`: `['uncertainty_score', 'risk_score']`
+- `decay_design`: "Fast reaction (3-4 days), quick saturation"
+- `NOT_for`: "Topic modeling, LLM summaries, long-window averages"
+
+**Telemetry:**
+- `source`: "EarningsTranscriptHF" or "cache"
+- `model`: "ProsusAI/finbert"
+- `expected`: 10 features
+- `generated`: Actual feature count
+
+---
+
+### Stream Routing
+
+**⚠️ FORCED-MAMBA PREFIX: ALL 10 columns go to Mamba**
+
+This family is in the forced-mamba prefix list (`earnings_transcript_hf_`), meaning ALL columns go to Mamba regardless of their semantic role. Portfolio sees NOTHING by default.
+
+**Mamba Parquet: ALL 10 columns (forced by prefix)**
+| Column | Semantic Role | Signal |
+|--------|---------------|--------|
+| `earnings_transcript_hf_score` | PREDICTIVE | Overall sentiment (-1 to 1) |
+| `earnings_transcript_hf_score_delta_qoq` | PREDICTIVE | QoQ change (HIGH ALPHA) |
+| `earnings_transcript_hf_score_delta_yoy` | PREDICTIVE | YoY change (removes seasonality) |
+| `earnings_transcript_hf_sentiment_divergence` | PREDICTIVE | Prepared - Q&A (management defensiveness) |
+| `earnings_transcript_hf_sentiment_shock` | PREDICTIVE | Delta × confidence |
+| `earnings_transcript_hf_conf` | RISK | Intensity × volume × dispersion |
+| `earnings_transcript_hf_uncertainty_score` | RISK | Information asymmetry (vol amplifier) |
+| `earnings_transcript_hf_risk_score` | RISK | Explicit downside language |
+| `earnings_transcript_hf_score_prepared` | REGIME | Prepared remarks sentiment |
+| `earnings_transcript_hf_score_qa` | REGIME | Q&A section sentiment |
+
+**Portfolio Parquet: 0 columns (forced-mamba excludes Portfolio)**
+
+**Key Issue:** Portfolio has NO visibility into transcript signals. If Portfolio needs transcript-based risk scaling:
+1. Mirror selected columns (e.g., `uncertainty_score`, `risk_score`) to portfolio parquet, OR
+2. Have Portfolio read from mamba parquet for transcript columns, OR
+3. Remove `earnings_transcript_hf_` from forced-mamba prefix (not recommended - breaks Mamba's access)
+
+**Recommended Approach:** For now, the transcript signals are event-driven and Mamba-focused. Portfolio can rely on other RISK families (options, garch_iv) for vol scaling. If transcript uncertainty becomes critical for portfolio constraints, mirror `uncertainty_score` and `risk_score` to portfolio.
+
+---
+
+## macro_tst_hf-family-full-feature-reference
+
+**Family**: `macro_tst_hf`  
+**Total Columns**: ~25-30 features (exact count varies by data availability)  
+**Data Sources**: EODHD macro indices (TNX, IRX, 2Y, UUP, TIP/TLT, VIX), FRED fallback  
+**Model**: HuggingFace TimeSeriesTransformer (internal, embeddings NOT exported)  
+**Philosophy**: Focus on transitions (changes), NOT levels
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature Categories
+
+#### Layer 1: Core Regime (10-12 features)
+
+**Yields:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_tnx_level` | REGIME | 10-year Treasury yield level |
+| `macro_tst_hf_irx_level` | REGIME | 3-month Treasury yield level |
+| `macro_tst_hf_2y_level` | REGIME | 2-year Treasury yield level |
+| `macro_tst_hf_tnx_change_1d` | REGIME | 10Y yield 1-day change |
+| `macro_tst_hf_tnx_change_5d` | REGIME | 10Y yield 5-day change |
+| `macro_tst_hf_curve_slope` | REGIME | Yield curve slope (10Y - 2Y) |
+| `macro_tst_hf_curve_slope_change` | REGIME | Curve slope change (steepening/flattening) |
+
+**Volatility:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_vix_level` | RISK | VIX level |
+| `macro_tst_hf_vix_return_1d` | RISK | VIX 1-day return (volatility shock) |
+| `macro_tst_hf_vix_return_5d` | RISK | VIX 5-day return |
+| `macro_tst_hf_vix_spike_flag` | REGIME | Binary flag for VIX spikes (>+20% 1d) |
+
+**Credit:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_credit_spread_level` | RISK | Credit spread level (IG/HY proxy) |
+| `macro_tst_hf_credit_spread_change` | RISK | Credit spread change (stress velocity) |
+| `macro_tst_hf_credit_spread_z` | RISK | Credit spread z-score (percentile) |
+
+**Commodities:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_oil_change` | REGIME | Oil price change (energy shock proxy) |
+| `macro_tst_hf_gold_change` | REGIME | Gold price change (safe-haven flow) |
+
+---
+
+#### Layer 2: Economic Momentum (6-8 features)
+
+**Derived from MINIMAL fundamental macro (inflation, unemployment, GDP growth):**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_derived_inflation_accel` | REGIME | CPI acceleration (change of change) |
+| `macro_tst_hf_derived_gdp_growth_accel` | REGIME | GDP growth momentum |
+| `macro_tst_hf_derived_unemployment_change` | REGIME | Employment delta |
+| `macro_tst_hf_derived_real_rate_change` | REGIME | Real rate velocity |
+| `macro_tst_hf_derived_debt_to_gdp_change` | REGIME | Fiscal trajectory |
+| `macro_tst_hf_derived_trade_balance_change` | REGIME | Trade flow velocity |
+
+---
+
+#### Layer 3: Shock-Aware Signals (8 features)
+
+**Volatility Shocks:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_vix_return_1d` | RISK | 1-day VIX return (duplicate from Layer 1) |
+| `macro_tst_hf_vix_return_5d` | RISK | 5-day VIX return (duplicate from Layer 1) |
+| `macro_tst_hf_vix_spike_flag` | REGIME | Binary regime break indicator (duplicate) |
+
+**Rate Shocks:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_rates_2y_change_1d` | REGIME | 2Y rate shock velocity |
+| `macro_tst_hf_rates_2y_change_5d` | REGIME | 2Y rate 5-day change |
+
+**Curve & Credit:**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_curve_slope_change` | REGIME | Curve steepening/flattening (duplicate) |
+| `macro_tst_hf_credit_spread_change` | RISK | Credit stress velocity (duplicate) |
+| `macro_tst_hf_credit_spread_z` | RISK | Credit stress percentile (duplicate) |
+
+---
+
+#### Layer 4: Symbol-Specific Interactions (4-6 features)
+
+**Interaction features customized per symbol (NOT always present):**
+
+| Column | Role | Description |
+|--------|------|-------------|
+| `macro_tst_hf_real_rate_growth_beta` | PREDICTIVE | real_rate_change × symbol's growth beta |
+| `macro_tst_hf_oil_energy_exposure` | PREDICTIVE | oil_change × symbol's energy sector exposure |
+| `macro_tst_hf_vix_beta_sensitivity` | RISK | vix_change × symbol's beta to VIX |
+| `macro_tst_hf_curve_bank_exposure` | PREDICTIVE | curve_slope_change × symbol's financials exposure |
+
+---
+
+### Interpretation Guide
+
+**Yield Curve Signals:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `curve_slope` > +1.5% | Steep curve | Growth expectations, bullish for cyclicals |
+| `curve_slope` < +0.5% | Flat/inverted | Recession risk, defensive positioning |
+| `curve_slope_change` > +0.2% (5d) | Steepening | Improving growth outlook |
+| `curve_slope_change` < -0.2% (5d) | Flattening | Deteriorating outlook, Fed tightening |
+
+**Volatility Regime:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `vix_level` > 30 | High vol regime | Risk-off, flight to quality |
+| `vix_level` < 15 | Low vol regime | Risk-on, complacency |
+| `vix_spike_flag` = 1 | Volatility shock | Regime break, event-driven |
+| `vix_return_1d` > +20% | 1-day spike | Panic, oversold opportunity |
+
+**Credit Stress:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `credit_spread_z` > +2σ | High stress | Credit crunch, avoid leverage |
+| `credit_spread_z` < -2σ | Low stress | Tight spreads, risk-on |
+| `credit_spread_change` > +0.5% (5d) | Widening | Deteriorating credit conditions |
+
+**Economic Momentum:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `derived_inflation_accel` > +0.5 | Accelerating inflation | Fed hawkish, rates up |
+| `derived_gdp_growth_accel` > 0 | Growth momentum | Cyclicals outperform |
+| `derived_unemployment_change` < -0.2 | Improving labor | Bullish consumer spending |
+
+**Interaction Features:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `real_rate_growth_beta` < 0, rates rising | Growth stock headwind | High-beta growth underperforms |
+| `oil_energy_exposure` > 0, oil surging | Energy positive | Energy sector benefits |
+| `vix_beta_sensitivity` > 1, VIX spiking | High vol sensitivity | Symbol amplifies market stress |
+
+---
+
+### Design Notes
+
+**Philosophy - Hedge Fund Grade:**
+- **Focus on transitions, NOT levels**: Changes > absolute values
+- **REMOVED slow fundamentals**: Population, GDP levels, GNI, sector %
+- **KEPT minimal essentials**: Only inflation, unemployment, GDP growth for derived accel features
+- **Shock-aware**: Explicit vol/rate/credit shock detection
+
+**Data Sources:**
+- **EODHD Macro Indices**:
+  - TNX.INDX: 10-year Treasury yield
+  - IRX.INDX: 3-month Treasury bill rate
+  - 2Y.INDX: 2-year Treasury note yield
+  - UUP: US Dollar Index ETF
+  - TIP/TLT: Inflation-protected vs nominal bonds (real rate proxy)
+  - ^VIX: CBOE Volatility Index
+- **FRED Fallback**:
+  - CPIAUCSL: CPI (inflation)
+  - UNRATE: Unemployment rate
+  - GDP: Gross Domestic Product
+
+**HuggingFace TimeSeriesTransformer:**
+- **Model**: Internal use ONLY (embeddings NOT exported to feature panel)
+- **Context length**: 180 days (reduced for lag overhead)
+- **Lags**: (1,) minimal lag (TimeSeriesTransformer requires at least one lag)
+- **D_model scale**: 4
+- **Encoder layers**: 2
+- **Dropout**: 0.1
+- **Device**: Auto-detects CUDA (GPU) or CPU
+
+**Feature Engineering Pipeline:**
+1. **Layer 1**: Fetch EODHD macro indices (yields, VIX, credit, commodities)
+2. **Layer 2**: Fetch minimal FRED fundamentals (CPI, unemployment, GDP)
+3. **Compute derived features**: Accelerations, velocities, z-scores
+4. **Layer 3**: Shock detection (VIX spikes, rate shocks)
+5. **Layer 4**: Symbol-specific interactions (beta × macro changes)
+6. **TimeSeriesTransformer**: Internal latent embeddings (NOT exported)
+7. **Final panel**: ~25-30 features (no hf_embed_* columns)
+
+**Placeholder Column Stripping:**
+- **Removed before cache write**: `hf_embed_*`, `hf_macro_score`, `hf_confidence`, `hf_regime`, `hf_volatility`
+- **Rationale**: HF transformer embeddings are internal, not exposed to downstream models
+
+**Cache Paths:**
+- **Local cache**: `data_cache/macro_panel/macro_tst_hf_{SYMBOL}.parquet`
+- **Cache hygiene**: Validates `l3_real_interest_rate` for degenerate zeros (forces rebuild if corrupt)
+
+**Z-Score Calculation:**
+- **Window**: 63 sessions (quarterly)
+- **Min periods**: 21 sessions
+- **Shift**: 1 session (prevents lookahead)
+- **Clip**: ±8σ (prevents extreme outliers)
+
+**Symbol-Specific Interactions:**
+- **Growth Beta**: Derived from symbol's historical beta to growth stocks (QQQ/IWM ratio)
+- **Energy Exposure**: Sector classification (energy sector = 1, others = 0)
+- **VIX Beta**: Symbol's historical correlation to VIX
+- **Bank Exposure**: Financials sector classification
+
+**Telemetry:**
+- `source`: "eodhd_unified_macro" or "cache"
+- `provider`: "EODHD" or "FRED"
+- `families_merged`: `['macro_sector', 'macro_enhanced', 'macro_tst_hf']`
+- `generated`: Actual feature count
+
+**Data Quality:**
+- Returns empty DataFrame if EODHD API key missing
+- FRED fallback for all essential series
+- Forward-fills missing macro data (daily reindexing)
+- Validates cache for degenerate values (real rate all-zeros triggers rebuild)
+
+---
+
+## news_sentiment_hf-family-full-feature-reference
+
+**Family**: `news_sentiment_hf`  
+**Total Columns**: 2 features (no governance)  
+**Data Source**: Cached news articles (`data_cache/company-news_news_{SYMBOL}_*.json`), NewsProvider fallback  
+**Sentiment Model**: ProsusAI/finbert (FinBERT)  
+**Status**: Excluded from Dagster assets (runs separately)
+
+**Governance**: None (lightweight sentiment-only family)
+
+---
+
+### Feature List (2)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `news_sentiment_hf_score` | PREDICTIVE | Daily sentiment score (-1 to 1), from title + body FinBERT analysis |
+| 2 | `news_sentiment_hf_conf` | RISK | Confidence score based on sentiment intensity × article volume |
+
+---
+
+### Interpretation Guide
+
+**Sentiment Signals:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.5 | Bullish news flow | Positive headlines, momentum support |
+| `score` < -0.5 | Bearish news flow | Negative headlines, downside risk |
+| `score` near 0 | Neutral/mixed | Balanced coverage, no clear signal |
+| `conf` > 0.7 | High confidence | Strong signal (intense sentiment + high volume) |
+| `conf` < 0.3 | Low confidence | Weak signal (low intensity or few articles) |
+
+**Combined Signals:**
+
+| Score | Confidence | Interpretation |
+|-------|-----------|----------------|
+| > +0.5 | > 0.7 | **Strong bullish**: High-confidence positive news |
+| < -0.5 | > 0.7 | **Strong bearish**: High-confidence negative news |
+| > +0.5 | < 0.3 | **Weak bullish**: Positive but low conviction |
+| < -0.5 | < 0.3 | **Weak bearish**: Negative but low conviction |
+| Near 0 | Any | **Neutral**: Mixed or routine coverage |
+
+---
+
+### Design Notes
+
+**Data Sources:**
+- **Cached news**: `data_cache/company-news_news_{SYMBOL}_*.json`
+  - JSON payloads with timestamp, title, body fields
+  - Max 750 articles per symbol
+- **Live fallback**: NewsProvider API
+  - Fetches last 14 days, limit 250 articles
+  - Triggered when cache has <25% of max_items
+
+**Sentiment Analysis:**
+- **Model**: ProsusAI/finbert (FinBERT - financial domain-specific)
+- **Input**: `title + ". " + body` (concatenated text)
+- **Output**: Probability distribution [negative, neutral, positive]
+- **Score**: `(2.0 * p_positive - 1.0)` → [-1, +1] range
+- **Batch size**: 16 (configurable)
+- **Max length**: 256 tokens
+
+**Daily Aggregation:**
+- **Session date**: Market session using cutoff time (default 16:00 ET)
+- **Aggregation**:
+  ```python
+  score = mean(article_scores)  # Daily mean sentiment
+  intensity = abs(p_positive - 0.5) * 2.0  # Distance from neutral
+  volume = log1p(n_articles) / log(10)  # Log-scaled volume [0.2, 1.0]
+  conf = intensity × volume  # Confidence = intensity × volume
+  ```
+
+**Timestamp Handling:**
+- **Unix epoch**: Auto-detects seconds vs milliseconds
+  - If < 2e9 (before year 2033), treats as milliseconds stored as seconds (×1000)
+  - If > 32503680000 (after year 3000), treats as milliseconds (÷1000)
+- **UTC normalization**: All timestamps converted to UTC
+- **Market session**: Maps timestamp to nearest market session date (16:00 ET cutoff)
+
+**Data Quality:**
+- **Min text length**: Title or body must be non-empty
+- **Deduplication**: Not implemented (relies on upstream cache uniqueness)
+- **Fallback**: Returns empty DataFrame if no news available
+
+**Cache Patterns:**
+- **File pattern**: `company-news_news_{SYMBOL}_*.json`
+- **JSON structure**: List of dicts with keys: `timestamp`, `title`, `body`
+- **Alternative keys**: Supports `date`, `datetime`, `providerPublishTime`, `publishedAt`, `time`
+- **Body alternatives**: `summary`, `description`, `content`
+
+**HFBrain Integration:**
+- **HFSpec**: Model ID, revision, max_length, batch_size
+- **infer_probs()**: Batch inference returning probability list
+- **Alignment**: Truncates frame to match probabilities length (handles inference failures gracefully)
+
+**Cutoff Time:**
+- **Default**: 16:00 ET (market close)
+- **Configurable**: Via constructor parameter (hours, minutes, seconds)
+- **Timezone**: America/New_York
+
+**Excluded from Dagster:**
+- **Rationale**: Runs separately outside Dagster pipeline
+- **Usage**: Typically pre-computed and cached for on-demand loading
+
+**Telemetry:**
+- `source`: "HFBrain+NewsProvider" or "cache"
+- `model`: "ProsusAI/finbert"
+- `articles_processed`: Count of articles analyzed
+- `sessions_aggregated`: Count of unique session dates
+
+---
+
+## tech_micro_hf-block-full-feature-reference
+
+**Block**: `tech_micro_hf`  
+**Total Columns**: 3 features (score, conf, score_raw)  
+**Base Families Used**: ml_framework, microstructure, correlation  
+**Horizon-Bound**: No (symbol-only, canonical horizon=63)  
+**Architecture**: HF sequence model with selective lagging
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature List (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `tech_micro_hf_score` | PREDICTIVE | HF sequence model score (0-1) predicting horizon forward return direction |
+| 2 | `tech_micro_hf_conf` | RISK | Model confidence score (0-1) based on prediction certainty |
+| 3 | `tech_micro_hf_score_raw` | PREDICTIVE | Raw model output before post-processing (same as score) |
+
+---
+
+### Base Families Integration
+
+**ml_framework (EODHD Technical Indicators):**
+- **Features Used**: Price vs MA/EMA, Bollinger Bands, MACD, RSI, returns, volatility, volume ratios
+- **Max Columns**: Unlimited (all features)
+- **Lag Strategy**: Curated lags based on feature patterns:
+  - Price indicators (price_vs_ma, bb_width, macd, rsi): 1, 5-day lags
+  - Moving averages (ma, ema): 5-day lag
+  - Returns (return, log_return): 1, 5, 10-day lags
+  - Volatility: 5, 20-day lags
+  - Volume (volume_ma, volume_ratio): 1, 5, 20-day lags
+  - Confidence: 1, 5-day lags
+
+**microstructure (Raw OHLCV Microstructure):**
+- **Features Used**: Liquidity (amihud, spread_proxy, impact_ratio), order flow (ofi_proxy, pressure_proxy), volatility (intraday_vol, overnight_vol), gaps, volume dynamics
+- **Max Columns**: Unlimited (all features)
+- **Lag Strategy**: Granular microstructure lags:
+  - Liquidity & impact: 1, 3-day lags
+  - Order flow & pressure: 1, 3-day lags
+  - Volatility & ranges: 1, 3-day lags
+  - Gaps & overnight: 1, 3-day lags
+  - Volume dynamics: 1, 3-day lags
+  - Flags (low_liquidity, zero_range, stale_tick): 1-day lag
+
+**correlation (Cross-Asset Correlation):**
+- **Features Used**: All correlation features
+- **Max Columns**: 12 (top features by variance/importance)
+- **Lag Strategy**: No lagging (current correlations)
+
+**Merged Features:**
+- **Max Total Columns**: 48 (hard limit across all families)
+- **Selection**: Top features by variance within each family
+- **Alignment**: Inner join on timestamps, forward-fill missing
+
+---
+
+### HF Sequence Model Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Window** | 40 | Lookback window in trading sessions |
+| **Horizon** | 63 | Forward prediction horizon (canonical) |
+| **Epochs** | 6 | Training epochs |
+| **Batch Size** | 32-128 | Adaptive based on data size |
+| **Learning Rate** | 5e-4 | Adam optimizer LR |
+| **Max Samples** | 4096 | Training sample cap |
+| **Architecture** | HFTimeSeriesModule | Sequence model with attention |
+
+---
+
+### Interpretation Guide
+
+**Score & Confidence:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7, `conf` > 0.6 | Strong bullish | High-confidence upward prediction |
+| `score` < 0.3, `conf` > 0.6 | Strong bearish | High-confidence downward prediction |
+| `score` near 0.5, `conf` < 0.4 | Uncertain | Low conviction, avoid trading |
+| `conf` > 0.8 | Very high certainty | Model strongly confident (rare) |
+| `conf` < 0.2 | Very uncertain | Ignore signal, noisy conditions |
+
+**Technical Regime Detection:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + RSI > 70 (from ml_framework) | Overbought momentum, potential reversal |
+| Low `score` + RSI < 30 | Oversold momentum, potential bounce |
+| High `score` + High `micro_amihud` (from microstructure) | Bullish in illiquid market, risky |
+| Low `score` + High `micro_spread_proxy` | Bearish with wide spreads, avoid |
+
+---
+
+### Design Notes
+
+**Philosophy:**
+- **Technical + Microstructure Alpha**: Combines price-based technicals with order flow/liquidity signals
+- **Selective Lagging**: Curated lag patterns per feature type (not blanket lagging)
+- **Confidence Calibration**: Model outputs both prediction and certainty
+
+**Feature Engineering Pipeline:**
+1. **Load cached families**: ml_framework, microstructure, correlation (from prep_families)
+2. **Add selective lags**: Apply family-specific lag patterns (1-20 days)
+3. **Prepare blocks**: Limit columns per family, select top variance features
+4. **Merge blocks**: Combine families with max 48 total columns
+5. **Train HF sequence model**: Sliding window attention model on 40-day windows
+6. **Generate predictions**: Score + confidence for each trading session
+
+**Lag Strategy Rationale:**
+- **Short lags (1-3 days)**: Microstructure features (fast-moving, mean-reverting)
+- **Medium lags (5-10 days)**: Technical indicators (momentum, trends)
+- **Long lags (20 days)**: Volatility, volume MAs (slow-moving fundamentals)
+- **No lags**: Correlations (current cross-asset regime)
+
+**Training Details:**
+- **Target**: Binary forward return direction (price up/down in 63 days)
+- **Window**: 40-day sliding windows of features
+- **Epochs**: 6 (light training, prevents overfitting)
+- **Batch shuffle**: Random shuffling per epoch
+- **Gradient clipping**: Prevents exploding gradients
+- **Scheduler**: Learning rate decay over epochs
+
+**Fallback Behavior:**
+- If HFTimeSeriesModule unavailable (torch/transformers missing):
+  - Falls back to `_hf_baseline_projection` (simple linear projection)
+- If insufficient data (<40 days + 63 horizon):
+  - Returns baseline projection or None
+
+**Cache Path:**
+- **Symbol-only HF block**: `cache/symbols/{SYMBOL}/hf/tech_micro_hf.parquet`
+- **NOT horizon-partitioned**: Uses canonical horizon=63 for all symbols
+
+**Telemetry:**
+- `source`: "HFTimeSeriesModule" or "baseline_projection"
+- `window`: 40
+- `horizon`: 63
+- `families`: ['ml_framework', 'microstructure', 'correlation']
+- `train_samples`: Count of training windows
+- `total_sequences`: Total sliding windows
+- `epochs`: 6
+
+---
+
+## forecast_hf-block-full-feature-reference
+
+**Block**: `forecast_hf`  
+**Total Columns**: 3 features (score, conf, score_raw)  
+**Base Families Used**: quantile_forecast, calibration, online_learning, arima_forecast, tft_features  
+**Horizon-Bound**: Yes (partitioned by symbol+horizon)  
+**Architecture**: HF sequence model for forecast aggregation
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature List (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `forecast_hf_score` | PREDICTIVE | Aggregated forecast score (0-1) from multiple forecasting families |
+| 2 | `forecast_hf_conf` | RISK | Confidence score based on forecast agreement and calibration |
+| 3 | `forecast_hf_score_raw` | PREDICTIVE | Raw model output before post-processing |
+
+---
+
+### Base Families Integration
+
+**quantile_forecast (Quantile Distribution Forecasts):**
+- **Features Used**: Quantile predictions (q10, q25, q50, q75, q90), width, skew, tail risk
+- **Max Columns**: 24 (top quantile features)
+- **Role**: Distributional forecasts, uncertainty quantification
+
+**calibration (Forecast Calibration Metrics):**
+- **Features Used**: Coverage rates, sharpness, calibration error, Brier scores
+- **Max Columns**: 10 (calibration quality metrics)
+- **Role**: Forecast reliability assessment
+
+**online_learning (Online Learning Adaptation):**
+- **Features Used**: Adaptive learning rates, model drift, concept shift detection
+- **Max Columns**: 18 (adaptation metrics)
+- **Role**: Model staleness detection, adaptive weighting
+
+**arima_forecast (ARIMA Time-Series Forecasts):**
+- **Features Used**: ARIMA point forecasts, confidence intervals, residual diagnostics
+- **Max Columns**: 6 (core ARIMA outputs)
+- **Role**: Classical time-series baseline
+
+**tft_features (TFT-Style Feature Engineering):**
+- **Features Used**: Temporal patterns, seasonality, trend components
+- **Max Columns**: 14 (TFT-engineered features)
+- **Role**: Temporal pattern recognition
+
+**Merged Features:**
+- **Max Total Columns**: 64 (higher limit for forecast aggregation)
+- **Min Families**: 2 (requires at least 2 families with data)
+- **Selection**: Top features by importance within each family
+
+---
+
+### HF Sequence Model Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Window** | 60 | Lookback window (2+ months for forecast stability) |
+| **Horizon** | User-specified | Partitioned by horizon (not fixed) |
+| **Epochs** | 8 | More training for forecast aggregation |
+| **Batch Size** | 32-128 | Adaptive based on data size |
+| **Learning Rate** | 5e-4 | Adam optimizer LR |
+| **Max Samples** | 4096 | Training sample cap |
+
+---
+
+### Interpretation Guide
+
+**Forecast Agreement:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7, `conf` > 0.7 | Strong consensus | Multiple forecasts agree (high conviction) |
+| `score` > 0.7, `conf` < 0.4 | Weak consensus | Forecasts disagree (low conviction) |
+| `conf` > 0.8 | Very high agreement | Rare, extremely strong signal |
+| `conf` < 0.3 | Divergent forecasts | Conflicting models, uncertain regime |
+
+**Calibration-Aware Signals:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High calibration error (from calibration family) | Bullish forecast but poorly calibrated, reduce confidence |
+| High `score` + Low calibration error | Well-calibrated bullish forecast, high conviction |
+| High `score` + High concept shift (from online_learning) | Forecast may be stale, regime changed |
+
+---
+
+### Design Notes
+
+**Philosophy:**
+- **Forecast Aggregation**: Blends multiple forecasting approaches (distributional, classical, adaptive)
+- **Calibration-Aware**: Explicitly incorporates forecast quality metrics
+- **Horizon-Bound**: Separate models per prediction horizon (unlike symbol-only HF blocks)
+
+**Family Synergies:**
+- **quantile_forecast**: Provides distributional uncertainty
+- **calibration**: Validates forecast reliability over time
+- **online_learning**: Detects when forecasts become stale
+- **arima_forecast**: Classical baseline for comparison
+- **tft_features**: Temporal pattern features (not full TFT model)
+
+**Training Strategy:**
+- **Longer window (60 days)**: Forecasts need more history for stability
+- **More epochs (8)**: Forecast aggregation benefits from more training
+- **Horizon-specific**: Each horizon gets separate model (h21, h42, h63, etc.)
+
+**Cache Path:**
+- **Horizon-partitioned**: `cache/symbols/{SYMBOL}/h{HORIZON}/forecast_hf.parquet`
+- **NOT symbol-only**: Uses actual horizon parameter, not canonical 63
+
+**Telemetry:**
+- `source`: "HFTimeSeriesModule"
+- `window`: 60
+- `horizon`: Actual horizon value
+- `families`: ['quantile_forecast', 'calibration', 'online_learning', 'arima_forecast', 'tft_features']
+- `train_samples`: Training window count
+- `epochs`: 8
+
+---
+
+## vol_deriv_hf-block-full-feature-reference
+
+**Block**: `vol_deriv_hf`  
+**Total Columns**: 3 features (score, conf, score_raw)  
+**Base Families Used**: garch_iv, cboe_term, options, options_anchoring, short_interest  
+**Horizon-Bound**: No (symbol-only, canonical horizon=63)  
+**Architecture**: HF sequence model for volatility/derivatives structure
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature List (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `vol_deriv_hf_score` | PREDICTIVE | Volatility regime score (0-1) from derivatives structure |
+| 2 | `vol_deriv_hf_conf` | RISK | Confidence based on options/vol signal coherence |
+| 3 | `vol_deriv_hf_score_raw` | PREDICTIVE | Raw model output before post-processing |
+
+---
+
+### Base Families Integration
+
+**garch_iv (GARCH Volatility Forecasts):**
+- **Features Used**: Conditional volatility, vol-of-vol, GARCH shocks, regime flags
+- **Max Columns**: 12 (core volatility features)
+- **Role**: Forward-looking volatility forecasts
+
+**cboe_term (VIX Term Structure):**
+- **Features Used**: VIX, VIX3M, VVIX, term slope, contango/backwardation
+- **Max Columns**: 12 (term structure features)
+- **Role**: Market-wide volatility regime
+
+**options_anchoring (Institutional Options Anchoring):**
+- **Features Used**: Decay-weighted strikes, gamma exposure, institutional positioning
+- **Max Columns**: 12 (anchoring features)
+- **Role**: Smart-money options positioning
+
+**options (Raw Options Chain):**
+- **Features Used**: Filtered to specific keywords (total_oi, total_volume, put_call, gamma, delta_exposure)
+- **Max Columns**: 10 (selective options metrics)
+- **Role**: Current options market structure
+
+**short_interest (Short Interest with Squeeze Analysis):**
+- **Features Used**: Short % of float, days-to-cover, squeeze probability
+- **Max Columns**: 6 (short interest core)
+- **Role**: Short squeeze risk
+
+**Merged Features:**
+- **Max Total Columns**: 60 (comprehensive vol/derivatives coverage)
+- **Selection**: Top features by variance
+- **Keyword Filtering**: Options family filtered to relevant columns only
+
+---
+
+### HF Sequence Model Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Window** | 60 | Lookback window for volatility regimes |
+| **Horizon** | 63 | Canonical horizon (symbol-only) |
+| **Epochs** | 8 | More training for complex vol structure |
+| **Batch Size** | 32-128 | Adaptive |
+| **Learning Rate** | 5e-4 | Adam optimizer LR |
+| **Max Samples** | 4096 | Training sample cap |
+
+---
+
+### Interpretation Guide
+
+**Volatility Regime Signals:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7, `conf` > 0.6 | High vol regime | Expect increased volatility, options expensive |
+| `score` < 0.3, `conf` > 0.6 | Low vol regime | Complacency, options cheap, sell vol |
+| High `score` + VIX term in backwardation | Vol spike imminent | Fear regime, hedge aggressively |
+| Low `score` + VIX term in contango | Normal regime | Sell vol premium, carry strategies |
+
+**Squeeze Detection:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High short_interest % + Low liquidity | Short squeeze risk | Potential violent upside move |
+| High `score` + High gamma exposure (from options) | Gamma squeeze | Dealers forced to buy, amplifies moves |
+| High `score` + High put/call OI skew | Hedging demand | Downside protection expensive |
+
+**Institutional Positioning:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High options_anchoring strikes | Smart money positioned | Institutions expect volatility |
+| High `score` + Low options volume | Quiet before storm | Vol about to explode |
+
+---
+
+### Design Notes
+
+**Philosophy:**
+- **Vol Structure Focus**: Combines forward vol forecasts, term structure, and options positioning
+- **Squeeze Detection**: Integrates short interest for squeeze risk
+- **Institutional Signals**: Options_anchoring captures smart-money positioning
+
+**Family Synergies:**
+- **garch_iv**: Forward-looking vol forecasts
+- **cboe_term**: Market-wide vol regime (VIX term structure)
+- **options_anchoring**: Institutional positioning (decay-weighted)
+- **options**: Current options market (filtered to avoid noise)
+- **short_interest**: Squeeze risk overlay
+
+**Keyword Filtering (options family):**
+- Keeps only: total_oi, total_volume, put_call, gamma, delta_exposure
+- Removes: Noisy strike-specific metrics, redundant columns
+- Rationale: Focus on aggregate positioning, not granular strikes
+
+**Cache Path:**
+- **Symbol-only HF block**: `cache/symbols/{SYMBOL}/hf/vol_deriv_hf.parquet`
+- **Canonical horizon=63**: Not horizon-partitioned
+
+**Telemetry:**
+- `source`: "HFTimeSeriesModule"
+- `window`: 60
+- `horizon`: 63
+- `families`: ['garch_iv', 'cboe_term', 'options', 'options_anchoring', 'short_interest']
+- `epochs`: 8
+
+---
+
+## macro_regime_hf-block-full-feature-reference
+
+**Block**: `macro_regime_hf`  
+**Total Columns**: 3 features (score, conf, score_raw)  
+**Base Families Used**: macro_tst_hf, regime, multiasset, cross_asset, correlation  
+**Horizon-Bound**: No (symbol-only, canonical horizon=63)  
+**Architecture**: HF sequence model for macro/regime detection
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature List (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `macro_regime_hf_score` | REGIME | Macro regime state score (0-1) |
+| 2 | `macro_regime_hf_conf` | RISK | Confidence in regime classification |
+| 3 | `macro_regime_hf_score_raw` | REGIME | Raw model output |
+
+---
+
+### Base Families Integration
+
+**macro_tst_hf (Macro Time-Series Transformer):**
+- **Features Used**: Yields, VIX, credit spreads, economic momentum, shock signals
+- **Max Columns**: 24 (comprehensive macro coverage)
+- **Role**: Core macro indicators with HF transformer
+
+**regime (Institutional Regime Classification):**
+- **Features Used**: Regime labels, regime probabilities, temporal context
+- **Max Columns**: 10 (all regime features)
+- **Role**: Explicit regime classification
+
+**multiasset (Equity Benchmark Exposures):**
+- **Features Used**: SPY/QQQ/IWM/ACWI correlations, PCA style factors
+- **Max Columns**: 16 (equity benchmark features)
+- **Role**: Cross-asset equity regime
+
+**cross_asset (Cross-Asset Macro Risk):**
+- **Features Used**: Bond/commodity/FX exposures, inflation regime
+- **Max Columns**: 16 (cross-asset signals)
+- **Role**: Multi-asset regime signals
+
+**correlation (Cross-Asset Correlation):**
+- **Features Used**: Filtered to macro keywords (spy, qqq, uup, vxx, sp500)
+- **Max Columns**: 12 (macro-relevant correlations)
+- **Role**: Correlation regime (risk-on/risk-off)
+
+**Merged Features:**
+- **Max Total Columns**: 80 (highest limit, comprehensive macro view)
+- **Min Families**: 2 (requires multiple families for regime detection)
+- **Keyword Filtering**: Correlation family filtered to macro-relevant pairs
+
+---
+
+### HF Sequence Model Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Window** | 120 | Long lookback (6+ months for regime stability) |
+| **Horizon** | 63 | Canonical horizon |
+| **Epochs** | 10 | Most training (macro regimes are complex) |
+| **Batch Size** | 32-128 | Adaptive |
+| **Learning Rate** | 5e-4 | Adam optimizer LR |
+| **Max Samples** | 4096 | Training sample cap |
+
+---
+
+### Interpretation Guide
+
+**Regime Signals:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7, `conf` > 0.7 | Strong regime | Clear macro regime (risk-on or risk-off) |
+| `score` near 0.5, `conf` < 0.4 | Transitional regime | Regime unclear, reduce risk |
+| High `score` + High VIX (from macro_tst_hf) | Risk-off regime | Flight to quality, defensive positioning |
+| Low `score` + Steep yield curve | Risk-on regime | Growth expectations, cyclicals outperform |
+
+**Cross-Asset Regime:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High SPY correlation (from correlation) | Beta regime | Stock-specific alpha less important |
+| High `score` + High USD (UUP from correlation) | Dollar strength | Emerging markets weaker, commodities pressure |
+| High `score` + High VXX correlation | Vol regime | Volatility drives everything, hedge aggressively |
+
+**Macro Transitions:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| `score` rising + Flattening curve (from macro_tst_hf) | Late cycle | Fed tightening, defensives outperform |
+| `score` falling + Steepening curve | Early cycle | Growth accelerating, cyclicals outperform |
+| High `conf` + Regime change (from regime family) | Regime break | Major macro shift, rebalance portfolio |
+
+---
+
+### Design Notes
+
+**Philosophy:**
+- **Comprehensive Macro View**: Combines yields, VIX, equity benchmarks, cross-asset flows
+- **Longest Lookback (120 days)**: Regimes change slowly, need long windows
+- **Most Training (10 epochs)**: Macro regimes are complex, need more learning
+
+**Family Synergies:**
+- **macro_tst_hf**: Core macro indicators (yields, VIX, credit)
+- **regime**: Explicit regime labels for supervision
+- **multiasset**: Equity regime (growth vs value, large vs small)
+- **cross_asset**: Multi-asset regime (bonds, commodities, FX)
+- **correlation**: Correlation regime (risk-on vs risk-off)
+
+**Keyword Filtering (correlation family):**
+- Keeps only: spy, qqq, uup, vxx, sp500
+- Removes: Idiosyncratic correlations, sector-specific
+- Rationale: Focus on macro-relevant cross-asset relationships
+
+**Longest Window:**
+- **120 days** (~6 months): Macro regimes persist, need long history
+- **10 epochs**: More training to capture regime transitions
+- **Trade-off**: Slower to detect regime changes, but more stable
+
+**Cache Path:**
+- **Symbol-only HF block**: `cache/symbols/{SYMBOL}/hf/macro_regime_hf.parquet`
+- **Canonical horizon=63**: Not horizon-partitioned
+
+**Telemetry:**
+- `source`: "HFTimeSeriesModule"
+- `window`: 120
+- `horizon`: 63
+- `families`: ['macro_tst_hf', 'regime', 'multiasset', 'cross_asset', 'correlation']
+- `epochs`: 10
+
+---
+
+## fundamental_val_hf-block-full-feature-reference
+
+**Block**: `fundamental_val_hf`  
+**Total Columns**: 3 features (score, conf, score_raw)  
+**Base Families Used**: fin_g1-fin_g7, earnings, dividends, dcf, subsidiary, short_interest  
+**Horizon-Bound**: No (symbol-only, canonical horizon=63)  
+**Architecture**: HF sequence model for fundamental valuation dynamics
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature List (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `fundamental_val_hf_score` | PREDICTIVE | Fundamental valuation score (0-1) |
+| 2 | `fundamental_val_hf_conf` | RISK | Confidence in valuation assessment |
+| 3 | `fundamental_val_hf_score_raw` | PREDICTIVE | Raw model output |
+
+---
+
+### Base Families Integration
+
+**fin_g1-fin_g7 (Fundamental Groups 1-7):**
+- **fin_g1**: Liquidity ratios (current ratio, quick ratio, cash ratio)
+- **fin_g2**: Leverage/capital structure (debt/equity, interest coverage)
+- **fin_g3**: Efficiency/turnover (asset turnover, inventory turnover)
+- **fin_g4**: Cash flow & earnings quality (FCF, CFO/NI, accruals)
+- **fin_g5**: Growth metrics (revenue growth, earnings growth)
+- **fin_g6**: Valuation multiples (P/E, P/B, EV/EBITDA)
+- **fin_g7**: Dividend/shareholder yield (dividend yield, buyback yield)
+- **Max Columns**: 24 per family (comprehensive fundamental coverage)
+- **Role**: Complete fundamental profile
+
+**earnings (Earnings Events & Quality):**
+- **Features Used**: EPS surprises, earnings quality, revenue beats
+- **Max Columns**: 12 (event features)
+- **Role**: Earnings event signals
+
+**dividends (Dividend Events):**
+- **Features Used**: Dividend yield, payout ratio, dividend growth
+- **Max Columns**: 12 (dividend features)
+- **Role**: Shareholder return signals
+
+**dcf (DCF Valuation Anchors):**
+- **Features Used**: Price-relative valuation, overextension, reversion targets
+- **Max Columns**: 12 (valuation anchors)
+- **Role**: Intrinsic value estimates
+
+**subsidiary (Organizational Complexity):**
+- **Features Used**: R&D intensity, OpEx complexity, subsidiary count
+- **Max Columns**: 12 (complexity features)
+- **Role**: Structural complexity overlay
+
+**short_interest (Short Interest):**
+- **Features Used**: Short % of float, days-to-cover, squeeze probability
+- **Max Columns**: 12 (short interest)
+- **Role**: Market sentiment overlay
+
+**Merged Features:**
+- **Max Total Columns**: 96 (highest limit, comprehensive fundamental view)
+- **Min Families**: 2 (requires at least 2 families)
+- **Selection**: Top features by variance within each family
+
+---
+
+### HF Sequence Model Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Window** | 120 | Long lookback (fundamentals change slowly) |
+| **Horizon** | 63 | Canonical horizon |
+| **Epochs** | 10 | Most training (many families to integrate) |
+| **Batch Size** | 32-128 | Adaptive |
+| **Learning Rate** | 5e-4 | Adam optimizer LR |
+| **Max Samples** | 4096 | Training sample cap |
+
+---
+
+### Interpretation Guide
+
+**Valuation Signals:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7, `conf` > 0.7 | Strong fundamental health | Quality company, potential long |
+| `score` < 0.3, `conf` > 0.7 | Fundamental deterioration | Weak fundamentals, avoid or short |
+| `score` > 0.7, `conf` < 0.4 | Uncertain valuation | Mixed signals, wait for clarity |
+
+**Quality + Valuation:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + Low P/E (from fin_g6) | High-quality value | Quality company at cheap price (rare) |
+| High `score` + High P/E | Quality growth | Market paying premium for quality |
+| Low `score` + Low P/E | Value trap | Cheap for a reason, avoid |
+| Low `score` + High P/E | Overvalued low-quality | Worst combination, short candidate |
+
+**Earnings Quality:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High FCF (from fin_g4) | High-quality earnings | Cash-generative, sustainable |
+| High `score` + High accruals (from fin_g4) | Earnings manipulation risk | Red flag, investigate |
+| High `score` + Positive EPS surprise (from earnings) | Momentum + quality | Strong buy signal |
+
+**Leverage & Liquidity:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + Low debt/equity (from fin_g2) | Strong balance sheet | Financial flexibility, safe |
+| Low `score` + High debt/equity | Distress risk | Leveraged + weak fundamentals, risky |
+| High `score` + Low current ratio (from fin_g1) | Liquidity risk | Good long-term but near-term cash issues |
+
+---
+
+### Design Notes
+
+**Philosophy:**
+- **Comprehensive Fundamental View**: Integrates all 7 fundamental groups + events + valuation
+- **Quality + Value**: Combines quality metrics (fin_g1-g4) with valuation (fin_g6-g7)
+- **Event Overlay**: Earnings/dividend events provide timing signals
+
+**Family Coverage:**
+- **7 Fundamental Groups**: Complete fundamental profile (liquidity → valuation → yield)
+- **Earnings**: Event-driven signals (surprises, beats)
+- **Dividends**: Shareholder return policy
+- **DCF**: Intrinsic value anchors
+- **Subsidiary**: Complexity overlay (R&D, OpEx structure)
+- **Short Interest**: Market sentiment (contrarian signal)
+
+**Training Strategy:**
+- **Longest window (120 days)**: Fundamentals change quarterly, need long history
+- **Most epochs (10)**: Many families to integrate, complex relationships
+- **Highest column limit (96)**: Comprehensive fundamental coverage
+
+**Cache Path:**
+- **Symbol-only HF block**: `cache/symbols/{SYMBOL}/hf/fundamental_val_hf.parquet`
+- **Canonical horizon=63**: Not horizon-partitioned
+
+**Telemetry:**
+- `source`: "HFTimeSeriesModule"
+- `window`: 120
+- `horizon`: 63
+- `families`: ['fin_g1', 'fin_g2', 'fin_g3', 'fin_g4', 'fin_g5', 'fin_g6', 'fin_g7', 'earnings', 'dividends', 'dcf', 'subsidiary', 'short_interest']
+- `epochs`: 10
+
+---
+
+## news_nlp_hf-block-full-feature-reference
+
+**Block**: `news_nlp_hf`  
+**Total Columns**: 3 features (score, conf, score_raw)  
+**Base Families Used**: finbert, doc_embedding_novelty_hf, earnings_transcript_hf, news_sentiment_hf, alternative_signals  
+**Horizon-Bound**: No (symbol-only, canonical horizon=63)  
+**Architecture**: HF sequence model for news/NLP signals
+
+**Governance**: None (governance metadata in attrs)
+
+---
+
+### Feature List (3)
+
+| # | Column | Role | Description |
+|---|--------|------|-------------|
+| 1 | `news_nlp_hf_score` | PREDICTIVE | News/sentiment aggregation score (0-1) |
+| 2 | `news_nlp_hf_conf` | RISK | Confidence based on signal coherence across NLP sources |
+| 3 | `news_nlp_hf_score_raw` | PREDICTIVE | Raw model output |
+
+---
+
+### Base Families Integration
+
+**finbert (FinBERT Sentiment Embeddings):**
+- **Features Used**: Sentiment scores from FinBERT model
+- **Max Columns**: 16 (sentiment features)
+- **Role**: Financial text sentiment baseline
+
+**doc_embedding_novelty_hf (Document Embedding Novelty):**
+- **Features Used**: Global novelty, cluster novelties, spike flags
+- **Max Columns**: 12 (novelty features)
+- **Role**: Global regime change detection
+
+**earnings_transcript_hf (Earnings Transcript Analysis):**
+- **Features Used**: Sentiment, divergence, uncertainty, deltas
+- **Max Columns**: 12 (transcript features)
+- **Role**: Earnings call narrative analysis
+
+**news_sentiment_hf (News Sentiment):**
+- **Features Used**: Daily news sentiment, confidence
+- **Max Columns**: 12 (news features)
+- **Role**: News flow sentiment
+
+**alternative_signals (Alternative Data):**
+- **Features Used**: Filtered to news/sentiment keywords (news, sentiment, reddit, twitter, social, search)
+- **Max Columns**: 10 (alt data features)
+- **Role**: Social media/search sentiment
+
+**Merged Features:**
+- **Max Total Columns**: 48 (moderate limit, focused NLP features)
+- **Keyword Filtering**: Alternative_signals filtered to sentiment-relevant columns
+- **Min Families**: 1 (can run with any NLP family)
+
+---
+
+### HF Sequence Model Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Window** | 45 | Medium lookback (news decays faster than fundamentals) |
+| **Horizon** | 63 | Canonical horizon |
+| **Epochs** | 6 | Light training (NLP features are event-driven) |
+| **Batch Size** | 32-128 | Adaptive |
+| **Learning Rate** | 5e-4 | Adam optimizer LR |
+| **Max Samples** | 4096 | Training sample cap |
+
+---
+
+### Interpretation Guide
+
+**Sentiment Consensus:**
+
+| Metric | Signal | Trading Implication |
+|--------|--------|---------------------|
+| `score` > 0.7, `conf` > 0.7 | Strong positive consensus | News, transcripts, social all bullish |
+| `score` < 0.3, `conf` > 0.7 | Strong negative consensus | Widespread negative sentiment |
+| `score` near 0.5, `conf` < 0.4 | Mixed signals | Conflicting sentiment sources |
+
+**Event-Driven Signals:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High earnings_transcript_hf score | Positive earnings call | Bullish narrative from management |
+| High `score` + Low earnings_transcript_hf score | Divergence | News positive but earnings call negative (investigate) |
+| High `score` + High doc_embedding_novelty | Novelty-driven rally | Global event driving sentiment |
+| High `score` + High social sentiment (alt data) | Retail hype | Meme stock risk, contrarian signal |
+
+**Regime Overlay:**
+
+| Condition | Interpretation |
+|-----------|----------------|
+| High `score` + High doc_embedding cluster novelty (geopolitical) | Geopolitical catalyst | News driven by macro event |
+| High `score` + High doc_embedding cluster novelty (regulatory) | Regulatory catalyst | Policy/regulation driving sentiment |
+
+---
+
+### Design Notes
+
+**Philosophy:**
+- **Multi-Source NLP**: Combines financial text (FinBERT), earnings calls, news, global events, social media
+- **Event-Driven**: News sentiment decays faster than fundamentals
+- **Medium Window (45 days)**: Balances recent news with longer-term narrative
+
+**Family Synergies:**
+- **finbert**: Baseline financial text sentiment
+- **doc_embedding_novelty_hf**: Global regime change (symbol-independent)
+- **earnings_transcript_hf**: Quarterly earnings narrative
+- **news_sentiment_hf**: Daily news flow
+- **alternative_signals**: Social media/search sentiment (filtered to relevant keywords)
+
+**Keyword Filtering (alternative_signals):**
+- Keeps only: news, sentiment, reddit, twitter, social, search
+- Removes: Non-sentiment alt data (traffic, app downloads, etc.)
+- Rationale: Focus on sentiment-relevant alt signals
+
+**Shorter Window (45 days):**
+- News decays faster than fundamentals
+- Earnings calls quarterly (every ~90 days)
+- Social media very fast-moving
+- 45 days balances recency with stability
+
+**Cache Path:**
+- **Symbol-only HF block**: `cache/symbols/{SYMBOL}/hf/news_nlp_hf.parquet`
+- **Canonical horizon=63**: Not horizon-partitioned
+
+**Telemetry:**
+- `source`: "HFTimeSeriesModule"
+- `window`: 45
+- `horizon`: 63
+- `families`: ['finbert', 'doc_embedding_novelty_hf', 'earnings_transcript_hf', 'news_sentiment_hf', 'alternative_signals']
+- `epochs`: 6
 
 ---

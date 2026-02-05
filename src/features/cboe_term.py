@@ -58,6 +58,11 @@ def fetch(start: Optional[str] = None, end: Optional[str] = None, symbol: Option
     try:
         from src.data_sources.eodhd_provider import get_eodhd_provider
         
+        # ═══════════════════════════════════════════════════════════════════
+        # DATA SOURCE: EODHD (Primary)
+        # Used by: Linear alpha combiner features (cboe_panic, cboe_slope, cboe_vrp)
+        # Enforcement: Set STAGE_B_EODHD_ONLY=1 to disable yfinance fallback
+        # ═══════════════════════════════════════════════════════════════════
         # Prefer EODHD symbols (when available). If strict modes are enabled, we
         # refuse to use yfinance.
         vix_candidates = {

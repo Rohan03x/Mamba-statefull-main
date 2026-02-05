@@ -54,7 +54,12 @@ from ..utils import to_market_session
 
 LOGGER = logging.getLogger(__name__)
 
-_DATA_CACHE = Path(__file__).resolve().parents[3] / "data_cache" / "macro_panel"
+# Import centralized cache paths
+try:
+    from src.cache_paths import MACRO_PANEL_CACHE_ROOT
+    _DATA_CACHE = MACRO_PANEL_CACHE_ROOT
+except ImportError:
+    _DATA_CACHE = Path(__file__).resolve().parents[3] / "cache" / "shared" / "macro_panel"
 
 
 _MACRO_TST_HF_DROP_PREFIXES: Tuple[str, ...] = (

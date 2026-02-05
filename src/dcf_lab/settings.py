@@ -28,7 +28,13 @@ CACHE_TTL_FINANCIALS_SEC: int = int(
         "TTL_FINANCIALS_SEC",
         24 * 3600))
 CACHE_TTL_NEWS_SEC: int = int(os.environ.get("TTL_NEWS_SEC", 30 * 60))
-CACHE_DIR: str = os.environ.get("DCF_LAB_CACHE_DIR", "data_cache")
+
+# Use centralized cache path
+try:
+    from src.cache_paths import SHARED_CACHE_ROOT
+    CACHE_DIR: str = os.environ.get("DCF_LAB_CACHE_DIR", str(SHARED_CACHE_ROOT))
+except ImportError:
+    CACHE_DIR: str = os.environ.get("DCF_LAB_CACHE_DIR", "cache/shared")
 
 # Provider-specific environment
 CIQ_EXCEL_PATH: str | None = os.environ.get("CIQ_EXCEL_PATH")

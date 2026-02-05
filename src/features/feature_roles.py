@@ -90,6 +90,9 @@ DEFAULT_FAMILY_META: Dict[str, FamilyMeta] = {
     # Macro regime summaries
     "macro_regime_hf": FamilyMeta(FeatureRole.REGIME, update_cadence="daily", decay="none", allow_direct_alpha="false"),
 
+    # Event risk management (portfolio-only)
+    "event_risk_hf": FamilyMeta(FeatureRole.RISK, update_cadence="daily", decay="none", allow_direct_alpha="false"),
+
     # Hygiene / gating
     "listing_status": FamilyMeta(FeatureRole.HYGIENE, update_cadence="daily", decay="slow", allow_direct_alpha="false"),
     "exchange_calendar": FamilyMeta(FeatureRole.REGIME, update_cadence="daily", decay="none", allow_direct_alpha="false"),
@@ -130,7 +133,7 @@ def load_family_meta_from_registry(path: Optional[Path] = None) -> Dict[str, Fam
     This is the STEP 0 anchor: registry is authoritative; DEFAULT_FAMILY_META is only a fallback.
     """
 
-    reg_path = path or (_repo_root() / "docs" / "family_metadata_registry.json")
+    reg_path = path or (_repo_root() / "src" / "features" / "family_metadata_registry.json")
     try:
         from src.features.family_metadata import load_family_metadata  # type: ignore
     except Exception:
@@ -346,6 +349,7 @@ HYGIENE_TOKENS = (
     "days_since_event",
     "missing",
     "availability",
+    "confidence",  # CRITICAL: any *_confidence must be HYGIENE, never alpha
 )
 
 REGIME_TOKENS = (
@@ -418,21 +422,21 @@ PREDICTIVE_TOKENS = (
 # ----------------------------------------------------------------------------
 _ALT_SIGNALS_PREFIX = "alternative_signals_"
 
-_ALT_SIGNALS_HYGIENE_SUFFIXES = {
+_ALT_SIGNALS_HYGIENE_SUFFIXES = frozenset({
     "has_data",
     "activity",
     "days_since_update",
-}
+})
 
-_ALT_SIGNALS_RISK_SUFFIXES = {
-    # Beta / correlation
+_ALT_SIGNALS_RISK_SUFFIXES = frozenset({
+    # Beta / correlation (risk overlay → Portfolio)
     "beta_20d",
     "beta_change_rate",
     "beta_vix_interaction",
     "spy_correlation_20d",
     "qqq_correlation_20d",
     "sector_etf_correlation_20d",
-    # Volatility
+    # Volatility block (risk overlay → Portfolio)
     "rv_5d",
     "rv_10d",
     "rv_20d",
@@ -442,22 +446,20 @@ _ALT_SIGNALS_RISK_SUFFIXES = {
     "open_to_close_volatility",
     "high_low_volatility_ratio",
     "intraday_volatility_ratio",
-    # Liquidity / cost
+    # Liquidity stress (risk → Portfolio)
     "liquidity_stress_pct",
-}
+})
 
-_ALT_SIGNALS_REGIME_SUFFIXES = {
-    # Earnings regime / calendar
+_ALT_SIGNALS_REGIME_SUFFIXES = frozenset({
+    # Earnings timing (calendar/context → Portfolio)
     "days_since_last_earnings",
     "days_to_next_earnings",
+    # Seasonality flag
     "turn_of_month_flag",
-    # Attention levels (policy)
-    "news_volume_count",
-    "google_trends_score",
-}
+})
 
-_ALT_SIGNALS_PREDICTIVE_SUFFIXES = {
-    # Intraday / overnight
+_ALT_SIGNALS_PREDICTIVE_SUFFIXES = frozenset({
+    # Intraday / overnight (alpha → Mamba)
     "intraday_range_pct",
     "intraday_range_z",
     "opening_reversal",
@@ -467,54 +469,60 @@ _ALT_SIGNALS_PREDICTIVE_SUFFIXES = {
     "gap_up_pct",
     "gap_down_pct",
     "gap_vs_vix_interaction",
-    # Volume
+    # Volume (mostly alpha → Mamba; liquidity_stress_pct is RISK)
     "relative_volume_20d",
     "volume_z_20d",
     "volume_trend_10d",
     "opening_volume_surge",
     "buy_volume_proxy",
     "volume_price_divergence",
-    # Earnings drift
+    # Earnings drift (alpha → Mamba)
     "earnings_runup_10d",
     "post_earnings_drift_5d",
-    # News / sentiment shocks
+    # News / attention (alpha → Mamba)
+    "news_volume_count",
     "news_volume_change",
     "news_volume_z",
-    # Derived signals
+    "google_trends_score",
+    # Final signals (alpha → Mamba)
     "trend_acceleration",
     "mean_reversion_signal",
-}
+})
 
 # ----------------------------------------------------------------------------
 # ARIMA forecast authoritative overrides (Jan 2026 policy)
 # ----------------------------------------------------------------------------
 _ARIMA_PREFIX = "arima_forecast_"
 
-_ARIMA_HYGIENE_SUFFIXES = {
+_ARIMA_HYGIENE_SUFFIXES = frozenset({
     "has_data",
     "activity",
     "days_since_update",
     "arima_log_likelihood",
     "confidence",
-}
+})
 
-_ARIMA_RISK_SUFFIXES = {
+_ARIMA_RISK_SUFFIXES = frozenset({
+    # Magnitude/variance → Portfolio for risk sizing
     "arima_abs_residual",
     "arima_uncertainty_proxy",
     "arima_innovation",
-}
+})
 
-_ARIMA_REGIME_SUFFIXES = {
+_ARIMA_REGIME_SUFFIXES = frozenset({
     "arima_persistence",
-}
+})
 
-_ARIMA_PREDICTIVE_SUFFIXES = {
-    "arima_forecast_1d",
-    "arima_forecast_5d",
-    "arima_residual_zscore",
+_ARIMA_PREDICTIVE_SUFFIXES = frozenset({
+    # Forecast outputs (alpha → Mamba)
+    "1d",
+    "5d",
+    # Signed residuals (alpha → Mamba)
     "arima_residual_t",
+    "arima_residual_zscore",
+    # Momentum indicator (alpha → Mamba)
     "arima_momentum_indicator",
-}
+})
 
 # ----------------------------------------------------------------------------
 # Quantile forecast + calibration + online learning overrides (Jan 2026 policy)
@@ -704,8 +712,11 @@ _CROSS_ASSET_REGIME_SUFFIXES = {
     "beta_sign_flip_flag",      # Binary regime shift
     "tnx_corr_change_5d",       # abs(change) in rate correlation
     "irx_corr_change_5d",       # abs(change) in rate correlation
-    "cross_asset_coupling_change",  # abs(change) in coupling factor
-    # Composite (directional, for policy state only)
+    "coupling_change",          # abs(change) in coupling factor (FIXED: was cross_asset_coupling_change)
+    # Composite policy state factor
+    # NOTE: risk_onoff_factor must be normalized to [0,1] centered at 0.5 before use.
+    # The derived risk_offness = clip((0.5 - risk_onoff_factor) / 0.5, 0, 1) assumes this.
+    # Normalization: logistic(z-score) or min-max over 252d rolling window.
     "risk_onoff_factor",
 }
 
@@ -767,28 +778,31 @@ _DCF_REGIME_SUFFIXES = {
     "terminal_value_pct",
 }
 
-_QUANTILE_HYGIENE_SUFFIXES = {
+_QUANTILE_HYGIENE_SUFFIXES = frozenset({
     "has_data",
     "activity",
     "days_since_update",
-    "hf_conf",
-}
+    "hf_conf",  # HF transformer confidence → gating only, not alpha
+})
 
-_QUANTILE_PREDICTIVE_SUFFIXES = {
-    "q50",
-    "q_median_50",
-    "q_skewness_proxy",
-    "q_tilt_direction",
-    "skew",
+_QUANTILE_PREDICTIVE_SUFFIXES = frozenset({
+    # Raw quantiles (8) → Mamba: full predictive distribution
+    "q05", "q10", "q25", "q50", "q75", "q90", "q95", "q99",
+    # Derived aliases (5) → Mamba: same as raw quantiles
+    "q_low_5", "q_low_25", "q_median_50", "q_high_75", "q_high_95",
+    # Directional skew signals (3) → Mamba: alpha
+    "q_skewness_proxy", "q_tilt_direction", "skew",
+    # HF transformer score → Mamba: directional alpha
     "hf_score",
-}
+})
 
-_QUANTILE_RISK_SUFFIXES = {
-    "q_spread_95_5",
-    "q_vol_forecast",
-    "width",
-    "uncertainty",
-}
+_QUANTILE_RISK_SUFFIXES = frozenset({
+    # Uncertainty/spread metrics → Portfolio: risk sizing only
+    "q_spread_95_5",  # 95-5 spread for position sizing
+    "q_vol_forecast", # Vol forecast for risk sizing
+    "width",          # Distribution width risk
+    "uncertainty",    # Normalized uncertainty
+})
 
 
 def _quantile_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
@@ -807,109 +821,134 @@ def _quantile_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
 
 
 def _calibration_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
-    """Route calibration columns: freshness→HYGIENE, quality→RISK, status→REGIME.
+    """Route calibration columns: ALL 27 columns → HYGIENE → Portfolio parquet only.
     
-    Critical: RoleAwareContext only auto-gates on has_data/days_since_update for HYGIENE.
-    Quality metrics (overall_score, calibration_error, etc.) must be RISK to affect
-    risk_scale = 1/(1+risk_agg). Keeping them as HYGIENE does nothing useful.
+    Critical: Calibration columns are model-quality diagnostics (hygiene).
+    Feeding them into Mamba creates circular behaviour (model learns "when it is good"
+    rather than learning market structure). These should gate/weight alpha, not become alpha.
+    
+    All columns route to Portfolio parquet:
+    - Governance: has_data, activity, days_since_update
+    - Coverage: q05_coverage..q99_coverage (8 quantiles)
+    - Error: q05_error..q99_error (8 quantiles)
+    - Interval: interval_coverage, interval_expected, interval_error
+    - Quality: mean_calibration_error, overall_score
+    - Status: requires_recalibration, sample_size, confidence
     """
     name = str(column or "")
     if not name.lower().startswith(_CALIB_PREFIX):
         return None
     suffix = name[len(_CALIB_PREFIX):].lower()
     
-    # HYGIENE: freshness/availability gates (veto on NaN or stale)
+    # ALL calibration columns → HYGIENE (Portfolio parquet only)
+    # Governance gates
     if suffix in {"has_data", "activity", "days_since_update"}:
         return FeatureRole.HYGIENE, "CAL:governance"
     
-    # RISK: quality metrics that should shrink exposure when degraded
-    # These affect risk_scale = 1/(1+risk_agg) in RoleAwareContext
-    if suffix in {
-        "mean_calibration_error",
-        "overall_score",
-        "interval_error",
-        "quantile_error",
-        "sharpness",
-        "reliability",
-        "calibration_slope",
-        "calibration_intercept",
-        "brier_score",
-        "log_loss",
-        "expected_calibration_error",
-        "maximum_calibration_error",
-    }:
-        return FeatureRole.RISK, "CAL:quality_risk"
+    # Coverage tracking (8 quantile coverage cols)
+    if suffix.startswith("q") and suffix.endswith("_coverage"):
+        return FeatureRole.HYGIENE, "CAL:coverage"
     
-    # REGIME: binary/categorical status flags that modulate regime_multiplier
-    if suffix in {
-        "requires_recalibration",
-        "recalibration_flag",
-        "model_stale",
-        "quality_regime",
-    }:
-        return FeatureRole.REGIME, "CAL:status_regime"
+    # Error tracking (8 quantile error cols)
+    if suffix.startswith("q") and suffix.endswith("_error"):
+        return FeatureRole.HYGIENE, "CAL:error"
     
-    # Default: treat unknown calibration columns as RISK (conservative)
-    return FeatureRole.RISK, "CAL:risk_default"
+    # Interval reliability metrics
+    if suffix in {"interval_coverage", "interval_expected", "interval_error"}:
+        return FeatureRole.HYGIENE, "CAL:interval"
+    
+    # Quality scalars for weighting
+    if suffix in {"mean_calibration_error", "overall_score"}:
+        return FeatureRole.HYGIENE, "CAL:quality"
+    
+    # Status/control flags
+    if suffix in {"requires_recalibration", "sample_size", "confidence"}:
+        return FeatureRole.HYGIENE, "CAL:status"
+    
+    # Default: ALL calibration → HYGIENE (never to Mamba)
+    return FeatureRole.HYGIENE, "CAL:hygiene_default"
 
 
 def _online_learning_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
-    """Route online_learning columns: freshness→HYGIENE, trust/accuracy→RISK, drift→REGIME.
+    """Route online_learning columns: ALL 35 columns → Portfolio parquet only.
     
-    Critical: These are meta-performance signals. They should NEVER go to Mamba.
-    Trust/accuracy metrics affect risk_scale; drift flags affect regime_multiplier.
+    Critical: These are model/learner telemetry, NOT market alpha features.
+    The 7 columns previously marked PREDICTIVE (direction_accuracy, model_confidence,
+    trust_score, recalibration_strength, quantile_spread_shock, asymmetric_calibration_ratio,
+    prediction_skewness) are reclassified to HYGIENE to prevent circular behaviour.
+    
+    Routing summary:
+    - HYGIENE: governance, quality metrics, counters, meta-signals (25 cols)
+    - REGIME: drift/update/compression flags, regime probabilities (10 cols)
+    - RISK: quantile drift, calibration asymmetry, uncertainty (0 → moved to HYGIENE)
+    
+    Net: 0 columns to Mamba, 35 columns to Portfolio.
     """
     name = str(column or "")
     if not name.lower().startswith(_ONLINE_PREFIX):
         return None
     suffix = name[len(_ONLINE_PREFIX):].lower()
     
-    # HYGIENE: freshness/availability gates
+    # HYGIENE: governance/freshness gates
     if suffix in {"has_data", "activity", "days_since_update"}:
         return FeatureRole.HYGIENE, "OL:governance"
     
-    # RISK: trust/accuracy/quality metrics - shrink exposure when model is uncertain
-    if suffix in {
-        "trust_score",
-        "model_confidence",
-        "direction_accuracy",
-        "sign_accuracy",
-        "hit_rate",
-        "accuracy",
-        "quantile_accuracy",
-        "mse",
-        "mae",
-        "sharpe_estimate",
-        "information_ratio",
-        "uncertainty_estimate",
-        "prediction_variance",
-    }:
-        return FeatureRole.RISK, "OL:trust_risk"
+    # HYGIENE: quality metrics (gate/weight signals, not alpha)
+    if suffix in {"mae", "rmse", "mape", "samples"}:
+        return FeatureRole.HYGIENE, "OL:quality"
     
-    # REGIME: drift/retrain flags - modulate regime_multiplier
+    # HYGIENE: maintenance counters
+    if suffix in {"partial_retrains", "incremental_updates", "recalibration_needed"}:
+        return FeatureRole.HYGIENE, "OL:maintenance"
+    
+    # HYGIENE: former PREDICTIVE meta-signals → reclassified to prevent circular behaviour
+    # These describe "how good the model is" not "where the market is going"
+    if suffix in {
+        "direction_accuracy",
+        "model_confidence",
+        "trust_score",
+        "recalibration_strength",
+        "quantile_spread_shock",
+        "asymmetric_calibration_ratio",
+        "prediction_skewness",
+    }:
+        return FeatureRole.HYGIENE, "OL:meta_hygiene"
+    
+    # REGIME: drift/retrain/update event flags
     if suffix in {
         "drift_flag",
+        "drift_events",
         "partial_retrain_flag",
-        "full_retrain_flag",
+        "model_updated_flag",
         "uncertainty_compression_alert",
-        "regime_shift_detected",
-        "distribution_drift",
-        "concept_drift",
-        "covariate_drift",
     }:
         return FeatureRole.REGIME, "OL:drift_regime"
     
-    # REGIME: regime probabilities (continuous modulation)
+    # REGIME: regime probabilities (6 cols: trend +/-/neutral, vol high/low/normal)
     if suffix in {
-        "regime_prob_bull",
-        "regime_prob_bear",
-        "regime_prob_neutral",
-        "regime_probability",
+        "regime_trend_positive",
+        "regime_trend_negative",
+        "regime_trend_neutral",
+        "regime_vol_high",
+        "regime_vol_low",
+        "regime_vol_normal",
     }:
         return FeatureRole.REGIME, "OL:regime_prob"
     
-    # Default: treat unknown online_learning columns as RISK (conservative)
-    return FeatureRole.RISK, "OL:risk_default"
+    # RISK: distribution instability metrics (route to Portfolio for risk sizing)
+    if suffix in {
+        "quantile_drift_avg",
+        "quantile_drift_q50",
+        "quantile_drift_std",
+        "quantile_spread_current",
+        "upside_calibration_error",
+        "downside_calibration_error",
+        "uncertainty_compression_ratio",
+    }:
+        return FeatureRole.RISK, "OL:distribution_risk"
+    
+    # Default: ALL online_learning → HYGIENE (never to Mamba)
+    return FeatureRole.HYGIENE, "OL:hygiene_default"
 
 
 def _cboe_term_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
@@ -962,9 +1001,19 @@ def _cboe_term_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
 def _corp_actions_splits_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
     """Route corp_actions_splits columns with proper bounded recency.
     
+    TIMING CONVENTION (Option A - canonical):
+    - flag=1.0 is emitted on the split effective date (close of that session)
+    - Global shift(1) downstream makes it tradeable next session
+    - Do NOT shift inside the family builder; this family participates in global shift
+    
     Critical: The raw days_since=9999 value corrupts role-aware regime averaging.
     The feature builder should transform to bounded recency in [0,1]:
         recency = exp(-min(days_since, 252)/20)
+    
+    TOKEN INFERENCE WARNING:
+    - 'days_since' suffix can be misclassified as HYGIENE by token-based inference
+    - This override provides explicit per-column roles to prevent misclassification
+    - Always use this family's explicit schema, never rely on token inference
     
     Routing:
     - HYGIENE: has_data, activity, days_since_update (freshness gating)
@@ -1009,6 +1058,16 @@ def _correlation_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]
     - Mamba (PREDICTIVE): lag correlations, VIX lag, return autocorrelations
     - Portfolio (RISK): systematic exposure, correlation levels
     - Portfolio (REGIME): decoupling, trends, cross-feature diagnostics, vol clustering
+    
+    COLUMN STATUS NOTE:
+    - corr_20_qqq_trend: Included in routing config (REGIME). If not generated by your
+      feature builder, add it or remove from _CORRELATION_PORTFOLIO_REGIME_SUFFIXES.
+    
+    TOKEN INFERENCE WARNING:
+    - '*_z' suffixes (e.g., corr_decoupling_z) can be misclassified as PREDICTIVE
+      by token-based inference since 'z' often indicates z-scored alpha features.
+    - This override provides explicit per-column roles: corr_decoupling_z → REGIME.
+    - Always use this family's explicit schema, never rely on token inference.
     """
     name = str(column or "")
     name_lower = name.lower()
@@ -1784,48 +1843,1868 @@ def _fin_g3_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
     return FeatureRole.REGIME, "G3:regime_default"
 
 
+# ============================================================================
+# FIN_G4 (Cash Flow) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G4_PREFIX = "fin_g4_"
+
+_FIN_G4_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+})
+
+_FIN_G4_RISK_SUFFIXES = frozenset({
+    # STRESS features: higher = worse (safe for risk aggregation)
+    "cash_flow_stress",
+    "earnings_quality_stress",
+    # Accruals ratio (higher = lower earnings quality = worse)
+    "accruals_ratio",
+})
+
+_FIN_G4_PREDICTIVE_SUFFIXES = frozenset({
+    # Scale-free quality metrics for Mamba (slow alpha)
+    "cfo_to_net_income",
+    "fcf_to_net_income",
+    "cfo_margin",
+    "fcf_margin",
+    "fcf_to_revenue",
+    # Normalized metrics
+    "cfo_to_assets",
+    "fcf_to_assets",
+    # Z-scores (PREDICTIVE: value tilt / mean reversion)
+    "cfo_to_assets_zscore_3y",
+    "fcf_to_assets_zscore_3y",
+    "cfo_margin_zscore_3y",
+    "fcf_margin_zscore_3y",
+})
+
+_FIN_G4_REGIME_SUFFIXES = frozenset({
+    # Capital intensity (regime/industry structural)
+    "capex_to_revenue",
+})
+
+# Raw dollar amounts: NOT scale-free, exclude from cross-sectional models
+_FIN_G4_RAW_DOLLAR_SUFFIXES = frozenset({
+    "operating_cash_flow",
+    "free_cash_flow",
+})
+
+
+def _fin_g4_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g4 (cash flow) columns: stress to portfolio, quality metrics to Mamba.
+    
+    CRITICAL: Raw OCF/FCF are in dollars and NOT cross-sectionally comparable.
+    Use normalized versions (cfo_to_assets, fcf_margin, z-scores) for Mamba.
+    Use stress features (cash_flow_stress, earnings_quality_stress) for portfolio risk.
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update
+    - Portfolio (RISK): cash_flow_stress, earnings_quality_stress, accruals_ratio
+    - Portfolio (REGIME): capex_to_revenue (industry structural)
+    - Mamba (PREDICTIVE): scale-free quality metrics, z-scores
+    - EXCLUDED: raw dollar amounts (not scale-free)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G4_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G4_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G4_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G4:governance"
+    
+    # RISK: stress features
+    if suffix in _FIN_G4_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G4:cash_flow_stress"
+    
+    # PREDICTIVE: quality metrics and z-scores
+    if suffix in _FIN_G4_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G4:quality_metrics"
+    
+    # REGIME: industry structural
+    if suffix in _FIN_G4_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "G4:regime"
+    
+    # Raw dollar amounts: REGIME (exclude from cross-sectional ranking)
+    if suffix in _FIN_G4_RAW_DOLLAR_SUFFIXES:
+        return FeatureRole.REGIME, "G4:dollar_not_scalefree"
+    
+    return FeatureRole.REGIME, "G4:regime_default"
+
+
+# ============================================================================
+# FIN_G5 (Growth) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G5_PREFIX = "fin_g5_"
+
+_FIN_G5_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+})
+
+_FIN_G5_RISK_SUFFIXES = frozenset({
+    # Growth volatility (higher = unstable growers = worse)
+    "growth_volatility_3y",
+    "eps_growth_volatility_3y",
+})
+
+_FIN_G5_PREDICTIVE_SUFFIXES = frozenset({
+    # YoY growth metrics: PREDICTIVE (medium-horizon drivers)
+    "revenue_growth_yoy",
+    "ebitda_growth_yoy",
+    "cf_growth_yoy",
+    "eps_growth_yoy",
+    # Margin dynamics: PREDICTIVE (leads price re-rating)
+    "margin_expansion",
+})
+
+_FIN_G5_REGIME_SUFFIXES = frozenset({
+    # Multi-year CAGR: REGIME (slow style classification, growth vs value)
+    "revenue_cagr_3y",
+    "eps_cagr_3y",
+})
+
+
+def _fin_g5_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g5 (growth) columns: YoY growth to Mamba (optional), CAGR to regime.
+    
+    CRITICAL ROUTING:
+    - YoY growth + margin_expansion: PREDICTIVE (medium-horizon alpha, optional for Mamba)
+    - Multi-year CAGR: REGIME (slow style tilt, not short-term alpha)
+    - Growth volatility: RISK (unstable growers get downweighted)
+    
+    Initial recommendation: Do NOT feed fin_g5 to Mamba until portfolio loop is stable.
+    If/when enabling: include only YoY growth + margin_expansion (clipped/winsorized).
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update
+    - Portfolio (RISK): growth_volatility_3y (downweight unstable growers)
+    - Portfolio (REGIME): revenue_cagr_3y, eps_cagr_3y (slow style)
+    - Mamba (PREDICTIVE, optional): *_growth_yoy, margin_expansion
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G5_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G5_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G5_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G5:governance"
+    
+    # RISK: growth volatility
+    if suffix in _FIN_G5_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G5:growth_risk"
+    
+    # PREDICTIVE: YoY growth + margin dynamics
+    if suffix in _FIN_G5_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G5:growth_alpha"
+    
+    # REGIME: multi-year CAGR (slow style)
+    if suffix in _FIN_G5_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "G5:style_regime"
+    
+    return FeatureRole.REGIME, "G5:regime_default"
+
+
+# ============================================================================
+# FIN_G6 (Valuation) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G6_PREFIX = "fin_g6_"
+
+_FIN_G6_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+})
+
+_FIN_G6_RISK_SUFFIXES = frozenset({
+    # Raw multiples: RISK (pathological values, use for risk/style not alpha)
+    # PE has negative EPS issues, all multiples are industry-structural
+    "pe_ratio",
+    "pb_ratio",
+    "ps_ratio",
+    "ev_ebitda",
+    "dividend_yield",
+    # STRESS features: valuation_richness = max(0, zscore)
+    # Expensive stocks are fragile: more downside risk if sentiment shifts
+    "valuation_richness",
+    "pe_ratio_richness",
+    "pb_ratio_richness",
+    "ev_ebitda_richness",
+})
+
+_FIN_G6_PREDICTIVE_SUFFIXES = frozenset({
+    # Z-scores: PREDICTIVE (value tilt / mean reversion for Mamba)
+    # This is the USEFUL version - scale-controlled and learnable
+    # Positive z = expensive vs history = potential short candidate or reduce
+    # Negative z = cheap vs history = potential value opportunity
+    "pe_ratio_zscore_5y",
+    "pb_ratio_zscore_5y",
+    "ev_ebitda_zscore_5y",
+    "ps_ratio_zscore_5y",
+})
+
+
+def _fin_g6_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g6 (valuation) columns: z-scores to Mamba, raw multiples + richness to portfolio.
+    
+    CRITICAL ROLE SPLIT:
+    - Raw multiples (pe_ratio, pb_ratio, etc.): RISK for portfolio style/risk.
+      DO NOT feed to Mamba - pathological values (negative EPS), industry-structural.
+    - Z-scores: PREDICTIVE value factor for Mamba (slow alpha on 21-252d horizons).
+      These are the USEFUL version - scale-controlled and actually learnable.
+    - Richness: RISK for portfolio risk scaling.
+      Expensive stocks are fragile: higher position risk if sentiment shifts.
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update
+    - Portfolio (RISK): raw multiples + valuation_richness, *_richness
+    - Mamba (PREDICTIVE): ONLY z-scores (value factor alpha)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G6_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G6_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G6_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G6:governance"
+    
+    # RISK: raw multiples + valuation richness
+    if suffix in _FIN_G6_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G6:valuation_risk"
+    
+    # PREDICTIVE: z-scores for value factor (ONLY these go to Mamba)
+    if suffix in _FIN_G6_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G6:value_factor"
+    
+    return FeatureRole.RISK, "G6:risk_default"
+
+
+# ============================================================================
+# FIN_G7 (Dividend Policy / Shareholder Yield) family role overrides (Jan 2026)
+# ============================================================================
+_FIN_G7_PREFIX = "fin_g7_"
+
+_FIN_G7_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    # shares_outstanding is raw scale, should not be ML input
+    "shares_outstanding",
+})
+
+_FIN_G7_RISK_SUFFIXES = frozenset({
+    # Payout sustainability / cut risk
+    "payout_ratio",
+    # Dividend exposure, not short-horizon alpha
+    "dividend_yield_proxy",
+    # Stability penalty/bonus
+    "dividend_policy_stability",
+    # Dilution is a quality negative
+    "share_dilution_3y",
+})
+
+_FIN_G7_REGIME_SUFFIXES = frozenset({
+    # Capital return regime (structural)
+    "buyback_consistency",
+})
+
+_FIN_G7_PREDICTIVE_SUFFIXES = frozenset({
+    # The ML-safe valuation-like transform (z-score)
+    "yield_zscore_5y",
+})
+
+
+def _fin_g7_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route fin_g7 (dividend/shareholder yield) columns.
+    
+    CRITICAL ROUTING:
+    - payout_ratio, dividend_yield_proxy, dividend_policy_stability, share_dilution_3y: RISK
+      These are sustainability/cut risk inputs, NOT short-horizon alpha.
+    - buyback_consistency: REGIME (capital return regime signal)
+    - yield_zscore_5y: PREDICTIVE (ML-safe z-score, especially for longer horizons)
+    - shares_outstanding: HYGIENE (raw scale, never ML input)
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update, shares_outstanding
+    - Portfolio (RISK): payout_ratio, dividend_yield_proxy, policy_stability, dilution
+    - Portfolio (REGIME): buyback_consistency
+    - Mamba (PREDICTIVE): yield_zscore_5y only
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FIN_G7_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FIN_G7_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FIN_G7_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "G7:governance"
+    
+    # RISK: sustainability/cut risk metrics
+    if suffix in _FIN_G7_RISK_SUFFIXES:
+        return FeatureRole.RISK, "G7:dividend_risk"
+    
+    # REGIME: capital return regime
+    if suffix in _FIN_G7_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "G7:capital_return_regime"
+    
+    # PREDICTIVE: z-score (ML-safe)
+    if suffix in _FIN_G7_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "G7:yield_alpha"
+    
+    return FeatureRole.RISK, "G7:risk_default"
+
+
+# ============================================================================
+# FINBERT (Sentiment) family role overrides (Jan 2026)
+# ============================================================================
+_FINBERT_PREFIX = "finbert_"
+
+_FINBERT_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    # CRITICAL: confidence must be HYGIENE globally, never alpha
+    "confidence",
+})
+
+_FINBERT_PREDICTIVE_SUFFIXES = frozenset({
+    # Direct alpha input
+    "score",
+})
+
+_FINBERT_REGIME_SUFFIXES = frozenset({
+    # High neutral = low informational content
+    # Use to downweight sentiment impact, not as direct alpha
+    "neutral",
+})
+
+
+def _finbert_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route finbert (sentiment) columns.
+    
+    CRITICAL ROUTING:
+    - finbert_score: PREDICTIVE (direct alpha input)
+    - finbert_neutral: REGIME (high neutral = low info, use to downweight sentiment)
+    - finbert_confidence: HYGIENE (must NEVER be alpha input)
+    
+    Routing:
+    - Portfolio (HYGIENE): has_data, activity, days_since_update, confidence
+    - Mamba (PREDICTIVE): score only
+    - Portfolio (REGIME): neutral (downweight sentiment when high)
+    """
+    name = str(column or "")
+    name_lower = name.lower()
+    
+    if not name_lower.startswith(_FINBERT_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_FINBERT_PREFIX):]
+    
+    # HYGIENE
+    if suffix in _FINBERT_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "FINBERT:governance"
+    
+    # PREDICTIVE: sentiment score
+    if suffix in _FINBERT_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "FINBERT:sentiment_alpha"
+    
+    # REGIME: neutral probability
+    if suffix in _FINBERT_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "FINBERT:info_quality"
+    
+    return FeatureRole.REGIME, "FINBERT:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GARCH_IV FAMILY — Risk/Regime diagnostics, NOT Mamba input
+# ─────────────────────────────────────────────────────────────────────────────
+# This is risk + regime diagnostics. Primary consumers: Portfolio parquet,
+# Policy Controller state, risk overlays, signal scaling.
+# Only vol_momentum is OPTIONAL for Mamba (if normalized/clipped).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GARCH_IV_PREFIX = "garch_iv_"
+
+# Governance + model diagnostics (HYGIENE)
+_GARCH_IV_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity", 
+    "days_since_update",
+    "confidence",
+    "garch_log_likelihood",       # Model fit quality, not tradable
+    "garch_standardized_residual",  # Single-point noise, REMOVE from Mamba
+})
+
+# RISK: vol targeting, execution, risk scaling
+_GARCH_IV_RISK_SUFFIXES = frozenset({
+    "garch30_minus_garch180",     # Legacy RV spread
+    "skew_proxy_downside_minus_upside",  # Tail risk proxy
+    "garch_1d",                   # Vol targeting
+    "garch_5d",                   # Policy state
+    "garch_20d",                  # Regime baseline
+    "garch_ratio_1d_20d",         # Shock detector
+    "garch_zscore",               # Vol extremeness
+    "garch_residual_vol",         # Model uncertainty
+    "garch_short_long_ratio",     # Deviation from steady state
+    "garch_vol_norm_20d",         # Model vs actual calibration
+})
+
+# REGIME: slow-moving, policy controller state
+_GARCH_IV_REGIME_SUFFIXES = frozenset({
+    "garch_persistence",          # Near 1.0 = persistent regime
+    "garch_long_run_variance",    # Steady-state volatility
+    "garch_vol_of_vol",           # Regime instability (NOT predictive!)
+    "garch_vol_momentum",         # Vol trend (Policy state, optional Mamba)
+    "garch_spike_flag",           # Binary shock detector → should be continuous
+    "garch_shock_indicator",      # Binary outlier → should be continuous
+})
+
+
+def _garch_iv_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """GARCH_IV: Risk/regime diagnostics for Portfolio + Policy Controller.
+    
+    NOT Mamba input except optional vol_momentum (normalized/clipped).
+    Binaries (spike_flag, shock_indicator) should be converted to continuous.
+    standardized_residual should be REMOVED (single-point noise).
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_GARCH_IV_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_GARCH_IV_PREFIX):]
+    
+    # HYGIENE: governance + diagnostics
+    if suffix in _GARCH_IV_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "GARCH_IV:governance_or_diagnostic"
+    
+    # RISK: vol targeting, execution, risk scaling
+    if suffix in _GARCH_IV_RISK_SUFFIXES:
+        return FeatureRole.RISK, "GARCH_IV:risk_scaling"
+    
+    # REGIME: policy controller state
+    if suffix in _GARCH_IV_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "GARCH_IV:policy_state"
+    
+    # Default to RISK (conservative - not Mamba input)
+    return FeatureRole.RISK, "GARCH_IV:risk_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INDEX_CONSTITUENTS FAMILY — Flow/Liquidity/Institutional behavior
+# ─────────────────────────────────────────────────────────────────────────────
+# This is flow + liquidity + institutional behavior, NOT sequence learning.
+# Primary consumers: Portfolio parquet, Policy Controller.
+# Binary pulses (added_*, removed_*) should be replaced with decaying pulses.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INDEX_CONST_PREFIX = "index_constituents_"
+
+# Governance + availability (HYGIENE)
+_INDEX_CONST_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+    "has_hist_gspc",              # Data availability
+    "has_hist_dji",               # Data availability
+})
+
+# RISK: liquidity scaling, position sizing
+_INDEX_CONST_RISK_SUFFIXES = frozenset({
+    "weight_gspc",                # Current snapshot weight (liquidity scaling)
+    "weight_dji",                 # Current snapshot weight
+})
+
+# REGIME: membership state, slow style factors, flow regime
+_INDEX_CONST_REGIME_SUFFIXES = frozenset({
+    "member_gspc",                # Large-cap status
+    "member_dji",                 # Blue-chip status
+    "num_indices",                # Institutional ownership proxy
+    "days_since_add_gspc",        # Post-inclusion state
+    "days_since_add_dji",
+    "days_since_remove_gspc",     # Post-removal state
+    "days_since_remove_dji",
+    "add_flow_20d",               # Slow rebalancing wave (not short-term predictive)
+    "remove_flow_20d",            # Slow removal wave
+    # Binary pulses - should be decaying, route to REGIME for now
+    "added_gspc",                 # Binary pulse → should be exp(-days/τ)
+    "added_dji",
+    "removed_gspc",
+    "removed_dji",
+})
+
+# PREDICTIVE: short-term flow signals (Portfolio use, NOT Mamba)
+_INDEX_CONST_PREDICTIVE_SUFFIXES = frozenset({
+    "add_flow_5d",                # Short-term addition wave
+    "remove_flow_5d",             # Short-term removal wave
+})
+
+
+def _index_constituents_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """INDEX_CONSTITUENTS: Flow/liquidity signals for Portfolio + Policy.
+    
+    NOT Mamba input. Binary pulses should be converted to decaying pulses.
+    Weights are current snapshots, NOT historical time series.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_INDEX_CONST_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_INDEX_CONST_PREFIX):]
+    
+    # HYGIENE: governance + data availability
+    if suffix in _INDEX_CONST_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "INDEX_CONST:governance"
+    
+    # RISK: liquidity scaling
+    if suffix in _INDEX_CONST_RISK_SUFFIXES:
+        return FeatureRole.RISK, "INDEX_CONST:liquidity_scaling"
+    
+    # REGIME: membership state, flow regime
+    if suffix in _INDEX_CONST_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "INDEX_CONST:membership_or_flow_regime"
+    
+    # PREDICTIVE: short-term flows (for Portfolio, not Mamba)
+    if suffix in _INDEX_CONST_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "INDEX_CONST:short_term_flow"
+    
+    # Default to REGIME (conservative)
+    return FeatureRole.REGIME, "INDEX_CONST:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKETCAP_HISTORY FAMILY — Size/Liquidity/Institutional regime
+# ─────────────────────────────────────────────────────────────────────────────
+# This is size, liquidity, and institutional regime, NOT pattern learning.
+# Primary consumers: Portfolio parquet (caps, costs), Policy Controller.
+# NEVER feed into Mamba — level ≠ alpha.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MCAP_HISTORY_PREFIX = "marketcap_history_"
+
+# Governance (HYGIENE)
+_MCAP_HISTORY_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+})
+
+# RISK: risk scaling, turnover penalties
+_MCAP_HISTORY_RISK_SUFFIXES = frozenset({
+    "mcap_chg_20d",               # Short-term size change (dilution/M&A detector)
+    "mcap_vol_63d",               # Size volatility (penalize unstable names)
+    "float_turnover",             # Portfolio costs + turnover cap
+})
+
+# REGIME: size determines caps, leverage, max_name, gross exposure
+_MCAP_HISTORY_REGIME_SUFFIXES = frozenset({
+    "mcap",                       # Raw market cap level
+    "log_mcap",                   # Log market cap (Policy state)
+    "mcap_chg_63d",               # Medium-term size change (Policy state)
+    "mcap_chg_252d",              # Long-term size change (Policy state)
+    "turnover_z_252d",            # Liquidity regime (Policy state)
+})
+
+
+def _marketcap_history_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """MARKETCAP_HISTORY: Size/liquidity/institutional regime for Portfolio + Policy.
+    
+    NEVER Mamba input. Size level determines:
+    - Liquidity caps
+    - Turnover tolerance
+    - Max name concentration
+    - Gross exposure limits
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_MCAP_HISTORY_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_MCAP_HISTORY_PREFIX):]
+    
+    # HYGIENE: governance
+    if suffix in _MCAP_HISTORY_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "MCAP_HISTORY:governance"
+    
+    # RISK: volatility, turnover penalties
+    if suffix in _MCAP_HISTORY_RISK_SUFFIXES:
+        return FeatureRole.RISK, "MCAP_HISTORY:risk_scaling"
+    
+    # REGIME: size state, liquidity regime
+    if suffix in _MCAP_HISTORY_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "MCAP_HISTORY:size_regime"
+    
+    # Default to REGIME (conservative - not Mamba input)
+    return FeatureRole.REGIME, "MCAP_HISTORY:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MICROSTRUCTURE FAMILY — Primary Mamba input family (surgically clean)
+# ─────────────────────────────────────────────────────────────────────────────
+# Most important family for Mamba. Must be surgically clean:
+# - Candle geometry, volume surprises, order-flow, overnight gaps → Mamba
+# - Impact, spreads, liquidity, volatility → Portfolio
+# - Vol-of-vol, liquidity regime → Policy Controller
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MICRO_PREFIX = "microstructure_"
+
+# Governance + binary flags (HYGIENE only, never learning)
+_MICRO_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+    "stale_tick",                 # Binary gating flag only
+    "zero_range_flag",            # REMOVE (duplicate) - HYGIENE to gate
+    "low_liquidity_flag",         # Binary gating flag only
+    # Quote data availability
+    "quote_has_data",
+    "bid",                        # Quote level - last row only, not historical
+    "ask",
+    "bid_size",
+    "ask_size",
+})
+
+# RISK: volatility, spreads, impact → Portfolio parquet
+_MICRO_RISK_SUFFIXES = frozenset({
+    # Range & volatility ratios - NOT Mamba
+    "true_range",
+    "atr_ratio",
+    "range_pct",
+    "range_scaled",
+    # Volume & liquidity proxies
+    "volume_liquidity",
+    "turnover",
+    "amihud",
+    # Volatility & price impact
+    "impact_ratio",
+    "impact_volatility",
+    "spread_proxy",
+    "intraday_vol_proxy",
+    # Overnight volatility
+    "overnight_vol",
+    "intraday_vs_overnight_vol",
+    # Quote spreads
+    "spread_abs",
+    "spread_bps",
+})
+
+# REGIME: liquidity regime, vol-of-vol → Policy Controller
+_MICRO_REGIME_SUFFIXES = frozenset({
+    "hl_volume_corr",             # Volume-range correlation regime
+    "vol_of_vol",                 # Volatility regime instability
+    "gap_direction",              # Optional: {-1,0,1} embedding
+})
+
+# PREDICTIVE: Primary Mamba inputs - candle geometry, order-flow, gaps
+_MICRO_PREDICTIVE_SUFFIXES = frozenset({
+    # Candle geometry → Mamba gold
+    "body_pct",
+    "wick_top",
+    "wick_bottom",
+    "shadow_ratio",
+    # Volume surprises → Mamba
+    "volume_zscore",
+    "volume_surge",
+    # Order-flow proxies → Mamba gold
+    "ofi_proxy",
+    "signed_volume",
+    "pressure_proxy",
+    "demand_supply_ratio",
+    "liquidity_imbalance",
+    # Overnight gap → Mamba
+    "overnight_gap",
+    # Quote imbalance → Mamba (but time-gate carefully)
+    "quote_imbalance",
+})
+
+
+def _microstructure_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """MICROSTRUCTURE: Primary Mamba input family (surgically clean).
+    
+    - Candle geometry, volume surprises, order-flow, overnight gaps → Mamba
+    - Impact, spreads, liquidity, volatility → Portfolio
+    - Vol-of-vol, liquidity regime → Policy Controller
+    
+    Binary flags (stale_tick, zero_range_flag, low_liquidity_flag) are HYGIENE
+    only - they gate, they don't learn.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_MICRO_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_MICRO_PREFIX):]
+    
+    # HYGIENE: governance + binary flags + quote levels
+    if suffix in _MICRO_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "MICRO:governance_or_gating"
+    
+    # RISK: volatility, spreads, impact → Portfolio
+    if suffix in _MICRO_RISK_SUFFIXES:
+        return FeatureRole.RISK, "MICRO:portfolio_risk"
+    
+    # REGIME: vol-of-vol, liquidity regime → Policy
+    if suffix in _MICRO_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "MICRO:policy_state"
+    
+    # PREDICTIVE: candle geometry, order-flow, gaps → Mamba
+    if suffix in _MICRO_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "MICRO:mamba_input"
+    
+    # Default to PREDICTIVE for unknown microstructure features (conservative for this family)
+    return FeatureRole.PREDICTIVE, "MICRO:predictive_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTIASSET FAMILY — Systematic exposure measurement
+# ─────────────────────────────────────────────────────────────────────────────
+# This measures systematic exposure (betas, correlations), NOT short-horizon 
+# price formation. Primary consumers: Portfolio Parquet + Policy Controller.
+# NO Mamba input (except optional clipped spread_spy_20).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MULTIASSET_PREFIX = "multiasset_"
+
+# Governance (HYGIENE)
+_MULTIASSET_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+})
+
+# RISK: systematic exposure for portfolio construction
+_MULTIASSET_RISK_SUFFIXES = frozenset({
+    # SPY (S&P 500)
+    "corr_spy_120",               # 120-day correlation with market
+    "beta_spy_120",               # Systematic risk exposure
+    # QQQ (Nasdaq 100 - growth tilt)
+    "corr_qqq_120",
+    "beta_qqq_120",
+    # IWM (Russell 2000 - size tilt)
+    "corr_iwm_120",
+    "beta_iwm_120",
+    # ACWI (Global exposure)
+    "corr_acwi_120",
+    "beta_acwi_120",
+    # PCA market factor
+    "equity_factor_market",       # PC1: overall market exposure
+})
+
+# REGIME: style factors for Policy Controller
+_MULTIASSET_REGIME_SUFFIXES = frozenset({
+    "equity_factor_growth_value", # PC2: growth vs value tilt
+    "equity_factor_size",         # PC3: large vs small cap
+})
+
+# PREDICTIVE: only spread_spy_20 (relative strength, portfolio use)
+# NOTE: This is PREDICTIVE but should NOT go to Mamba (portfolio allocator only)
+_MULTIASSET_PREDICTIVE_SUFFIXES = frozenset({
+    "spread_spy_20",              # Relative strength vs SPY (clip if using in Mamba)
+})
+
+
+def _multiasset_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """MULTIASSET: Systematic exposure for Portfolio + Policy Controller.
+    
+    NOT Mamba input (except optional clipped spread_spy_20).
+    Betas/correlations are slow-moving and break sequence stationarity.
+    PCA factors are structural, not predictive.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_MULTIASSET_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_MULTIASSET_PREFIX):]
+    
+    # HYGIENE: governance
+    if suffix in _MULTIASSET_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "MULTIASSET:governance"
+    
+    # RISK: systematic exposure
+    if suffix in _MULTIASSET_RISK_SUFFIXES:
+        return FeatureRole.RISK, "MULTIASSET:systematic_exposure"
+    
+    # REGIME: style factors
+    if suffix in _MULTIASSET_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "MULTIASSET:style_factor"
+    
+    # PREDICTIVE: relative strength (portfolio use only)
+    if suffix in _MULTIASSET_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "MULTIASSET:relative_strength"
+    
+    # Default to RISK (conservative - not Mamba input)
+    return FeatureRole.RISK, "MULTIASSET:risk_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONS FAMILY — Snapshot-only options chain metrics
+# ─────────────────────────────────────────────────────────────────────────────
+# Snapshot architecture: only snapshot date has has_data=1, all other dates=0.
+# Primary use: Policy conditioning + Portfolio constraints.
+# NO Mamba input — snapshot data with zero-fill destroys temporal learning.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OPTIONS_PREFIX = "options_"
+
+# Governance + chain health diagnostics (HYGIENE)
+_OPTIONS_HYGIENE_SUFFIXES = frozenset({
+    "has_data",
+    "activity",
+    "days_since_update",
+    "confidence",
+    # Chain availability
+    "strikes_available",          # Total number of strikes (chain health)
+    "expiries_available",         # Number of expiries (chain health)
+    # Pricing features - NOT signals, just chain diagnostics
+    "call_bid_avg",
+    "call_ask_avg",
+    "call_last_avg",
+    "put_bid_avg",
+    "put_ask_avg",
+    "put_last_avg",
+})
+
+# RISK: IV for portfolio risk scaling, bid-ask for liquidity
+_OPTIONS_RISK_SUFFIXES = frozenset({
+    "atm_iv",                     # At-the-money IV → portfolio risk scaling
+    "call_iv_avg",                # Average call IV
+    "put_iv_avg",                 # Average put IV
+    "iv_spread",                  # Put-call IV skew → fear premium
+    "bid_ask_spread_pct",         # Liquidity proxy
+})
+
+# REGIME: sentiment, positioning, event proximity → Policy Controller
+_OPTIONS_REGIME_SUFFIXES = frozenset({
+    # Volume ratios (sentiment)
+    "call_volume",
+    "put_volume",
+    "put_call_volume_ratio",
+    # Open interest ratios (structural positioning)
+    "call_oi",
+    "put_oi",
+    "put_call_oi_ratio",
+    # Moneyness (skew structure)
+    "otm_call_pct",
+    "otm_put_pct",
+    # Term structure (event proximity)
+    "nearest_expiry_days",
+})
+
+
+def _options_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """OPTIONS: Snapshot-only options metrics for Policy + Portfolio.
+    
+    NO Mamba input — snapshot architecture with zero-fill destroys temporal learning.
+    IV → portfolio risk scaling
+    Volume/OI ratios → policy sentiment
+    Pricing features → HYGIENE chain diagnostics only
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_OPTIONS_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_OPTIONS_PREFIX):]
+    
+    # HYGIENE: governance + chain health + pricing diagnostics
+    if suffix in _OPTIONS_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "OPTIONS:governance_or_chain_health"
+    
+    # RISK: IV for portfolio risk scaling
+    if suffix in _OPTIONS_RISK_SUFFIXES:
+        return FeatureRole.RISK, "OPTIONS:portfolio_risk_scaling"
+    
+    # REGIME: sentiment, positioning → Policy
+    if suffix in _OPTIONS_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "OPTIONS:policy_sentiment"
+    
+    # Default to REGIME (conservative - not Mamba input)
+    return FeatureRole.REGIME, "OPTIONS:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONS_ANCHORING FAMILY — Institutional options anchoring with decay weighting
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily time-series (leakage-safe, continuous, decay-weighted).
+# Mamba: YES (10 columns) — IV regime, skew, expected move, positioning.
+# Portfolio: YES (all 12) — risk mgmt + gating + monitoring.
+# Key correction: IV anchoring/skew columns are REGIME (not RISK).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OPTIONS_ANCHORING_PREFIX = "options_anchoring_"
+
+# Governance / data quality — HYGIENE (freshness gating, NOT alpha)
+_OPTIONS_ANCHORING_HYGIENE_SUFFIXES = frozenset({
+    "days_since_update",          # Freshness gating
+    "confidence",                 # Data quality (can also serve as mask)
+})
+
+# REGIME: IV anchoring (z-scores, percentiles describe IV environment)
+# CORRECTED: these are regime descriptors, not "risk" in portfolio-only sense
+_OPTIONS_ANCHORING_IV_REGIME_SUFFIXES = frozenset({
+    "iv_anchor_pct",              # Z-score of ATM IV (high/low IV environment)
+    "iv_percentile_30d",          # Percentile rank → regime context
+    "iv_percentile_1yr",          # Slow regime context
+})
+
+# REGIME: Skew anchoring (sentiment/fear regime variables)
+_OPTIONS_ANCHORING_SKEW_REGIME_SUFFIXES = frozenset({
+    "iv_skew_anchor",             # Skew = sentiment/fear regime
+    "iv_skew_zscore",             # Normalized skew state
+    "risk_reversal_25d",          # Institutional skew proxy → regime
+})
+
+# REGIME: Positioning (flow and structural positioning)
+_OPTIONS_ANCHORING_POSITIONING_REGIME_SUFFIXES = frozenset({
+    "put_call_vol_ratio_anchor",  # Flow regime (short memory)
+    "put_call_oi_ratio_anchor",   # Structural positioning regime (slow memory)
+    "em_vs_real_vol_ratio",       # Forward vs backward vol regime
+})
+
+# PREDICTIVE: Expected move (forward-looking uncertainty for Mamba)
+_OPTIONS_ANCHORING_PREDICTIVE_SUFFIXES = frozenset({
+    "expected_move_pct",          # Straddle-implied move → Mamba conditioning
+})
+
+
+def _options_anchoring_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """OPTIONS_ANCHORING: Institutional options anchoring with decay weighting.
+    
+    Mamba sees all except HYGIENE (10 columns):
+      - IV anchoring (regime descriptors)
+      - Skew anchoring (sentiment regime)
+      - Expected move (forward uncertainty)
+      - Positioning (flow + structural regime)
+    
+    Portfolio sees all 12 (risk mgmt + gating + monitoring).
+    
+    Key correction: iv_anchor_pct, iv_percentile_*, iv_skew_*, risk_reversal_25d
+    are REGIME (not RISK) — they describe IV environment, not portfolio risk scaling.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_OPTIONS_ANCHORING_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_OPTIONS_ANCHORING_PREFIX):]
+    
+    # HYGIENE: governance/freshness (NOT alpha, NOT Mamba input)
+    if suffix in _OPTIONS_ANCHORING_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "OPTIONS_ANCHORING:governance"
+    
+    # REGIME: IV anchoring (regime descriptors) → BOTH (Mamba + Portfolio)
+    if suffix in _OPTIONS_ANCHORING_IV_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "OPTIONS_ANCHORING:iv_regime"
+    
+    # REGIME: Skew anchoring (sentiment regime) → BOTH
+    if suffix in _OPTIONS_ANCHORING_SKEW_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "OPTIONS_ANCHORING:skew_regime"
+    
+    # REGIME: Positioning (flow + structural) → BOTH
+    if suffix in _OPTIONS_ANCHORING_POSITIONING_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "OPTIONS_ANCHORING:positioning_regime"
+    
+    # PREDICTIVE: Expected move → BOTH (Mamba can learn conditional drift)
+    if suffix in _OPTIONS_ANCHORING_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "OPTIONS_ANCHORING:expected_move"
+    
+    # Default to REGIME (conservative - regime conditioning)
+    return FeatureRole.REGIME, "OPTIONS_ANCHORING:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIME FAMILY — Institutional-grade regime classification
+# ─────────────────────────────────────────────────────────────────────────────
+# Model conditioning + portfolio gating. Most columns go to BOTH.
+# Mamba: YES (8-9 columns) — probabilities, duration, trend metrics.
+# Portfolio: YES (all 9) — gating, risk scaling, regime awareness.
+# Recommendation: exclude regime_label from Mamba (prefer probabilities).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REGIME_PREFIX = "regime_"
+
+# REGIME: Probabilities (continuous, best for Mamba)
+_REGIME_PROBABILITY_SUFFIXES = frozenset({
+    "bull_probability",           # Bull regime probability (0-1)
+    "bear_probability",           # Bear regime probability (0-1)
+    "neutral_probability",        # Neutral regime probability (0-1)
+})
+
+# REGIME: Label and temporal context
+_REGIME_CONTEXT_SUFFIXES = frozenset({
+    "label",                      # Discrete label (0/1/2) — portfolio-first
+    "duration",                   # Days in current regime
+    "change_flag",                # Transition risk indicator
+})
+
+# PREDICTIVE: Trend metrics (continuous trend strength, extreme detector)
+_REGIME_PREDICTIVE_SUFFIXES = frozenset({
+    "trend_ratio",                # Fast/slow MA ratio → Mamba conditioning
+    "trend_ratio_zscore",         # Extreme detector → Mamba conditioning
+})
+
+# RISK: Volatility for sizing control
+_REGIME_RISK_SUFFIXES = frozenset({
+    "volatility_20d",             # Sizing control + Mamba conditioning
+})
+
+
+def _regime_family_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """REGIME: Institutional-grade regime classification.
+    
+    Mamba sees (8 columns, recommend exclude label):
+      - bull_probability, bear_probability, neutral_probability
+      - duration, change_flag
+      - trend_ratio, trend_ratio_zscore
+      - volatility_20d
+    
+    Portfolio sees all 9 (gating + risk scaling + regime awareness).
+    
+    Note: regime_label introduces discontinuities; prefer probabilities for Mamba.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_REGIME_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_REGIME_PREFIX):]
+    
+    # REGIME: Probabilities → BOTH (best Mamba input, continuous)
+    if suffix in _REGIME_PROBABILITY_SUFFIXES:
+        return FeatureRole.REGIME, "REGIME:probability"
+    
+    # REGIME: Label + temporal context → BOTH (label optional for Mamba)
+    if suffix in _REGIME_CONTEXT_SUFFIXES:
+        return FeatureRole.REGIME, "REGIME:context"
+    
+    # PREDICTIVE: Trend metrics → BOTH
+    if suffix in _REGIME_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "REGIME:trend_metric"
+    
+    # RISK: Volatility → BOTH (sizing + conditioning)
+    if suffix in _REGIME_RISK_SUFFIXES:
+        return FeatureRole.RISK, "REGIME:volatility"
+    
+    # Default to REGIME (family intent)
+    return FeatureRole.REGIME, "REGIME:default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHORT_INTEREST FAMILY — Short interest tracking with squeeze analysis
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: YES (6 columns) — change/momentum/squeeze forecasting only.
+# Portfolio: YES (all) — risk constraints, regime gating.
+# Key principle: Bi-monthly data is forward-filled; avoid letting Mamba learn
+# data-availability patterns. Core metrics are RISK, not PREDICTIVE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHORT_INTEREST_PREFIX = "short_interest_"
+
+# HYGIENE: Governance + quality scoring (never Mamba)
+# Note: conf is alias of confidence, score_raw/score are diagnostic
+_SHORT_INTEREST_HYGIENE_SUFFIXES = frozenset({
+    "has_data",                   # Data availability flag
+    "confidence",                 # Data quality score
+    "conf",                       # Alias of confidence (WARN: consider dropping)
+    "score_raw",                  # Raw composite score (diagnostic)
+    "score",                      # Normalized composite score (diagnostic)
+})
+
+# RISK: Core short metrics for portfolio constraints (not Mamba)
+# These are positioning/risk pressure descriptors, not alpha
+_SHORT_INTEREST_RISK_SUFFIXES = frozenset({
+    "percent",                    # Short % of shares outstanding
+    "ratio",                      # Days to cover (short interest / ADV)
+    "days_to_cover",              # Alias of ratio (WARN: consider dropping)
+    "float_short_pct",            # Short % of float (primary metric)
+    "shares_on_loan_pct",         # Utilization (borrow demand)
+    "borrow_rate",                # Annual borrow rate (cost to short)
+})
+
+# PREDICTIVE: Change/momentum/squeeze forecasting → Mamba
+# These describe how positioning is evolving (directional descriptors)
+_SHORT_INTEREST_PREDICTIVE_SUFFIXES = frozenset({
+    "change_1m",                  # MoM % change in short interest
+    "change_3m",                  # 3-month % change
+    "momentum",                   # Rolling trend in short interest
+    "squeeze_risk_flag",          # Binary: squeeze conditions met
+    "squeeze_risk_score",         # Composite squeeze risk (0-100)
+    "squeeze_probability",        # Probability of squeeze event (0-1)
+})
+
+# REGIME: Statistical context for gating (not Mamba)
+# Crowdedness regime descriptors; avoid learning forward-fill patterns
+_SHORT_INTEREST_REGIME_SUFFIXES = frozenset({
+    "zscore_1y",                  # Z-score vs 1-year history
+    "pct_zscore_3y",              # Z-score of float_short_pct vs 3-year
+    "short_to_oi_ratio",          # Short vs options OI
+    "short_vs_institutional",     # Short vs institutional ownership
+    "borrow_rate_zscore_3y",      # Z-score of borrow rate vs 3-year
+})
+
+
+def _short_interest_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """SHORT_INTEREST: Short interest tracking with squeeze analysis.
+    
+    Mamba sees (6 columns):
+      - change_1m, change_3m, momentum (positioning evolution)
+      - squeeze_risk_flag, squeeze_risk_score, squeeze_probability
+    
+    Portfolio sees all (risk constraints + regime gating):
+      - Core metrics for sizing constraints (high borrow = reduce size)
+      - Regime z-scores for crowdedness gating
+    
+    Key concern: Bi-monthly data is forward-filled. Avoid letting Mamba
+    learn data-availability patterns from statistical context columns.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_SHORT_INTEREST_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_SHORT_INTEREST_PREFIX):]
+    
+    # HYGIENE: Governance + quality (never Mamba)
+    if suffix in _SHORT_INTEREST_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "SHORT_INTEREST:governance"
+    
+    # RISK: Core short metrics (Portfolio constraints, not Mamba)
+    if suffix in _SHORT_INTEREST_RISK_SUFFIXES:
+        return FeatureRole.RISK, "SHORT_INTEREST:risk_constraint"
+    
+    # PREDICTIVE: Change/momentum/squeeze → Mamba
+    if suffix in _SHORT_INTEREST_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "SHORT_INTEREST:squeeze_forecast"
+    
+    # REGIME: Statistical context for gating (not Mamba)
+    if suffix in _SHORT_INTEREST_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "SHORT_INTEREST:crowdedness_regime"
+    
+    # Default to RISK (conservative - not Mamba input)
+    return FeatureRole.RISK, "SHORT_INTEREST:risk_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSIDIARY FAMILY — Organizational complexity from quarterly OpEx/R&D
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: NO (recommend REGIME for all, slow-moving structural descriptors).
+# Portfolio: YES (all) — complexity regime, operational scale context.
+# Key principle: Quarterly data is publication-lagged and slow-moving.
+# Growth/intensity features are REGIME-like, not short-horizon alpha.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUBSIDIARY_PREFIX = "subsidiary_"
+
+# HYGIENE: Governance (never Mamba)
+_SUBSIDIARY_HYGIENE_SUFFIXES = frozenset({
+    "has_data",                   # Data availability flag
+    "activity",                   # Activity indicator
+    "days_since_update",          # Freshness (quarterly, often high)
+    "confidence",                 # Data quality score
+})
+
+# REGIME: Core scale + structure (slow-moving, sector/size encoders)
+_SUBSIDIARY_STRUCTURE_REGIME_SUFFIXES = frozenset({
+    "rd_spending",                # R&D spending (absolute USD)
+    "opex_spending",              # Total operating expenses
+    "complexity_score",           # Log(1 + OpEx) - scale-invariant proxy
+})
+
+# REGIME: Growth/intensity (treated as REGIME, not PREDICTIVE)
+# Quarterly financials are publication-lagged and slow-moving
+# Better as context than daily alpha inputs
+_SUBSIDIARY_GROWTH_REGIME_SUFFIXES = frozenset({
+    "rd_intensity",               # R&D as % of OpEx (innovation focus)
+    "rd_qoq_growth",              # QoQ % change in R&D
+    "opex_qoq_growth",            # QoQ % change in OpEx
+    "rd_yoy_growth",              # YoY % change in R&D
+    "opex_yoy_growth",            # YoY % change in OpEx
+})
+
+
+def _subsidiary_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """SUBSIDIARY: Organizational complexity from quarterly OpEx/R&D.
+    
+    Mamba sees: NOTHING (all columns are slow-moving structural descriptors)
+    
+    Portfolio sees all (complexity regime + operational scale context):
+      - Core metrics for normalization (don't compare across complexity)
+      - Growth rates for regime detection
+    
+    Key concern: Quarterly financials are publication-lagged (30-45 days).
+    Even when lag-safe, they move slowly — better as context than alpha.
+    
+    Exception: If you have a long-horizon head (30-252d targets), move
+    growth/intensity features to PREDICTIVE for that head only.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_SUBSIDIARY_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_SUBSIDIARY_PREFIX):]
+    
+    # HYGIENE: Governance (never Mamba)
+    if suffix in _SUBSIDIARY_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "SUBSIDIARY:governance"
+    
+    # REGIME: Core scale + structure (slow-moving, not Mamba)
+    if suffix in _SUBSIDIARY_STRUCTURE_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "SUBSIDIARY:operational_scale"
+    
+    # REGIME: Growth/intensity (quarterly, slow-moving, not Mamba)
+    if suffix in _SUBSIDIARY_GROWTH_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "SUBSIDIARY:growth_regime"
+    
+    # Default to REGIME (family intent - slow-moving structural)
+    return FeatureRole.REGIME, "SUBSIDIARY:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TFT_FEATURES FAMILY — Multi-scale temporal patterns for forecasting
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: YES (4 columns) — trend strength/signal-to-noise only.
+# Portfolio: YES (13 columns) — volatility, seasonality, stability, confidence.
+# Key principle: Volatility/stability/seasonality are regime/risk descriptors,
+# not short-horizon alpha. Only trend metrics go to Mamba.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TFT_FEATURES_PREFIX = "tft_features_"
+
+# PREDICTIVE: Trend metrics → Mamba
+_TFT_FEATURES_PREDICTIVE_SUFFIXES = frozenset({
+    "trend_short_strength",       # 5-10d momentum bursts
+    "trend_long_strength",        # 20-30d structural alignment
+    "trend_signal_to_noise",      # |trend| / volatility
+    "trend_importance",           # Blended trend importance
+})
+
+# REGIME: Trend consistency, seasonality, stability (NOT Mamba)
+# These describe market state, not predictive signals
+_TFT_FEATURES_REGIME_SUFFIXES = frozenset({
+    "trend_consistency",          # Fraction positive days in 20d (regime)
+    "vol_regime_zscore",          # High/low vol regime detector
+    "weekday_effect",             # Rolling weekday return pattern
+    "month_phase",                # Day-of-month normalized
+    "seasonality_importance",     # Seasonal pattern strength
+    "stability_short",            # 5-10d stability
+    "stability_long",             # 20-30d stability
+    "stability_score",            # Alias of stability_long
+})
+
+# RISK: Volatility metrics for sizing (NOT Mamba)
+_TFT_FEATURES_RISK_SUFFIXES = frozenset({
+    "vol_short",                  # 5-10d realized vol
+    "vol_long",                   # 20-30d baseline vol
+    "vol_trend",                  # Is vol rising or calming?
+    "volatility_importance",      # Alias of vol_long
+})
+
+# HYGIENE: Confidence score
+_TFT_FEATURES_HYGIENE_SUFFIXES = frozenset({
+    "confidence",                 # Dynamic confidence score
+})
+
+
+def _tft_features_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """TFT_FEATURES: Multi-scale temporal patterns for forecasting.
+    
+    Mamba sees (4 columns):
+      - trend_short_strength, trend_long_strength
+      - trend_signal_to_noise, trend_importance
+    
+    Portfolio sees all (vol + seasonality + stability + confidence):
+      - Volatility metrics for sizing
+      - Seasonality/stability for regime awareness
+    
+    Key risk: Names like trend_consistency, weekday_effect, stability_*
+    lack "risk/regime" tokens and may default to PREDICTIVE incorrectly.
+    This override ensures correct routing.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_TFT_FEATURES_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_TFT_FEATURES_PREFIX):]
+    
+    # HYGIENE: Confidence (never Mamba)
+    if suffix in _TFT_FEATURES_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "TFT_FEATURES:confidence"
+    
+    # PREDICTIVE: Trend metrics → Mamba
+    if suffix in _TFT_FEATURES_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "TFT_FEATURES:trend"
+    
+    # REGIME: Consistency, seasonality, stability (not Mamba)
+    if suffix in _TFT_FEATURES_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "TFT_FEATURES:regime_context"
+    
+    # RISK: Volatility (not Mamba)
+    if suffix in _TFT_FEATURES_RISK_SUFFIXES:
+        return FeatureRole.RISK, "TFT_FEATURES:volatility"
+    
+    # Default to REGIME (conservative - not Mamba input)
+    return FeatureRole.REGIME, "TFT_FEATURES:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PEER_SCREENER_CONTEXT FAMILY — Cross-sectional peer/sector/industry context
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: YES (10 columns) — cheap_pct, universe z-scores/percentiles.
+# Portfolio: YES (14 columns) — percentile ranks, peer counts, options/short z.
+# Key risk: *_pct columns often default to PREDICTIVE; *_peer_count to PREDICTIVE.
+# This override ensures correct routing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PEER_SCREENER_CONTEXT_PREFIX = "peer_screener_context_"
+
+# HYGIENE: Governance + peer counts (data quality, not alpha)
+_PEER_SCREENER_CONTEXT_HYGIENE_SUFFIXES = frozenset({
+    "has_data",                   # Data availability flag
+    "sector_peer_count",          # Number of sector peers (data quality)
+    "industry_peer_count",        # Number of industry peers (data quality)
+})
+
+# PREDICTIVE: Cheap percentiles + universe momentum/valuation → Mamba
+# These are cross-sectional relative value signals
+_PEER_SCREENER_CONTEXT_PREDICTIVE_SUFFIXES = frozenset({
+    # Sector cheap percentiles
+    "sector_pe_ratio_cheap_pct",
+    "sector_pb_ratio_cheap_pct",
+    "sector_ev_ebitda_cheap_pct",
+    # Industry cheap percentiles
+    "industry_pe_ratio_cheap_pct",
+    "industry_pb_ratio_cheap_pct",
+    "industry_ev_ebitda_cheap_pct",
+    # Universe momentum/valuation (z-scores and percentiles)
+    "universe_momentum_z",
+    "universe_valuation_z",
+    "universe_momentum_pct",
+    "universe_valuation_pct",
+})
+
+# REGIME: Percentile ranks within sector/industry (context, not alpha)
+_PEER_SCREENER_CONTEXT_REGIME_SUFFIXES = frozenset({
+    "sector_pe_ratio_pct",        # Sector PE percentile
+    "sector_pb_ratio_pct",        # Sector PB percentile
+    "sector_ev_ebitda_pct",       # Sector EV/EBITDA percentile
+    "industry_pe_ratio_pct",      # Industry PE percentile
+    "industry_pb_ratio_pct",      # Industry PB percentile
+    "industry_ev_ebitda_pct",     # Industry EV/EBITDA percentile
+})
+
+# RISK: Universe options/short interest z-scores (portfolio constraints)
+_PEER_SCREENER_CONTEXT_RISK_SUFFIXES = frozenset({
+    "universe_options_iv_z",      # Universe IV z-score
+    "universe_options_skew_z",    # Universe skew z-score
+    "universe_short_interest_z",  # Universe short interest z-score
+    "universe_options_iv_pct",    # Universe IV percentile
+    "universe_options_skew_pct",  # Universe skew percentile
+})
+
+
+def _peer_screener_context_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """PEER_SCREENER_CONTEXT: Cross-sectional peer/sector/industry context.
+    
+    Mamba sees (10 columns):
+      - sector/industry *_cheap_pct (relative value signals)
+      - universe_momentum_z, universe_valuation_z
+      - universe_momentum_pct, universe_valuation_pct
+    
+    Portfolio sees (14 columns):
+      - *_pct percentile ranks (context, not alpha)
+      - peer_count (data quality)
+      - options/short interest z-scores (risk constraints)
+    
+    Key risk: *_pct columns often default to PREDICTIVE incorrectly.
+    *_peer_count often defaults to PREDICTIVE. This override fixes that.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_PEER_SCREENER_CONTEXT_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_PEER_SCREENER_CONTEXT_PREFIX):]
+    
+    # HYGIENE: Governance + peer counts (data quality)
+    if suffix in _PEER_SCREENER_CONTEXT_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "PEER_SCREENER_CONTEXT:governance"
+    
+    # PREDICTIVE: Cheap percentiles + universe momentum/valuation → Mamba
+    if suffix in _PEER_SCREENER_CONTEXT_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "PEER_SCREENER_CONTEXT:relative_value"
+    
+    # REGIME: Percentile ranks (context, not alpha)
+    if suffix in _PEER_SCREENER_CONTEXT_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "PEER_SCREENER_CONTEXT:peer_context"
+    
+    # RISK: Options/short interest z-scores (portfolio constraints)
+    if suffix in _PEER_SCREENER_CONTEXT_RISK_SUFFIXES:
+        return FeatureRole.RISK, "PEER_SCREENER_CONTEXT:risk_constraint"
+    
+    # Default to REGIME (conservative - not Mamba input)
+    return FeatureRole.REGIME, "PEER_SCREENER_CONTEXT:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYMBOL_GRAPH_CONTEXT FAMILY — Cross-symbol graph embeddings + neighbor stats
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: YES (all columns) — embeddings, neighbor aggregates, centrality
+# Portfolio: NO — these are pure alpha signals, not risk/regime context
+# Key insight: Graph structure encodes cross-symbol relationships for relational
+#              learning without changing dataset shape.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SYMBOL_GRAPH_CONTEXT_PREFIX = "sgc_"
+
+# PREDICTIVE: All sgc_* columns are designed for Mamba alpha input
+# - sgc_emb_* : SVD embeddings from adjacency (captures graph structure)
+# - sgc_neighbor_* : Weighted neighbor aggregates (momentum, vol, drawdown, lags)
+# - sgc_degree, sgc_strength_topk, sgc_pagerank : Centrality metrics
+_SYMBOL_GRAPH_CONTEXT_PREDICTIVE_SUFFIXES = frozenset({
+    # Embeddings (8 dims by default)
+    "emb_0", "emb_1", "emb_2", "emb_3", "emb_4", "emb_5", "emb_6", "emb_7",
+    # Centrality
+    "degree",
+    "strength_topk",
+    "pagerank",
+    # Neighbor aggregates (current + lagged)
+    "neighbor_momentum",
+    "neighbor_vol",
+    "neighbor_drawdown",
+    "neighbor_momentum_lag1",
+    "neighbor_momentum_lag5",
+})
+
+
+def _symbol_graph_context_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """SYMBOL_GRAPH_CONTEXT: Cross-symbol graph embeddings + neighbor stats.
+    
+    Mamba sees (ALL columns):
+      - sgc_emb_0..7 : Graph embeddings (weekly refresh)
+      - sgc_degree, sgc_strength_topk, sgc_pagerank : Centrality
+      - sgc_neighbor_* : Neighbor-aggregated momentum/vol/drawdown
+    
+    Portfolio sees: NOTHING (pure alpha signals)
+    
+    All columns are PREDICTIVE by design. This family encodes cross-symbol
+    relationships via learned adjacency (correlation + sector) without
+    changing dataset shape.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_SYMBOL_GRAPH_CONTEXT_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_SYMBOL_GRAPH_CONTEXT_PREFIX):]
+    
+    # All sgc_* columns are PREDICTIVE (Mamba input)
+    # Check against known suffixes for explicit match
+    if suffix in _SYMBOL_GRAPH_CONTEXT_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "SYMBOL_GRAPH_CONTEXT:graph_feature"
+    
+    # Handle dynamic embedding dims (sgc_emb_8, sgc_emb_9, etc.)
+    if suffix.startswith("emb_"):
+        return FeatureRole.PREDICTIVE, "SYMBOL_GRAPH_CONTEXT:embedding"
+    
+    # Handle any neighbor aggregates with different windows
+    if suffix.startswith("neighbor_"):
+        return FeatureRole.PREDICTIVE, "SYMBOL_GRAPH_CONTEXT:neighbor_aggregate"
+    
+    # Default: still PREDICTIVE (all graph features go to Mamba)
+    return FeatureRole.PREDICTIVE, "SYMBOL_GRAPH_CONTEXT:graph_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOC_EMBEDDING_NOVELTY_HF FAMILY — GDELT global event novelty detection
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: YES (1 column ONLY) — `score` (PREDICTIVE) reaches Mamba under current rules.
+# Portfolio: YES (14 columns) — all REGIME/RISK/HYGIENE columns.
+# Key issue: Cluster novelty metrics are REGIME → Portfolio-only by default.
+# If you want Mamba to see cluster novelty, add prefix to forced-mamba list.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DOC_EMBEDDING_NOVELTY_HF_PREFIX = "doc_embedding_novelty_hf_"
+
+# HYGIENE: Governance + metadata (not features, consider moving to attrs)
+_DOC_EMBEDDING_NOVELTY_HF_HYGIENE_SUFFIXES = frozenset({
+    "has_data",                   # Data availability
+    "n_events",                   # Event count (data quality)
+    "n_articles",                 # Article count (data quality)
+    "top_theme",                  # String - will be coerced to 0.0 downstream
+    "theme_weight",               # Metadata weight
+    "baseline_mean",              # Not scalar - move to attrs instead
+})
+
+# PREDICTIVE: Overall novelty score → Mamba (only column that reaches Mamba)
+_DOC_EMBEDDING_NOVELTY_HF_PREDICTIVE_SUFFIXES = frozenset({
+    "score",                      # Overall novelty (0-1) - ONLY Mamba column
+})
+
+# RISK: Confidence score (portfolio constraint)
+_DOC_EMBEDDING_NOVELTY_HF_RISK_SUFFIXES = frozenset({
+    "conf",                       # Confidence based on event count/coherence
+})
+
+# REGIME: Cluster-specific novelty + spike detection (Portfolio-only by default)
+_DOC_EMBEDDING_NOVELTY_HF_REGIME_SUFFIXES = frozenset({
+    "novelty_macro",              # Macro/economic cluster
+    "novelty_geopolitical",       # Geopolitical cluster
+    "novelty_regulatory",         # Regulatory/policy cluster
+    "novelty_energy",             # Energy/commodities cluster
+    "novelty_conflict",           # Conflict/crisis cluster
+    "novelty_tech",               # Technology/innovation cluster
+    "novelty_spike_flag",         # >2σ novelty spike
+    "novelty_persistence_5d",     # Sustained high novelty
+})
+
+
+def _doc_embedding_novelty_hf_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """DOC_EMBEDDING_NOVELTY_HF: GDELT global event novelty detection.
+    
+    Mamba sees (1 column ONLY by default):
+      - `score` (overall novelty) — the only PREDICTIVE column
+    
+    Portfolio sees (14 columns):
+      - Cluster novelty metrics (REGIME)
+      - Confidence (RISK)
+      - Metadata/governance (HYGIENE)
+    
+    Key issue: If you want Mamba to see cluster novelty, either:
+      - Add doc_embedding_novelty_hf_ to forced-mamba prefix list, OR
+      - Re-role cluster columns as PREDICTIVE (not recommended)
+    
+    WARNING: top_theme is string, baseline_mean may not be scalar.
+    Consider moving these to attrs instead of feature columns.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_DOC_EMBEDDING_NOVELTY_HF_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_DOC_EMBEDDING_NOVELTY_HF_PREFIX):]
+    
+    # HYGIENE: Governance + metadata
+    if suffix in _DOC_EMBEDDING_NOVELTY_HF_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "DOC_EMBEDDING_NOVELTY_HF:governance"
+    
+    # PREDICTIVE: Overall novelty → Mamba
+    if suffix in _DOC_EMBEDDING_NOVELTY_HF_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "DOC_EMBEDDING_NOVELTY_HF:novelty_score"
+    
+    # RISK: Confidence (portfolio constraint)
+    if suffix in _DOC_EMBEDDING_NOVELTY_HF_RISK_SUFFIXES:
+        return FeatureRole.RISK, "DOC_EMBEDDING_NOVELTY_HF:confidence"
+    
+    # REGIME: Cluster novelty + spike detection (Portfolio-only by default)
+    if suffix in _DOC_EMBEDDING_NOVELTY_HF_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "DOC_EMBEDDING_NOVELTY_HF:cluster_novelty"
+    
+    # Default to REGIME (conservative - not Mamba input)
+    return FeatureRole.REGIME, "DOC_EMBEDDING_NOVELTY_HF:regime_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EARNINGS_TRANSCRIPT_HF FAMILY — Earnings call sentiment analysis
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: YES (ALL columns) — This family IS in forced-mamba prefix list.
+# Portfolio: NO — Portfolio does not see these signals by default!
+# Key issue: If portfolio needs transcript uncertainty/risk/confidence,
+# you must mirror columns to portfolio parquet or change prefix override.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EARNINGS_TRANSCRIPT_HF_PREFIX = "earnings_transcript_hf_"
+
+# HYGIENE: Governance (but still goes to Mamba due to prefix forcing)
+_EARNINGS_TRANSCRIPT_HF_HYGIENE_SUFFIXES = frozenset({
+    "has_data",                   # Data availability
+})
+
+# PREDICTIVE: Sentiment + deltas + interactions → Mamba (forced by prefix)
+_EARNINGS_TRANSCRIPT_HF_PREDICTIVE_SUFFIXES = frozenset({
+    "score",                      # Overall sentiment (-1 to 1)
+    "score_delta_qoq",            # QoQ sentiment change (HIGH ALPHA)
+    "score_delta_yoy",            # YoY sentiment change
+    "sentiment_divergence",       # Prepared - QA (management defensiveness)
+    "sentiment_shock",            # Delta × confidence
+})
+
+# RISK: Confidence + tone dimensions (forced to Mamba by prefix)
+_EARNINGS_TRANSCRIPT_HF_RISK_SUFFIXES = frozenset({
+    "conf",                       # Intensity × volume × dispersion
+    "uncertainty_score",          # Information asymmetry (vol amplifier)
+    "risk_score",                 # Explicit downside language
+})
+
+# REGIME: Sectional sentiment (forced to Mamba by prefix)
+_EARNINGS_TRANSCRIPT_HF_REGIME_SUFFIXES = frozenset({
+    "score_prepared",             # Prepared remarks (often upward biased)
+    "score_qa",                   # Q&A section (reveals stress)
+})
+
+
+def _earnings_transcript_hf_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """EARNINGS_TRANSCRIPT_HF: Earnings call sentiment analysis.
+    
+    Mamba sees ALL columns (forced by prefix rule):
+      - score, score_delta_qoq, score_delta_yoy (PREDICTIVE)
+      - sentiment_divergence, sentiment_shock (PREDICTIVE)
+      - conf, uncertainty_score, risk_score (RISK but forced to Mamba)
+      - score_prepared, score_qa (REGIME but forced to Mamba)
+      - has_data (HYGIENE but forced to Mamba)
+    
+    Portfolio sees NOTHING by default!
+    
+    Key issue: If portfolio needs transcript uncertainty/risk/confidence:
+      - Mirror selected columns into portfolio parquet, OR
+      - Have portfolio read from mamba parquet too, OR
+      - Change prefix override to split by role instead of forcing all to Mamba
+    
+    Role assignments here are for semantic correctness; routing is by prefix.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_EARNINGS_TRANSCRIPT_HF_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_EARNINGS_TRANSCRIPT_HF_PREFIX):]
+    
+    # HYGIENE: Governance (still forced to Mamba by prefix)
+    if suffix in _EARNINGS_TRANSCRIPT_HF_HYGIENE_SUFFIXES:
+        return FeatureRole.HYGIENE, "EARNINGS_TRANSCRIPT_HF:governance"
+    
+    # PREDICTIVE: Sentiment + deltas + interactions
+    if suffix in _EARNINGS_TRANSCRIPT_HF_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "EARNINGS_TRANSCRIPT_HF:sentiment"
+    
+    # RISK: Confidence + tone dimensions
+    if suffix in _EARNINGS_TRANSCRIPT_HF_RISK_SUFFIXES:
+        return FeatureRole.RISK, "EARNINGS_TRANSCRIPT_HF:risk_tone"
+    
+    # REGIME: Sectional sentiment
+    if suffix in _EARNINGS_TRANSCRIPT_HF_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "EARNINGS_TRANSCRIPT_HF:sectional"
+    
+    # Handle event-prefixed columns (forced to Mamba by prefix)
+    if suffix.startswith("event_"):
+        return FeatureRole.REGIME, "EARNINGS_TRANSCRIPT_HF:event_metadata"
+    
+    # Default to PREDICTIVE (family intent - sentiment signals)
+    return FeatureRole.PREDICTIVE, "EARNINGS_TRANSCRIPT_HF:predictive_default"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MACRO_TST_HF FAMILY — Macro TST daily (no governance columns)
+# ─────────────────────────────────────────────────────────────────────────────
+# Mamba: Only 3 PREDICTIVE interaction terms (symbol-specific exposures)
+# Portfolio: Everything else (REGIME + RISK)
+# Key issue: Almost everything is REGIME/RISK → Portfolio. Only the
+# symbol-specific interaction columns are PREDICTIVE → Mamba.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MACRO_TST_HF_PREFIX = "macro_tst_hf_"
+
+# REGIME: Core macro levels + changes + economic momentum
+_MACRO_TST_HF_REGIME_SUFFIXES = frozenset({
+    # Layer 1: Core regime (levels + changes)
+    "tnx_level",
+    "irx_level",
+    "2y_level",
+    "tnx_change_1d",
+    "tnx_change_5d",
+    "curve_slope",
+    "curve_slope_change",
+    "vix_spike_flag",
+    "oil_change",
+    "gold_change",
+    # Layer 2: Economic momentum (derived)
+    "derived_inflation_accel",
+    "derived_gdp_growth_accel",
+    "derived_unemployment_change",
+    "derived_real_rate_change",
+    "derived_debt_to_gdp_change",
+    "derived_trade_balance_change",
+    # Layer 3: Rate shock columns
+    "rates_2y_change_1d",
+    "rates_2y_change_5d",
+})
+
+# RISK: VIX + credit spreads
+_MACRO_TST_HF_RISK_SUFFIXES = frozenset({
+    # Layer 1: VIX metrics
+    "vix_level",
+    "vix_return_1d",
+    "vix_return_5d",
+    # Layer 1: Credit spreads
+    "credit_spread_level",
+    "credit_spread_change",
+    "credit_spread_z",
+    # Layer 4: VIX beta (risk overlay)
+    "vix_beta_sensitivity",
+})
+
+# PREDICTIVE: Symbol-specific interactions ONLY (Mamba input)
+_MACRO_TST_HF_PREDICTIVE_SUFFIXES = frozenset({
+    # Layer 4: Symbol-specific macro interactions
+    "real_rate_growth_beta",      # Sensitivity to real rate changes
+    "oil_energy_exposure",        # Energy sector exposure
+    "curve_bank_exposure",        # Banks/financials curve exposure
+})
+
+
+def _macro_tst_hf_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """MACRO_TST_HF: Macro TST daily (no governance columns).
+    
+    CRITICAL ROUTING (almost everything → Portfolio):
+    
+    Mamba sees (3 columns ONLY):
+      - real_rate_growth_beta: Symbol-specific real rate sensitivity
+      - oil_energy_exposure: Symbol-specific energy exposure
+      - curve_bank_exposure: Symbol-specific curve exposure
+    
+    Portfolio sees (ALL other columns):
+      - REGIME: Levels, changes, economic momentum, shocks
+      - RISK: VIX, credit spreads, vix_beta_sensitivity
+    
+    Key issue: No governance columns in this family. Routing is purely by role.
+    """
+    name_lower = str(column or "").lower()
+    
+    if not name_lower.startswith(_MACRO_TST_HF_PREFIX):
+        return None
+    
+    suffix = name_lower[len(_MACRO_TST_HF_PREFIX):]
+    
+    # PREDICTIVE: Symbol-specific interactions → Mamba
+    if suffix in _MACRO_TST_HF_PREDICTIVE_SUFFIXES:
+        return FeatureRole.PREDICTIVE, "MACRO_TST_HF:symbol_interaction"
+    
+    # RISK: VIX + credit spreads → Portfolio
+    if suffix in _MACRO_TST_HF_RISK_SUFFIXES:
+        return FeatureRole.RISK, "MACRO_TST_HF:risk_overlay"
+    
+    # REGIME: Levels + changes + economic momentum → Portfolio
+    if suffix in _MACRO_TST_HF_REGIME_SUFFIXES:
+        return FeatureRole.REGIME, "MACRO_TST_HF:macro_regime"
+    
+    # Default to REGIME (conservative - not Mamba input)
+    return FeatureRole.REGIME, "MACRO_TST_HF:regime_default"
+
+
 def _candle_mechanics_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
+    """Route candle_mechanics columns per repo truth (Jan 2026 policy).
+    
+    A) Default Mamba (PREDICTIVE) - 21 alpha-suitable columns
+    B) Optional Mamba - 5 columns controlled by CANDLE_MECHANICS_MAMBA_OPTIONAL env var
+       If not enabled, these go to Portfolio.
+    C) Portfolio only - governance, risk/vol, calendar encodings
+    
+    The optional toggle is handled at the parquet split layer (prep_families.py),
+    not here. This function returns the "ideal" role; the split layer may override.
+    """
     name = str(column or "")
     if not name.lower().startswith(_CANDLE_PREFIX):
         return None
     suffix = name[len(_CANDLE_PREFIX):].lower()
 
-    # Governance
+    # === C) PORTFOLIO ONLY ===
+    
+    # Governance / hygiene
     if suffix in {"has_data", "activity", "days_since_update", "confidence"}:
         return FeatureRole.HYGIENE, "CM:governance"
-
-    # Policy / risk / regime
+    
+    # Risk/vol + supporting stats (Portfolio for position sizing)
     if suffix in {
-        "range_atr14",
-        "atr_ratio_14_60",
+        "range_pct",
+        "atr14",
+        "atr60",
+        "body_atr14",
+        "gap_atr14",
+        "close_vs_prev_close_atr14",
+        "high_vs_prev_close_atr14",
+        "low_vs_prev_close_atr14",
+        "ret_1d",
+        "ret_3d",
         "rv_5",
         "rv_20",
-        "dir_change",
+        "dist_to_high_20_atr14",
+        "dist_to_low_20_atr14",
+        "dist_to_mean_20_atr14",
+    }:
+        return FeatureRole.RISK, "CM:risk"
+    
+    # Calendar encodings (one-hot style → REGIME for policy)
+    if suffix in {
+        "dow_1", "dow_2", "dow_3", "dow_4", "dow_5",
+        "moy_1", "moy_2", "moy_3", "moy_4", "moy_5", "moy_6",
+        "moy_7", "moy_8", "moy_9", "moy_10", "moy_11", "moy_12",
+    }:
+        return FeatureRole.REGIME, "CM:calendar"
+    
+    # === B) OPTIONAL MAMBA (default to REGIME so split layer can promote) ===
+    # These are REGIME here; prep_families.py promotes to Mamba if env var enabled
+    if suffix in {
         "inside_bar",
         "outside_bar",
-        "ret_1d",
-        "dow_1",
-        "dow_2",
-        "dow_3",
-        "dow_4",
-        "dow_5",
-        "moy_1",
-        "moy_2",
-        "moy_3",
-        "moy_4",
-        "moy_5",
-        "moy_6",
-        "moy_7",
-        "moy_8",
-        "moy_9",
-        "moy_10",
-        "moy_11",
-        "moy_12",
+        "range_atr14",
+        "sign_sum_3",
+        "sign_sum_5",
     }:
-        return FeatureRole.REGIME, "CM:policy"
+        return FeatureRole.REGIME, "CM:optional"
+    
+    # === A) DEFAULT MAMBA (PREDICTIVE) ===
+    # 21 alpha-suitable columns
+    if suffix in {
+        "close_pos",
+        "body_pct",
+        "upper_wick_pct",
+        "lower_wick_pct",
+        "wick_imbalance",
+        "gap_pct",
+        "close_vs_prev_close_pct",
+        "high_vs_prev_close_pct",
+        "low_vs_prev_close_pct",
+        "logret_1d",
+        "ret_5d",
+        "rng_z_20",
+        "trend_3",
+        "trend_5",
+        "body_z_20",
+        "dir_change",
+        "vol_ratio_20",
+        "vol_log_chg",
+        "up_day",
+        "down_day",
+        "atr_ratio_14_60",
+    }:
+        return FeatureRole.PREDICTIVE, "CM:predictive"
 
-    # Predictive default
-    return FeatureRole.PREDICTIVE, "CM:predictive"
+    # Default: unknown candle columns → RISK (conservative, Portfolio)
+    return FeatureRole.RISK, "CM:risk_default"
 
 
 def _alt_signals_role_override(column: str) -> Optional[Tuple[FeatureRole, str]]:
@@ -2050,10 +3929,132 @@ def infer_feature_role_with_reason(
     if fin_g3_override is not None:
         return fin_g3_override
 
+    # FIN_G4 (Cash Flow) - stress to portfolio, quality metrics to Mamba
+    fin_g4_override = _fin_g4_role_override(column)
+    if fin_g4_override is not None:
+        return fin_g4_override
+
+    # FIN_G5 (Growth) - YoY growth optional for Mamba, CAGR to regime, volatility to risk
+    fin_g5_override = _fin_g5_role_override(column)
+    if fin_g5_override is not None:
+        return fin_g5_override
+
+    # FIN_G6 (Valuation) - raw multiples to RISK, z-scores to Mamba PREDICTIVE
+    fin_g6_override = _fin_g6_role_override(column)
+    if fin_g6_override is not None:
+        return fin_g6_override
+
+    # FIN_G7 (Dividend Policy) - payout/dilution to RISK, yield_zscore to Mamba
+    fin_g7_override = _fin_g7_role_override(column)
+    if fin_g7_override is not None:
+        return fin_g7_override
+
+    # FINBERT (Sentiment) - score to Mamba, neutral to regime, confidence to HYGIENE
+    finbert_override = _finbert_role_override(column)
+    if finbert_override is not None:
+        return finbert_override
+
+    # GARCH_IV (Volatility) - Risk/regime diagnostics, NOT Mamba input
+    # Portfolio parquet + Policy Controller state + risk overlays
+    garch_iv_override = _garch_iv_role_override(column)
+    if garch_iv_override is not None:
+        return garch_iv_override
+
+    # INDEX_CONSTITUENTS (Flows) - Flow/liquidity, NOT Mamba input
+    # Portfolio parquet + Policy Controller + turnover logic
+    index_const_override = _index_constituents_role_override(column)
+    if index_const_override is not None:
+        return index_const_override
+
+    # MARKETCAP_HISTORY (Size) - Size/liquidity/institutional regime, NOT Mamba input
+    # Portfolio parquet (caps, costs) + Policy Controller
+    mcap_history_override = _marketcap_history_role_override(column)
+    if mcap_history_override is not None:
+        return mcap_history_override
+
+    # MICROSTRUCTURE - Primary Mamba input family (surgically clean)
+    # Candle geometry, order-flow, gaps → Mamba; Impact, spreads → Portfolio
+    micro_override = _microstructure_role_override(column)
+    if micro_override is not None:
+        return micro_override
+
+    # MULTIASSET - Systematic exposure, NOT Mamba input (except optional spread_spy_20)
+    # Portfolio parquet + Policy Controller (betas, correlations, style factors)
+    multiasset_override = _multiasset_role_override(column)
+    if multiasset_override is not None:
+        return multiasset_override
+
+    # OPTIONS - Snapshot-only options metrics, NO Mamba input
+    # Policy Controller (sentiment, positioning) + Portfolio (IV scaling)
+    options_override = _options_role_override(column)
+    if options_override is not None:
+        return options_override
+
+    # OPTIONS_ANCHORING - Institutional decay-weighted options, BOTH Mamba + Portfolio
+    # IV regime, skew regime, expected move, positioning → Mamba conditioning
+    options_anchoring_override = _options_anchoring_role_override(column)
+    if options_anchoring_override is not None:
+        return options_anchoring_override
+
+    # REGIME - Institutional regime classification, BOTH Mamba + Portfolio
+    # Probabilities, duration, trend metrics → Mamba conditioning + gating
+    regime_override = _regime_family_role_override(column)
+    if regime_override is not None:
+        return regime_override
+
+    # SHORT_INTEREST - Change/momentum/squeeze to Mamba, core metrics to Portfolio
+    # Bi-monthly data, forward-filled; avoid learning data-availability patterns
+    short_interest_override = _short_interest_role_override(column)
+    if short_interest_override is not None:
+        return short_interest_override
+
+    # SUBSIDIARY - Organizational complexity, NO Mamba input
+    # Quarterly financials are slow-moving; better as regime context
+    subsidiary_override = _subsidiary_role_override(column)
+    if subsidiary_override is not None:
+        return subsidiary_override
+
+    # TFT_FEATURES - Trend metrics to Mamba, vol/seasonality/stability to Portfolio
+    # High risk of misclassification: trend_consistency, weekday_effect, stability_*
+    tft_features_override = _tft_features_role_override(column)
+    if tft_features_override is not None:
+        return tft_features_override
+
+    # PEER_SCREENER_CONTEXT - Cheap percentiles + universe z to Mamba
+    # High risk of misclassification: *_pct defaults, *_peer_count, options/short z
+    peer_screener_override = _peer_screener_context_role_override(column)
+    if peer_screener_override is not None:
+        return peer_screener_override
+
+    # SYMBOL_GRAPH_CONTEXT - Cross-symbol graph embeddings + neighbor stats to Mamba
+    # All columns are PREDICTIVE by design (graph embeddings, neighbor aggregates)
+    symbol_graph_context_override = _symbol_graph_context_role_override(column)
+    if symbol_graph_context_override is not None:
+        return symbol_graph_context_override
+
+    # DOC_EMBEDDING_NOVELTY_HF - Only `score` to Mamba, cluster novelty to Portfolio
+    # Key issue: If you want cluster novelty in Mamba, add to forced-mamba prefix list
+    doc_embedding_novelty_override = _doc_embedding_novelty_hf_role_override(column)
+    if doc_embedding_novelty_override is not None:
+        return doc_embedding_novelty_override
+
+    # EARNINGS_TRANSCRIPT_HF - ALL columns to Mamba (forced-mamba prefix)
+    # Key issue: Portfolio sees NOTHING; mirror columns if portfolio needs them
+    earnings_transcript_override = _earnings_transcript_hf_role_override(column)
+    if earnings_transcript_override is not None:
+        return earnings_transcript_override
+
+    # MACRO_TST_HF - Only symbol interactions to Mamba; everything else to Portfolio
+    # Key issue: Almost ALL columns are REGIME/RISK → Portfolio. Only 3 PREDICTIVE.
+    macro_tst_hf_override = _macro_tst_hf_role_override(column)
+    if macro_tst_hf_override is not None:
+        return macro_tst_hf_override
+
     name = str(column).lower()
 
     # Explicit governance suffixes (structural, not keyword heuristics)
-    if name.endswith("_has_data") or name.endswith("_activity") or name.endswith("_days_since_update") or name.endswith("__days_since_update"):
+    # CRITICAL: confidence must be HYGIENE globally
+    if name.endswith("_has_data") or name.endswith("_activity") or name.endswith("_days_since_update") or name.endswith("__days_since_update") or name.endswith("_confidence"):
         return FeatureRole.HYGIENE, "A1:governance_suffix"
 
     # Fallback to family intent only.
@@ -2196,16 +4197,95 @@ def normalize_by_role(
     pred_window: int = 252,
     risk_window: int = 252,
     min_periods: int = 20,
+    family_map: Optional[Mapping[str, str]] = None,
+    family_meta: Optional[Mapping[str, FamilyMeta]] = None,
 ) -> pd.DataFrame:
     """Apply role-specific transforms in-place on a copy and return it."""
 
     out = df.copy()
     eps = 1e-6
 
+    gov_suffixes = ("_has_data", "_activity", "_days_since_update", "_confidence", "_conf")
+
+    def _cadence_defaults(cadence: str) -> Tuple[int, int, int, bool]:
+        token = str(cadence or "").strip().lower()
+        if token == "daily":
+            return 252, 252, 20, False
+        if token == "weekly":
+            return 104, 104, 12, False
+        if token == "monthly":
+            return 60, 60, 8, False
+        if token == "quarterly":
+            return 0, 0, 8, True
+        if token == "event":
+            return 40, 40, 20, True
+        if token == "intraday":
+            bars = int(os.getenv("BARS_PER_DAY", "390"))
+            z_win = max(100, bars * 10)
+            return z_win, z_win, max(20, int(z_win * 0.2)), False
+        return pred_window, risk_window, min_periods, False
+
+    def _update_mask_for_family(fam: str) -> Optional[pd.Series]:
+        if fam and f"{fam}_days_since_update" in out.columns:
+            ds = pd.to_numeric(out[f"{fam}_days_since_update"], errors="coerce")
+            return ds.fillna(1.0) <= 0.0
+        if fam and f"{fam}_has_data" in out.columns:
+            hd = pd.to_numeric(out[f"{fam}_has_data"], errors="coerce")
+            return hd.fillna(0.0) > 0.0
+        return None
+
+    def _rolling_stat(
+        series: pd.Series,
+        *,
+        window: int,
+        min_p: int,
+        update_mask: Optional[pd.Series],
+        stat: str,
+        quantile: Optional[float] = None,
+    ) -> pd.Series:
+        s = series
+        if update_mask is not None:
+            mask = update_mask.reindex(s.index).fillna(False)
+            s_evt = s[mask]
+            if s_evt.empty:
+                return pd.Series(index=s.index, dtype=float)
+            if window and window > 0:
+                roll = s_evt.rolling(int(window), min_periods=int(min_p))
+            else:
+                roll = s_evt.expanding(min_periods=int(min_p))
+            if stat == "mean":
+                out_stat = roll.mean().shift(1)
+            elif stat == "std":
+                out_stat = roll.std(ddof=0).shift(1)
+            elif stat == "min":
+                out_stat = roll.min().shift(1)
+            elif stat == "max":
+                out_stat = roll.max().shift(1)
+            elif stat == "quantile" and quantile is not None:
+                out_stat = roll.quantile(float(quantile)).shift(1)
+            else:
+                out_stat = roll.mean().shift(1)
+            return out_stat.reindex(s.index).ffill()
+
+        roll = s.rolling(int(window), min_periods=int(min_p)) if window and window > 0 else s.expanding(min_periods=int(min_p))
+        if stat == "mean":
+            return roll.mean().shift(1)
+        if stat == "std":
+            return roll.std(ddof=0).shift(1)
+        if stat == "min":
+            return roll.min().shift(1)
+        if stat == "max":
+            return roll.max().shift(1)
+        if stat == "quantile" and quantile is not None:
+            return roll.quantile(float(quantile)).shift(1)
+        return roll.mean().shift(1)
+
     for col, role in roles.items():
         if col not in out.columns:
             continue
         if col == "date":
+            continue
+        if str(col).endswith(gov_suffixes):
             continue
 
         if role == FeatureRole.HYGIENE:
@@ -2215,6 +4295,14 @@ def normalize_by_role(
         if s.isna().all():
             out[col] = 0.0
             continue
+
+        fam = ""
+        if family_map is not None:
+            fam = str(family_map.get(col, ""))
+        meta = family_meta.get(fam) if family_meta is not None else None
+        cadence_token = str(getattr(meta, "update_cadence", "")) if meta is not None else ""
+        cad_pred_win, cad_risk_win, cad_min_p, update_points_only = _cadence_defaults(cadence_token)
+        update_mask = _update_mask_for_family(fam) if update_points_only else None
 
         if role == FeatureRole.REGIME:
             if _is_boolish(out[col]):
@@ -2226,16 +4314,12 @@ def normalize_by_role(
             if _is_probabilistic(s2):
                 out[col] = s2.fillna(0.0).clip(0.0, 1.0)
             else:
-                valid = s2.dropna()
-                if valid.empty:
-                    out[col] = 0.0
-                else:
-                    mn = float(valid.min())
-                    mx = float(valid.max())
-                    if abs(mx - mn) < eps:
-                        out[col] = 0.0
-                    else:
-                        out[col] = ((s2 - mn) / (mx - mn)).fillna(0.0).clip(0.0, 1.0)
+                win = int(cad_pred_win) if cad_pred_win else 0
+                mp = int(cad_min_p) if cad_min_p else int(min_periods)
+                mn = _rolling_stat(s2, window=win, min_p=mp, update_mask=update_mask, stat="min")
+                mx = _rolling_stat(s2, window=win, min_p=mp, update_mask=update_mask, stat="max")
+                denom = (mx - mn).abs() + eps
+                out[col] = ((s2 - mn) / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(0.0, 1.0)
             continue
 
         if role == FeatureRole.RISK:
@@ -2263,20 +4347,29 @@ def normalize_by_role(
             q_lo = min(max(q_lo, 0.0), 0.49)
             q_hi = max(min(q_hi, 1.0), 0.51)
 
-            roll = t.rolling(int(risk_window), min_periods=int(min_periods))
-            lo = roll.quantile(q_lo)
-            hi = roll.quantile(q_hi)
+            win = int(cad_risk_win) if cad_risk_win else 0
+            mp = int(cad_min_p) if cad_min_p else int(min_periods)
+            lo = _rolling_stat(t, window=win, min_p=mp, update_mask=update_mask, stat="quantile", quantile=q_lo)
+            hi = _rolling_stat(t, window=win, min_p=mp, update_mask=update_mask, stat="quantile", quantile=q_hi)
             denom = (hi - lo).abs() + eps
             scaled = pd.Series((t - lo) / denom, index=t.index)
             out[col] = scaled.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(0.0, 1.0)
             continue
 
         if role == FeatureRole.PREDICTIVE:
-            roll = s.rolling(int(pred_window), min_periods=int(min_periods))
-            mu = roll.mean()
-            sd = roll.std(ddof=0)
+            name = str(col).lower()
+            if _is_boolish(out[col]) or _is_probabilistic(s):
+                out[col] = _safe_numeric(out[col]).fillna(0.0).clip(0.0, 1.0)
+                continue
+            if "zscore" in name or name.endswith("_z") or "_z_" in name:
+                out[col] = s.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-5.0, 5.0)
+                continue
+            win = int(cad_pred_win) if cad_pred_win else 0
+            mp = int(cad_min_p) if cad_min_p else int(min_periods)
+            mu = _rolling_stat(s, window=win, min_p=mp, update_mask=update_mask, stat="mean")
+            sd = _rolling_stat(s, window=win, min_p=mp, update_mask=update_mask, stat="std")
             z = (s - mu) / (sd + eps)
-            out[col] = z.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-8.0, 8.0)
+            out[col] = z.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-5.0, 5.0)
             continue
 
     return out

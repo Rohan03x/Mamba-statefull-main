@@ -1,0 +1,189 @@
+[
+	{
+		"family_id": "dcf",
+		"primary_intent": "predictive",
+		"update_frequency": "quarterly",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "ml_framework",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "finbert",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "alternative_signals",
+		"primary_intent": "predictive",
+		"update_frequency": "irregular",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "conditional"
+	},
+	{
+		"family_id": "quantile_forecast",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "garch_iv",
+		"primary_intent": "risk",
+		"update_frequency": "daily",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "cboe_term",
+		"primary_intent": "risk",
+		"update_frequency": "daily",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "microstructure",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "correlation",
+		"primary_intent": "risk",
+		"update_frequency": "daily",
+		"decay_profile": "none",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "cross_asset",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "multiasset",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "options",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "conditional"
+	},
+	{
+		"family_id": "short_interest",
+		"primary_intent": "risk",
+		"update_frequency": "irregular",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "true"
+	},
+	{
+		"family_id": "regime",
+		"primary_intent": "regime",
+		"update_frequency": "daily",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "macro_tst_hf",
+		"primary_intent": "predictive",
+		"update_frequency": "event",
+		"decay_profile": "slow",
+		"is_event_driven": true,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "conditional"
+	},
+	{
+		"family_id": "econ_events_calendar",
+		"primary_intent": "regime",
+		"update_frequency": "event",
+		"decay_profile": "none",
+		"is_event_driven": true,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "macro_regime_hf",
+		"primary_intent": "regime",
+		"update_frequency": "daily",
+		"decay_profile": "none",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "listing_status",
+		"primary_intent": "hygiene",
+		"update_frequency": "daily",
+		"decay_profile": "slow",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "exchange_calendar",
+		"primary_intent": "regime",
+		"update_frequency": "daily",
+		"decay_profile": "none",
+		"is_event_driven": false,
+		"is_cross_sectional": "false",
+		"allow_direct_alpha": "false"
+	},
+	{
+		"family_id": "symbol_graph_context",
+		"primary_intent": "predictive",
+		"update_frequency": "daily",
+		"decay_profile": "fast",
+		"is_event_driven": false,
+		"is_cross_sectional": "true",
+		"allow_direct_alpha": "true",
+		"risk_scale_ok": false,
+		"gating_ok": false,
+		"veto_ok": false,
+		"requires_point_in_time": true,
+		"update_latency_class": "t_plus_1",
+		"expected_sparsity": "dense",
+		"notes": "Cross-symbol graph embeddings and neighbor-aggregated features. Weekly adjacency refresh, daily neighbor stats. Uses ActiveUniverse + anchor ETFs."
+	}
+]

@@ -1,0 +1,1304 @@
+"""Linear Alpha Combiner for Phase-2 signal blending.
+
+This module provides a Ridge-regularized linear model that outputs z_lin directly
+(z-space), replacing static quantile blending. The model trains online using
+matured forward returns with calibration-gated freeze logic.
+
+Architecture:
+- LinearFeatureBuilder: Assembles per-symbol feature matrix from portfolio context
+- RidgeModel: Numpy-only Ridge regression with feature standardization
+- LinearCombinerState: Manages observation buffering, maturity gating, and online updates
+
+DATA SOURCES (All trace to EODHD as primary provider):
+- Price data (ret_1d, ret_5d, ret_21d, rv_21d): EODHD via _fetch_price_data()
+- CBOE VIX features (cboe_panic, cboe_slope, cboe_vrp): EODHD via cboe_term.fetch()
+- Mamba predictions (z_mamba): Trained on prep_families features from EODHD
+- RoleAwareDayContext: Aggregates EODHD-sourced features
+- Enforcement: Set STAGE_B_EODHD_ONLY=1 to disable non-EODHD fallbacks
+- Verification: Run verify_eodhd_data_sources.py to confirm data provenance
+
+Usage in phase2_stateful.py:
+    if linear_state is not None:
+        X_day = linear_state.feature_builder.build_day(...)
+        linear_state.observe_day(i, X_day, sigma_exec)
+        if linear_state.is_ready():
+            z_lin = linear_state.predict_z(X_day)
+            z = (1 - w_L) * z + w_L * z_lin
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Feature names for interpretability and persistence
+FEATURE_NAMES_PER_SYMBOL = [
+    "z_mamba",           # Post-overlay z-score from Mamba
+    "quantile_z",        # Quantile forecast z-score
+    "risk_scale",        # Risk overlay scale [0,1]
+    "regime_multiplier", # Regime overlay [0,1]
+    "split_stress",      # Split penalty factor
+    "ret_1d",            # 1-day past return
+    "ret_5d",            # 5-day cumulative past return
+    "ret_21d",           # 21-day cumulative past return
+    "rv_21d",            # 21-day realized volatility
+    "inv_sigma_exec",    # Inverse execution sigma (precision proxy)
+]
+
+FEATURE_NAMES_GLOBAL = [
+    "day_calib_score",   # Mamba calibration score
+    "online_trust_score",# Online trust metric
+    "cboe_panic",        # VIX panic premium
+    "cboe_slope",        # VIX term structure slope
+    "cboe_vrp",          # Vol risk premium z-score
+    "drawdown",          # Current portfolio drawdown
+    "realized_vol",      # Portfolio realized vol
+    "corr_hhi",          # Correlation HHI (concentration)
+    "turnover_prev",     # Previous day turnover
+    "cost_prev",         # Previous day cost
+]
+
+# NEW: Interaction features for capturing non-linear relationships
+FEATURE_NAMES_INTERACTIONS = [
+    "z_mamba_x_rv",      # z_mamba * rv_21d (volatility-conditional signal)
+    "z_mamba_x_regime",  # z_mamba * regime_multiplier (regime-conditional)
+    "z_mamba_squared",   # z_mamba^2 (non-linear signal strength)
+    "ret_1d_x_rv",       # ret_1d * rv_21d (momentum-volatility interaction)
+    "regime_x_panic",    # regime_multiplier * cboe_panic (risk-off interaction)
+]
+
+# NEW: Sector indicators (if sector_map provided)
+FEATURE_NAMES_SECTORS = [
+    "sector_tech",       # Technology sector indicator
+    "sector_finance",    # Financial sector indicator
+    "sector_healthcare", # Healthcare sector indicator
+    "sector_consumer",   # Consumer sector indicator
+    "sector_industrial", # Industrial sector indicator
+    "sector_energy",     # Energy sector indicator
+    "sector_other",      # Other sectors
+]
+
+ALL_FEATURE_NAMES = FEATURE_NAMES_PER_SYMBOL + FEATURE_NAMES_GLOBAL
+N_FEATURES = len(ALL_FEATURE_NAMES)
+
+# Extended features (optional, enabled via config)
+ALL_FEATURE_NAMES_EXTENDED = (
+    FEATURE_NAMES_PER_SYMBOL + 
+    FEATURE_NAMES_GLOBAL + 
+    FEATURE_NAMES_INTERACTIONS +
+    FEATURE_NAMES_SECTORS
+)
+N_FEATURES_EXTENDED = len(ALL_FEATURE_NAMES_EXTENDED)
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """Safely convert to float with fallback."""
+    try:
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return float(default)
+        return float(v)  # type: ignore
+    except Exception:
+        return float(default)
+
+
+def _compute_rolling_returns(
+    returns_df: Optional[pd.DataFrame],
+    i: int,
+    syms: Sequence[str],
+    window: int,
+) -> np.ndarray:
+    """Compute cumulative return over past `window` days ending at day i (exclusive of i).
+    
+    Returns shape (n_assets,).
+    """
+    n_assets = len(syms)
+    result = np.zeros(n_assets, dtype=float)
+    
+    if returns_df is None or i < 1:
+        return result
+    
+    start_idx = max(0, i - window)
+    end_idx = i  # Exclusive of current day
+    
+    if start_idx >= end_idx:
+        return result
+    
+    try:
+        # Get returns for the window
+        ret_slice = returns_df.iloc[start_idx:end_idx]
+        for j, sym in enumerate(syms):
+            if sym in ret_slice.columns:
+                r = ret_slice[sym].to_numpy(dtype=float)
+                # Cumulative return: prod(1+r) - 1
+                r = np.where(np.isfinite(r), r, 0.0)
+                cum_ret = float(np.prod(1.0 + r) - 1.0)
+                result[j] = cum_ret if np.isfinite(cum_ret) else 0.0
+    except Exception:
+        pass
+    
+    return result
+
+
+def _compute_realized_vol(
+    returns_df: Optional[pd.DataFrame],
+    i: int,
+    syms: Sequence[str],
+    window: int = 21,
+) -> np.ndarray:
+    """Compute realized volatility over past `window` days ending at day i.
+    
+    Returns shape (n_assets,), annualized.
+    """
+    n_assets = len(syms)
+    result = np.full(n_assets, 0.15, dtype=float)  # Default 15% vol
+    
+    if returns_df is None or i < window:
+        return result
+    
+    start_idx = max(0, i - window)
+    end_idx = i
+    
+    if end_idx - start_idx < 5:  # Need at least 5 days
+        return result
+    
+    try:
+        ret_slice = returns_df.iloc[start_idx:end_idx]
+        for j, sym in enumerate(syms):
+            if sym in ret_slice.columns:
+                r = ret_slice[sym].to_numpy(dtype=float)
+                r = r[np.isfinite(r)]
+                if len(r) >= 5:
+                    vol = float(np.std(r, ddof=1) * np.sqrt(252))
+                    result[j] = vol if np.isfinite(vol) and vol > 0 else 0.15
+    except Exception:
+        pass
+    
+    return result
+
+
+@dataclass
+class LinearFeatureBuilder:
+    """Builds feature matrix for linear alpha combiner.
+    
+    Features are split into per-symbol (varying across assets) and global
+    (same for all assets, broadcast). All features use only past information
+    to avoid lookahead bias.
+    
+    NEW: Optional extended features for non-linear modeling:
+    - Interaction terms (z_mamba * volatility, regime interactions)
+    - Sector indicators (one-hot encoding by sector)
+    """
+    
+    symbols: List[str] = field(default_factory=list)
+    n_features: int = N_FEATURES
+    feature_names: List[str] = field(default_factory=lambda: list(ALL_FEATURE_NAMES))
+    
+    # NEW: Extended features config
+    use_interactions: bool = False  # Enable interaction terms
+    use_sectors: bool = False        # Enable sector indicators
+    sector_map: Optional[Dict[str, str]] = None  # Symbol -> sector mapping
+    
+    def build_day(
+        self,
+        *,
+        i: int,
+        syms: Sequence[str],
+        z_mamba: np.ndarray,
+        sigma_exec: np.ndarray,
+        day_ctx: Any = None,  # RoleAwareDayContext
+        day_calib_score: float = 1.0,
+        day_online_trust: float = 1.0,
+        day_cboe_panic: float = 0.0,
+        day_cboe_slope: float = 0.0,
+        day_cboe_vrp: float = 0.0,
+        equity: Optional[np.ndarray] = None,
+        turnover: Optional[np.ndarray] = None,
+        costs: Optional[np.ndarray] = None,
+        returns_df: Optional[pd.DataFrame] = None,
+        corr_hhi: float = 0.0,
+    ) -> np.ndarray:
+        """Build feature matrix for day i.
+        
+        Args:
+            i: Day index in OOS loop
+            syms: Symbol list
+            z_mamba: Post-overlay z-scores, shape (n_assets,)
+            sigma_exec: Execution sigma, shape (n_assets,)
+            day_ctx: RoleAwareDayContext for the day (optional)
+            day_calib_score: Mamba calibration score [0, 1]
+            day_online_trust: Online trust score [0, 1]
+            day_cboe_panic: VIX panic premium
+            day_cboe_slope: VIX term structure slope
+            day_cboe_vrp: Vol risk premium z-score
+            equity: Equity curve array (to compute drawdown)
+            turnover: Turnover array (for previous day)
+            costs: Costs array (for previous day)
+            returns_df: Returns DataFrame for momentum features
+            corr_hhi: Correlation HHI from covariance matrix (Gap C fix)
+        
+        Returns:
+            X_day: Feature matrix, shape (n_assets, n_features)
+        """
+        n_assets = len(syms)
+        # Always start with base features, then extend if needed
+        X = np.zeros((n_assets, N_FEATURES), dtype=float)
+        
+        # === Per-symbol features ===
+        
+        # z_mamba (idx 0)
+        z_mamba = np.asarray(z_mamba, dtype=float)
+        X[:, 0] = np.where(np.isfinite(z_mamba), z_mamba, 0.0)
+        
+        # quantile_z (idx 1)
+        if day_ctx is not None and hasattr(day_ctx, 'quantile_z'):
+            qz = np.asarray(day_ctx.quantile_z, dtype=float)
+            X[:, 1] = np.where(np.isfinite(qz), qz, 0.0)
+        
+        # risk_scale (idx 2)
+        if day_ctx is not None and hasattr(day_ctx, 'risk_scale'):
+            rs = np.asarray(day_ctx.risk_scale, dtype=float)
+            X[:, 2] = np.where(np.isfinite(rs), rs, 1.0)
+        else:
+            X[:, 2] = 1.0
+        
+        # regime_multiplier (idx 3)
+        if day_ctx is not None and hasattr(day_ctx, 'regime_multiplier'):
+            rm = np.asarray(day_ctx.regime_multiplier, dtype=float)
+            X[:, 3] = np.where(np.isfinite(rm), rm, 1.0)
+        else:
+            X[:, 3] = 1.0
+        
+        # split_stress (idx 4)
+        if day_ctx is not None and hasattr(day_ctx, 'split_stress'):
+            ss = np.asarray(day_ctx.split_stress, dtype=float)
+            X[:, 4] = np.where(np.isfinite(ss), ss, 0.0)
+        
+        # ret_1d, ret_5d, ret_21d (idx 5, 6, 7)
+        if returns_df is not None:
+            X[:, 5] = _compute_rolling_returns(returns_df, i, syms, window=1)
+            X[:, 6] = _compute_rolling_returns(returns_df, i, syms, window=5)
+            X[:, 7] = _compute_rolling_returns(returns_df, i, syms, window=21)
+        
+        # rv_21d (idx 8)
+        if returns_df is not None:
+            X[:, 8] = _compute_realized_vol(returns_df, i, syms, window=21)
+        else:
+            X[:, 8] = 0.15  # Default vol
+        
+        # inv_sigma_exec (idx 9) - precision proxy for robust position sizing
+        sigma_exec = np.asarray(sigma_exec, dtype=float)
+        inv_sigma = 1.0 / np.clip(sigma_exec, 1e-8, None)
+        X[:, 9] = np.where(np.isfinite(inv_sigma), inv_sigma, 1.0)
+        
+        # === Global features (broadcast to all assets) ===
+        
+        # day_calib_score (idx 10)
+        X[:, 10] = _safe_float(day_calib_score, 1.0)
+        
+        # online_trust_score (idx 11)
+        X[:, 11] = _safe_float(day_online_trust, 1.0)
+        
+        # cboe_panic (idx 12)
+        X[:, 12] = _safe_float(day_cboe_panic, 0.0)
+        
+        # cboe_slope (idx 13)
+        X[:, 13] = _safe_float(day_cboe_slope, 0.0)
+        
+        # cboe_vrp (idx 14)
+        X[:, 14] = _safe_float(day_cboe_vrp, 0.0)
+        
+        # drawdown (idx 15)
+        if equity is not None and i > 0:
+            eq_so_far = equity[:i]
+            eq_so_far = eq_so_far[np.isfinite(eq_so_far)]
+            if len(eq_so_far) > 0:
+                peak = float(np.max(eq_so_far))
+                current = float(eq_so_far[-1]) if len(eq_so_far) > 0 else 1.0
+                dd = (peak - current) / peak if peak > 0 else 0.0
+                X[:, 15] = _safe_float(dd, 0.0)
+        
+        # realized_vol (portfolio-level) (idx 16)
+        if returns_df is not None and i >= 21:
+            try:
+                port_ret = returns_df.iloc[max(0, i-21):i].mean(axis=1).to_numpy(dtype=float)
+                port_vol = float(np.std(port_ret[np.isfinite(port_ret)], ddof=1) * np.sqrt(252))
+                X[:, 16] = port_vol if np.isfinite(port_vol) else 0.15
+            except Exception:
+                X[:, 16] = 0.15
+        else:
+            X[:, 16] = 0.15
+        
+        # corr_hhi (idx 17) - correlation concentration from eigenvalue HHI
+        # FIX Gap C: Use actual value passed from phase2 instead of placeholder
+        X[:, 17] = _safe_float(corr_hhi, 0.0)
+        
+        # turnover_prev (idx 18)
+        if turnover is not None and i > 0:
+            X[:, 18] = _safe_float(turnover[i - 1], 0.0)
+        
+        # cost_prev (idx 19)
+        if costs is not None and i > 0:
+            X[:, 19] = _safe_float(costs[i - 1], 0.0)
+        
+        # === Extended features (if enabled) ===
+        if self.use_interactions or self.use_sectors:
+            X_extended = self._build_extended_features(
+                X=X,
+                n_assets=n_assets,
+                syms=syms,
+            )
+            return X_extended
+        
+        return X
+    
+    def _build_extended_features(
+        self,
+        X: np.ndarray,
+        n_assets: int,
+        syms: Sequence[str],
+    ) -> np.ndarray:
+        """Build extended feature matrix with interactions and sectors.
+        
+        Args:
+            X: Base feature matrix, shape (n_assets, N_FEATURES)
+            n_assets: Number of assets
+            syms: Symbol list
+        
+        Returns:
+            X_extended: Extended matrix, shape (n_assets, N_FEATURES_EXTENDED)
+        """
+        feature_list = [X]  # Start with base features
+        
+        # === Interaction features ===
+        if self.use_interactions:
+            X_interact = np.zeros((n_assets, len(FEATURE_NAMES_INTERACTIONS)), dtype=float)
+            
+            # z_mamba_x_rv: z_mamba * rv_21d
+            X_interact[:, 0] = X[:, 0] * X[:, 8]
+            
+            # z_mamba_x_regime: z_mamba * regime_multiplier
+            X_interact[:, 1] = X[:, 0] * X[:, 3]
+            
+            # z_mamba_squared: z_mamba^2 (non-linear)
+            X_interact[:, 2] = X[:, 0] ** 2
+            
+            # ret_1d_x_rv: ret_1d * rv_21d
+            X_interact[:, 3] = X[:, 5] * X[:, 8]
+            
+            # regime_x_panic: regime_multiplier * cboe_panic
+            X_interact[:, 4] = X[:, 3] * X[:, 12]
+            
+            feature_list.append(X_interact)
+        
+        # === Sector indicators ===
+        if self.use_sectors and self.sector_map is not None:
+            X_sector = np.zeros((n_assets, len(FEATURE_NAMES_SECTORS)), dtype=float)
+            
+            sector_indices = {
+                "Technology": 0,
+                "Financial Services": 1,
+                "Healthcare": 2,
+                "Consumer": 3,  # Consumer Cyclical + Defensive
+                "Industrials": 4,
+                "Energy": 5,
+            }
+            
+            for i, sym in enumerate(syms):
+                sector = self.sector_map.get(sym, "Other")
+                
+                # Map to simplified sectors
+                if "Technology" in sector:
+                    X_sector[i, 0] = 1.0
+                elif "Financial" in sector:
+                    X_sector[i, 1] = 1.0
+                elif "Healthcare" in sector:
+                    X_sector[i, 2] = 1.0
+                elif "Consumer" in sector:
+                    X_sector[i, 3] = 1.0
+                elif "Industrial" in sector:
+                    X_sector[i, 4] = 1.0
+                elif "Energy" in sector:
+                    X_sector[i, 5] = 1.0
+                else:
+                    X_sector[i, 6] = 1.0  # Other
+            
+            feature_list.append(X_sector)
+        
+        # Concatenate all feature groups
+        X_extended = np.hstack(feature_list)
+        
+        return X_extended
+
+    def __post_init__(self):
+        """Update feature count and names if extended features are enabled."""
+        if self.use_interactions or self.use_sectors:
+            self.feature_names = list(FEATURE_NAMES_PER_SYMBOL + FEATURE_NAMES_GLOBAL)
+            
+            if self.use_interactions:
+                self.feature_names.extend(FEATURE_NAMES_INTERACTIONS)
+            
+            if self.use_sectors:
+                self.feature_names.extend(FEATURE_NAMES_SECTORS)
+            
+            self.n_features = len(self.feature_names)
+
+
+@dataclass
+class RidgeModel:
+    """Numpy-only Ridge regression with feature standardization.
+    
+    Solves: β = (XᵀX + λI)⁻¹Xᵀy
+    
+    Features are standardized (mean=0, std=1) before fitting.
+    """
+    
+    n_features: int = N_FEATURES
+    lambda_: float = 10.0
+    
+    # Fitted parameters
+    beta_: Optional[np.ndarray] = None  # Coefficients, shape (n_features,)
+    intercept_: float = 0.0
+    
+    # Standardization stats
+    mean_: Optional[np.ndarray] = None  # shape (n_features,)
+    std_: Optional[np.ndarray] = None   # shape (n_features,)
+    
+    # Training diagnostics
+    r_squared_: float = 0.0
+    n_samples_: int = 0
+    
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RidgeModel":
+        """Fit Ridge regression.
+        
+        Args:
+            X: Feature matrix, shape (n_samples, n_features)
+            y: Target, shape (n_samples,) - should be z-space (r / sigma_exec)
+        
+        Returns:
+            self
+        """
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        
+        # Filter valid samples
+        valid_mask = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
+        X = X[valid_mask]
+        y = y[valid_mask]
+        
+        if len(y) < 10:
+            logger.warning("[linear.ridge] Not enough valid samples (%d < 10)", len(y))
+            return self
+        
+        self.n_samples_ = len(y)
+        
+        # Compute and store standardization stats
+        self.mean_ = np.mean(X, axis=0)
+        self.std_ = np.std(X, axis=0, ddof=1)
+        self.std_ = np.where(self.std_ > 1e-8, self.std_, 1.0)  # Avoid div by zero
+        
+        # Standardize features
+        X_std = (X - self.mean_) / self.std_
+        
+        # Center target
+        y_mean = float(np.mean(y))
+        y_centered = y - y_mean
+        
+        # Ridge regression: β = (XᵀX + λI)⁻¹Xᵀy
+        n_features = X_std.shape[1]
+        XtX = X_std.T @ X_std
+        XtY = X_std.T @ y_centered
+        
+        # Add regularization
+        reg_matrix = self.lambda_ * np.eye(n_features)
+        
+        try:
+            self.beta_ = np.linalg.solve(XtX + reg_matrix, XtY)
+        except np.linalg.LinAlgError:
+            # Fallback to pseudo-inverse
+            logger.warning("[linear.ridge] Singular matrix, using pseudo-inverse")
+            self.beta_ = np.linalg.lstsq(XtX + reg_matrix, XtY, rcond=None)[0]
+        
+        self.intercept_ = y_mean
+        
+        # Compute R² for diagnostics
+        y_pred = X_std @ self.beta_ + self.intercept_
+        ss_res = float(np.sum((y - y_pred) ** 2))
+        ss_tot = float(np.sum((y - y_mean) ** 2))
+        self.r_squared_ = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-10 else 0.0
+        
+        return self
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict z_lin from features.
+        
+        Args:
+            X: Feature matrix, shape (n_assets, n_features)
+        
+        Returns:
+            z_lin: Predicted z-scores, shape (n_assets,)
+        """
+        if self.beta_ is None or self.mean_ is None or self.std_ is None:
+            # Not fitted yet - return zeros
+            return np.zeros(X.shape[0], dtype=float)
+        
+        X = np.asarray(X, dtype=float)
+        
+        # Handle NaN/Inf in input
+        X = np.where(np.isfinite(X), X, 0.0)
+        
+        # Standardize using stored stats
+        X_std = (X - self.mean_) / self.std_
+        
+        # Predict
+        z_lin = X_std @ self.beta_ + self.intercept_
+        
+        # Clip extreme predictions
+        z_lin = np.clip(z_lin, -10.0, 10.0)
+        
+        return z_lin
+    
+    def get_coefficients_report(self, feature_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Get coefficient report for logging."""
+        if self.beta_ is None:
+            return {"status": "not_fitted"}
+        
+        if feature_names is None:
+            feature_names = list(ALL_FEATURE_NAMES)
+        
+        # Top coefficients by absolute value
+        abs_coefs = np.abs(self.beta_)
+        top_indices = np.argsort(abs_coefs)[::-1][:5]
+        
+        top_coefs: List[Dict[str, Any]] = [
+            {
+                "feature": feature_names[idx] if idx < len(feature_names) else f"feat_{idx}",
+                "coef": float(self.beta_[idx]),
+                "abs_coef": float(abs_coefs[idx]),
+            }
+            for idx in top_indices
+        ]
+        
+        # Key coefficients
+        z_mamba_coef = float(self.beta_[0]) if len(self.beta_) > 0 else 0.0
+        quantile_z_coef = float(self.beta_[1]) if len(self.beta_) > 1 else 0.0
+        
+        return {
+            "status": "fitted",
+            "n_samples": self.n_samples_,
+            "r_squared": float(self.r_squared_),
+            "intercept": float(self.intercept_),
+            "z_mamba_coef": z_mamba_coef,
+            "quantile_z_coef": quantile_z_coef,
+            "z_mamba_sign": "positive" if z_mamba_coef >= 0 else "negative",
+            "quantile_z_sign": "positive" if quantile_z_coef >= 0 else "negative",
+            "top_coefficients": top_coefs,
+        }
+
+
+@dataclass
+class LinearCombinerState:
+    """Manages linear alpha combiner state, buffering, and online updates.
+    
+    Key responsibilities:
+    1. Buffer daily observations (X, sigma_exec) for maturity processing
+    2. Compute z-space targets when predictions mature (y = r / sigma_exec)
+    3. Maintain rolling training window
+    4. Refit model at specified intervals with freeze logic
+    
+    Adaptive Quality Thresholds (configurable):
+    - r2_threshold: Minimum R² to activate (default 0.05)
+    - drift_threshold: Max coefficient drift to stay active (default 0.15)
+    - corr_threshold: Min correlation with Mamba (default 0.3)
+    - sign_disagree_threshold: Max sign disagreement rate (default 0.4)
+    - min_stable_updates: Min consecutive good updates (default 3)
+    """
+    
+    # Config
+    horizon: int = 21
+    update_interval: int = 21
+    ridge_lambda: float = 10.0
+    window: int = 126
+    max_window: int = 252
+    min_samples: int = 63
+    time_decay_halflife: int = 42  # Days for exponential decay (0 = no decay)
+    confidence_ewma_alpha: float = 0.1  # EWMA smoothing for confidence tracking
+    
+    # Adaptive quality thresholds (decoupled from hard-coded values)
+    r2_threshold: float = 0.05  # Minimum R² to activate
+    drift_threshold: float = 0.15  # Max coefficient drift before penalty
+    corr_threshold: float = 0.3  # Min correlation with Mamba
+    sign_disagree_threshold: float = 0.4  # Max sign disagreement rate
+    min_stable_updates: int = 3  # Min consecutive good updates
+    
+    # Components
+    feature_builder: LinearFeatureBuilder = field(default_factory=LinearFeatureBuilder)
+    model: RidgeModel = field(default_factory=RidgeModel)
+    
+    # Observation buffers (keyed by day index)
+    _X_buffer: Dict[int, np.ndarray] = field(default_factory=dict)
+    _sigma_exec_buffer: Dict[int, np.ndarray] = field(default_factory=dict)
+    
+    # Training data (rolling window)
+    # FIX Gap D: Add day_idx tracking for proper rolling window and persistence
+    _X_train: List[np.ndarray] = field(default_factory=list)
+    _y_train: List[np.ndarray] = field(default_factory=list)
+    _day_idx_train: List[int] = field(default_factory=list)
+    
+    # State tracking
+    _last_fit_day: int = -1
+    _n_updates: int = 0
+    _prev_beta: Optional[np.ndarray] = None
+    
+    # Quality tracking for adaptive blending (rolling window)
+    _r_squared_history: List[float] = field(default_factory=list)
+    _drift_history: List[float] = field(default_factory=list)
+    _corr_history: List[float] = field(default_factory=list)
+    _sign_disagree_history: List[float] = field(default_factory=list)
+    _quality_window: int = 10  # Rolling window for quality metrics
+    
+    # Confidence tracking (EWMA of per-symbol absolute residuals)
+    # Confidence = 1 / (1 + residual_variance)
+    _residual_ewma: Optional[np.ndarray] = None  # EWMA of |y - y_pred|, shape (n_features,)
+    _n_confidence_updates: int = 0
+    
+    def __post_init__(self):
+        self.model.lambda_ = self.ridge_lambda
+    
+    def observe_day(self, i: int, X_day: np.ndarray, sigma_exec: np.ndarray) -> None:
+        """Store observation for day i.
+        
+        Called during the main loop BEFORE prediction. Stores features
+        and sigma_exec for later maturity processing.
+        
+        Args:
+            i: Day index
+            X_day: Feature matrix, shape (n_assets, n_features)
+            sigma_exec: Execution sigma, shape (n_assets,)
+        """
+        self._X_buffer[i] = X_day.copy()
+        self._sigma_exec_buffer[i] = np.asarray(sigma_exec, dtype=float).copy()
+        
+        # Garbage collect old buffers (beyond max_window + horizon)
+        cutoff = i - self.max_window - self.horizon - 10
+        for old_idx in list(self._X_buffer.keys()):
+            if old_idx < cutoff:
+                del self._X_buffer[old_idx]
+                if old_idx in self._sigma_exec_buffer:
+                    del self._sigma_exec_buffer[old_idx]
+    
+    def update_if_matured(
+        self,
+        i: int,
+        fwd_ret_mat: np.ndarray,
+        freeze: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Process matured observations and optionally refit.
+        
+        Called after main loop prediction. For day i, the prediction
+        made at day (i - horizon) has now matured.
+        
+        Args:
+            i: Current day index
+            fwd_ret_mat: Forward returns matrix, shape (n_days, n_assets)
+            freeze: If True, buffer but don't refit (calibration < 0.55)
+        
+        Returns:
+            Refit report dict if refit occurred, else None
+        """
+        matured_idx = i - self.horizon
+        
+        if matured_idx < 0:
+            return None
+        
+        # Get buffered observation from matured day
+        if matured_idx not in self._X_buffer:
+            return None
+        
+        X_matured = self._X_buffer[matured_idx]
+        sigma_matured = self._sigma_exec_buffer.get(matured_idx)
+        
+        if sigma_matured is None:
+            return None
+        
+        # Get realized returns for matured prediction
+        if matured_idx >= fwd_ret_mat.shape[0]:
+            return None
+        
+        realized_ret = fwd_ret_mat[matured_idx, :]
+        
+        # Cross-sectional demean to get alpha residual (removes market beta)
+        # This trains the linear model on idiosyncratic return, not market mode
+        valid_ret_mask = np.isfinite(realized_ret)
+        if np.sum(valid_ret_mask) > 1:
+            ret_mean = float(np.mean(realized_ret[valid_ret_mask]))
+            r_alpha = realized_ret - ret_mean  # Alpha residual
+        else:
+            r_alpha = realized_ret
+        
+        # Compute z-space target: y = r_alpha / (sigma_exec + eps)
+        eps = 1e-8
+        y_matured = r_alpha / (sigma_matured + eps)
+        
+        # Filter valid samples
+        valid_mask = np.isfinite(y_matured) & np.all(np.isfinite(X_matured), axis=1)
+        
+        if np.sum(valid_mask) > 0:
+            # Update confidence tracking if model is fitted
+            if self.model.beta_ is not None:
+                y_pred = self.model.predict(X_matured[valid_mask])
+                abs_residuals = np.abs(y_matured[valid_mask] - y_pred)
+                
+                # Update EWMA of absolute residuals (per-feature contribution)
+                # We track residual magnitude aggregated over all samples this day
+                if self._residual_ewma is None:
+                    # Initialize with mean absolute residual
+                    self._residual_ewma = np.full(self.model.n_features, float(np.mean(abs_residuals)))
+                else:
+                    # EWMA update: smooth the average residual magnitude
+                    current_residual = float(np.mean(abs_residuals))
+                    # Update all features equally (global confidence measure)
+                    self._residual_ewma = (
+                        self.confidence_ewma_alpha * current_residual +
+                        (1 - self.confidence_ewma_alpha) * self._residual_ewma
+                    )
+                
+                self._n_confidence_updates += 1
+            
+            # Add to training buffer (per-sample for rolling window)
+            # FIX Gap D: Store day_idx for proper window enforcement
+            self._X_train.append(X_matured[valid_mask])
+            self._y_train.append(y_matured[valid_mask])
+            self._day_idx_train.append(matured_idx)
+            
+            # Enforce rolling window by day count (not sample count)
+            # Use 'window' for training, 'max_window' for storage retention
+            while len(self._day_idx_train) > 0:
+                oldest_day = self._day_idx_train[0]
+                if (matured_idx - oldest_day) > self.max_window:
+                    self._X_train.pop(0)
+                    self._y_train.pop(0)
+                    self._day_idx_train.pop(0)
+                else:
+                    break
+        
+        # Check if refit is due
+        should_refit = (
+            (i - self._last_fit_day) >= self.update_interval
+            and not freeze
+        )
+        
+        if should_refit:
+            return self._do_refit(i)
+        
+        return None
+    
+    def _do_refit(self, i: int) -> Dict[str, Any]:
+        """Perform model refit on accumulated training data.
+        
+        FIX Gap D: Use 'window' parameter to select training subset from buffer.
+        Buffer stores up to 'max_window' days, but training uses recent 'window' days.
+        
+        Returns:
+            Refit report with R², drift, coefficients, etc.
+        """
+        if len(self._X_train) == 0:
+            return {"status": "no_data"}
+        
+        # Apply training window: use only recent 'window' days
+        # (buffer may hold more for warm restarts)
+        matured_idx = i - self.horizon
+        train_cutoff_day = matured_idx - self.window
+        
+        X_chunks = []
+        y_chunks = []
+        day_sizes = []  # Track samples per day for weighting
+        
+        for j in range(len(self._day_idx_train)):
+            if self._day_idx_train[j] >= train_cutoff_day:
+                X_chunks.append(self._X_train[j])
+                y_chunks.append(self._y_train[j])
+                day_sizes.append(len(self._y_train[j]))
+        
+        if len(X_chunks) == 0:
+            return {"status": "no_data", "n_samples": 0}
+        
+        # FIX: Apply per-day weighting to equalize contribution across days
+        # Days with more eligible symbols shouldn't get more weight
+        # Weight each day equally: w_day = 1 / sqrt(n_samples_in_day)
+        # Applied as sqrt(w_day) to X and y before concatenation
+        # 
+        # ENHANCEMENT: Add exponential time-decay for older days within window
+        # More recent days get higher weight for regime responsiveness
+        X_weighted = []
+        y_weighted = []
+        
+        for idx, (X_day, y_day, n_day, day_idx) in enumerate(zip(X_chunks, y_chunks, day_sizes, self._day_idx_train[-(len(X_chunks)):])):
+            # Per-day sample normalization (equal contribution per day)
+            day_weight = 1.0 / float(np.sqrt(max(n_day, 1)))
+            
+            # Time-decay: recent days get more weight
+            if self.time_decay_halflife > 0:
+                days_ago = matured_idx - day_idx
+                time_weight = np.exp(-np.log(2) * days_ago / self.time_decay_halflife)
+            else:
+                time_weight = 1.0
+            
+            # Combined weight
+            combined_weight = day_weight * time_weight
+            
+            X_weighted.append(X_day * combined_weight)
+            y_weighted.append(y_day * combined_weight)
+        
+        # Concatenate weighted training data
+        X_all = np.vstack(X_weighted)
+        y_all = np.concatenate(y_weighted)
+        
+        n_samples = len(y_all)
+        
+        if n_samples < self.min_samples:
+            return {
+                "status": "insufficient_samples",
+                "n_samples": n_samples,
+                "min_required": self.min_samples,
+            }
+        
+        # Store previous beta for drift calculation
+        self._prev_beta = self.model.beta_.copy() if self.model.beta_ is not None else None
+        
+        # Fit model
+        self.model.fit(X_all, y_all)
+        
+        self._last_fit_day = i
+        self._n_updates += 1
+        
+        # Compute drift
+        drift = 0.0
+        if self._prev_beta is not None and self.model.beta_ is not None:
+            drift = float(np.linalg.norm(self.model.beta_ - self._prev_beta))
+        
+        # Track drift for adaptive blending
+        self._drift_history.append(drift)
+        if len(self._drift_history) > self._quality_window:
+            self._drift_history = self._drift_history[-self._quality_window:]
+        
+        # Build report
+        report = self.model.get_coefficients_report()
+        report.update({
+            "day_idx": i,
+            "n_updates": self._n_updates,
+            "drift": drift,
+        })
+        
+        logger.info(
+            "[linear.refit] day=%d n_samples=%d R²=%.3f drift=%.4f z_mamba_coef=%.3f",
+            i, n_samples, report.get("r_squared", 0.0), drift,
+            report.get("z_mamba_coef", 0.0),
+        )
+        
+        return report
+    
+    def predict_z(self, X_day: np.ndarray) -> np.ndarray:
+        """Predict z_lin for current day.
+        
+        Args:
+            X_day: Feature matrix, shape (n_assets, n_features)
+        
+        Returns:
+            z_lin: Predicted z-scores, shape (n_assets,)
+        """
+        return self.model.predict(X_day)
+    
+    def predict_z_with_confidence(
+        self,
+        X_day: np.ndarray,
+        confidence_scaling: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Predict z_lin with per-symbol confidence scores.
+        
+        Args:
+            X_day: Feature matrix, shape (n_assets, n_features)
+            confidence_scaling: If True, scale z_lin by confidence
+        
+        Returns:
+            Tuple of:
+                z_lin: Predicted z-scores, shape (n_assets,)
+                confidence: Per-symbol confidence [0, 1], shape (n_assets,)
+        """
+        z_lin = self.model.predict(X_day)
+        
+        # Compute confidence from residual EWMA
+        if self._residual_ewma is not None and self._n_confidence_updates > 3:
+            # Global confidence based on rolling residual variance
+            # Lower residual = higher confidence
+            # confidence = 1 / (1 + avg_residual)
+            avg_residual = float(np.mean(self._residual_ewma))
+            global_confidence = 1.0 / (1.0 + avg_residual)
+            
+            # Broadcast to all symbols (global measure)
+            confidence = np.full(len(z_lin), global_confidence, dtype=float)
+        else:
+            # No confidence data yet - assume neutral
+            confidence = np.ones(len(z_lin), dtype=float)
+        
+        # Apply confidence scaling to predictions
+        if confidence_scaling:
+            z_lin = z_lin * confidence
+        
+        return z_lin, confidence
+    
+    def is_ready(self) -> bool:
+        """Check if model is trained and ready for blending.
+        
+        Returns True only after first successful fit with min_samples.
+        """
+        return self.model.beta_ is not None
+    
+    def get_daily_diagnostics(
+        self,
+        z_lin: np.ndarray,
+        z_mamba: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Compute daily diagnostic metrics.
+        
+        Args:
+            z_lin: Linear model predictions, shape (n_assets,)
+            z_mamba: Original Mamba z-scores, shape (n_assets,)
+        
+        Returns:
+            Dict with diagnostic metrics
+        """
+        z_lin = np.asarray(z_lin, dtype=float)
+        z_mamba = np.asarray(z_mamba, dtype=float)
+        
+        valid_mask = np.isfinite(z_lin) & np.isfinite(z_mamba)
+        
+        if np.sum(valid_mask) < 2:
+            return {"status": "insufficient_valid"}
+        
+        z_lin_v = z_lin[valid_mask]
+        z_mamba_v = z_mamba[valid_mask]
+        
+        # Correlation
+        corr = float(np.corrcoef(z_lin_v, z_mamba_v)[0, 1])
+        if not np.isfinite(corr):
+            corr = 0.0
+        
+        # Sign disagreement
+        sign_disagree = float(np.mean(np.sign(z_lin_v) != np.sign(z_mamba_v)))
+        
+        # Scale impact: mean(|z_lin| / |z_mamba|)
+        z_mamba_abs = np.abs(z_mamba_v)
+        z_lin_abs = np.abs(z_lin_v)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(z_mamba_abs > 1e-6, z_lin_abs / z_mamba_abs, 1.0)
+            scale_impact = float(np.clip(np.mean(ratio), 0.0, 10.0))
+        
+        return {
+            "corr_z_lin_z_mamba": corr,
+            "sign_disagreement_frac": sign_disagree,
+            "scale_impact": scale_impact,
+            "is_ready": self.is_ready(),
+            "n_updates": self._n_updates,
+        }
+    
+    def compute_adaptive_blend_weight(
+        self,
+        base_weight: float,
+        z_lin: np.ndarray,
+        z_mamba: np.ndarray,
+        *,
+        r_squared_threshold: Optional[float] = None,
+        drift_threshold: Optional[float] = None,
+        corr_threshold: Optional[float] = None,
+        sign_disagree_threshold: Optional[float] = None,
+        min_stable_updates: Optional[int] = None,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Compute quality-adaptive blend weight.
+        
+        Down-weights the linear model when:
+        - R² is weak or negative
+        - Coefficient drift spikes
+        - Correlation with Mamba collapses
+        - Sign disagreement is high
+        
+        Args:
+            base_weight: Policy-controlled base weight (DECOUPLED from quantile_blend_weight)
+            z_lin: Linear model predictions
+            z_mamba: Original Mamba z-scores
+            r_squared_threshold: Override instance threshold (None = use self.r2_threshold)
+            drift_threshold: Override instance threshold (None = use self.drift_threshold)
+            corr_threshold: Override instance threshold (None = use self.corr_threshold)
+            sign_disagree_threshold: Override instance threshold (None = use self.sign_disagree_threshold)
+            min_stable_updates: Override instance threshold (None = use self.min_stable_updates)
+        
+        Returns:
+            (adaptive_weight, diagnostics_dict)
+        """
+        # Use instance thresholds as defaults, allow runtime overrides
+        r_squared_threshold = r_squared_threshold if r_squared_threshold is not None else self.r2_threshold
+        drift_threshold = drift_threshold if drift_threshold is not None else self.drift_threshold
+        corr_threshold = corr_threshold if corr_threshold is not None else self.corr_threshold
+        sign_disagree_threshold = sign_disagree_threshold if sign_disagree_threshold is not None else self.sign_disagree_threshold
+        min_stable_updates = min_stable_updates if min_stable_updates is not None else self.min_stable_updates
+        
+        # Start with base weight
+        w = float(base_weight)
+        diagnostics = {}
+        
+        # If model not ready, return zero weight
+        if not self.is_ready():
+            return 0.0, {"reason": "model_not_ready", "adaptive_weight": 0.0}
+        
+        # Compute current quality metrics
+        diag = self.get_daily_diagnostics(z_lin, z_mamba)
+        current_corr = diag.get("corr_z_lin_z_mamba", 0.0)
+        current_sign_disagree = diag.get("sign_disagreement_frac", 1.0)
+        
+        # Get model R²
+        current_r_squared = float(self.model.r_squared_)
+        
+        # Get recent drift (from last refit)
+        current_drift = self._drift_history[-1] if len(self._drift_history) > 0 else 0.0
+        
+        # Track quality metrics
+        self._r_squared_history.append(current_r_squared)
+        self._corr_history.append(current_corr)
+        self._sign_disagree_history.append(current_sign_disagree)
+        
+        # Trim to window
+        if len(self._r_squared_history) > self._quality_window:
+            self._r_squared_history = self._r_squared_history[-self._quality_window:]
+            self._corr_history = self._corr_history[-self._quality_window:]
+            self._sign_disagree_history = self._sign_disagree_history[-self._quality_window:]
+        
+        # Quality gates (multiplicative penalties)
+        penalties = []
+        reasons = []
+        
+        # 1) R² penalty
+        if current_r_squared < r_squared_threshold:
+            r2_penalty = float(np.clip(current_r_squared / r_squared_threshold, 0.0, 1.0))
+            penalties.append(r2_penalty)
+            reasons.append(f"low_r2={current_r_squared:.3f}")
+            diagnostics["r_squared_penalty"] = r2_penalty
+        
+        # 2) Drift penalty
+        if current_drift > drift_threshold:
+            drift_penalty = float(np.clip(drift_threshold / (current_drift + 1e-8), 0.0, 1.0))
+            penalties.append(drift_penalty)
+            reasons.append(f"high_drift={current_drift:.3f}")
+            diagnostics["drift_penalty"] = drift_penalty
+        
+        # 3) Correlation penalty
+        if current_corr < corr_threshold:
+            corr_penalty = float(np.clip(current_corr / corr_threshold, 0.0, 1.0))
+            penalties.append(corr_penalty)
+            reasons.append(f"low_corr={current_corr:.3f}")
+            diagnostics["corr_penalty"] = corr_penalty
+        
+        # 4) Sign disagreement penalty
+        if current_sign_disagree > sign_disagree_threshold:
+            sign_penalty = float(np.clip((1.0 - current_sign_disagree) / (1.0 - sign_disagree_threshold), 0.0, 1.0))
+            penalties.append(sign_penalty)
+            reasons.append(f"high_sign_disagree={current_sign_disagree:.3f}")
+            diagnostics["sign_disagree_penalty"] = sign_penalty
+        
+        # 5) Stability gate: require min_stable_updates before trusting
+        if self._n_updates < min_stable_updates:
+            stability_mult = float(self._n_updates) / float(min_stable_updates)
+            penalties.append(stability_mult)
+            reasons.append(f"warmup={self._n_updates}/{min_stable_updates}")
+            diagnostics["stability_penalty"] = stability_mult
+        
+        # Apply all penalties multiplicatively
+        if len(penalties) > 0:
+            combined_penalty = float(np.prod(penalties))
+            w = w * combined_penalty
+            diagnostics["combined_penalty"] = combined_penalty
+            diagnostics["penalties_applied"] = reasons
+        
+        # Final clamp
+        w = float(np.clip(w, 0.0, 1.0))
+        
+        diagnostics.update({
+            "base_weight": float(base_weight),
+            "adaptive_weight": w,
+            "current_r_squared": current_r_squared,
+            "current_drift": current_drift,
+            "current_corr": current_corr,
+            "current_sign_disagree": current_sign_disagree,
+            "n_updates": self._n_updates,
+        })
+        
+        return w, diagnostics
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize state for persistence.
+        
+        FIX Gap D: Persist training buffer (X, y, day_idx) for warm restarts.
+        """
+        # Concatenate buffer samples for compact storage
+        buffer_X = np.vstack(self._X_train) if len(self._X_train) > 0 else None
+        buffer_y = np.concatenate(self._y_train) if len(self._y_train) > 0 else None
+        buffer_days = np.array(self._day_idx_train, dtype=int) if len(self._day_idx_train) > 0 else None
+        
+        # Track sample counts per day for reconstruction
+        sample_counts = [len(y) for y in self._y_train] if len(self._y_train) > 0 else None
+        
+        return {
+            "horizon": self.horizon,
+            "update_interval": self.update_interval,
+            "ridge_lambda": self.ridge_lambda,
+            "window": self.window,
+            "max_window": self.max_window,
+            "min_samples": self.min_samples,
+            "n_updates": self._n_updates,
+            "last_fit_day": self._last_fit_day,
+            "beta": self.model.beta_.tolist() if self.model.beta_ is not None else None,
+            "intercept": float(self.model.intercept_),
+            "mean": self.model.mean_.tolist() if self.model.mean_ is not None else None,
+            "std": self.model.std_.tolist() if self.model.std_ is not None else None,
+            "r_squared": float(self.model.r_squared_),
+            "n_samples": int(self.model.n_samples_),
+            "feature_names": list(ALL_FEATURE_NAMES),
+            # Buffer persistence (Gap D fix)
+            "buffer_X": buffer_X.tolist() if buffer_X is not None else None,
+            "buffer_y": buffer_y.tolist() if buffer_y is not None else None,
+            "buffer_days": buffer_days.tolist() if buffer_days is not None else None,
+            "buffer_sample_counts": sample_counts,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "LinearCombinerState":
+        """Deserialize state from persistence.
+        
+        FIX Gap D: Restore training buffer for warm restarts.
+        """
+        state = cls(
+            horizon=int(data.get("horizon", 21)),
+            update_interval=int(data.get("update_interval", 21)),
+            ridge_lambda=float(data.get("ridge_lambda", 10.0)),
+            window=int(data.get("window", 126)),
+            max_window=int(data.get("max_window", 252)),
+            min_samples=int(data.get("min_samples", 63)),
+        )
+        
+        state._n_updates = int(data.get("n_updates", 0))
+        state._last_fit_day = int(data.get("last_fit_day", -1))
+        
+        # Restore model
+        if data.get("beta") is not None:
+            state.model.beta_ = np.array(data["beta"], dtype=float)
+            state.model.intercept_ = float(data.get("intercept", 0.0))
+            state.model.mean_ = np.array(data["mean"], dtype=float) if data.get("mean") else None
+            state.model.std_ = np.array(data["std"], dtype=float) if data.get("std") else None
+            state.model.r_squared_ = float(data.get("r_squared", 0.0))
+            state.model.n_samples_ = int(data.get("n_samples", 0))
+        
+        # Restore buffer (Gap D fix)
+        if data.get("buffer_X") is not None and data.get("buffer_y") is not None:
+            buffer_X_flat = np.array(data["buffer_X"], dtype=float)
+            buffer_y_flat = np.array(data["buffer_y"], dtype=float)
+            buffer_days = data.get("buffer_days", [])
+            sample_counts = data.get("buffer_sample_counts", [])
+            
+            if len(buffer_days) == len(sample_counts) and len(buffer_days) > 0:
+                # Reconstruct per-day chunks
+                X_chunks = []
+                y_chunks = []
+                
+                X_offset = 0
+                y_offset = 0
+                for count in sample_counts:
+                    if count > 0:
+                        X_chunk = buffer_X_flat[X_offset:X_offset + count, :]
+                        y_chunk = buffer_y_flat[y_offset:y_offset + count]
+                        X_chunks.append(X_chunk)
+                        y_chunks.append(y_chunk)
+                        X_offset += count
+                        y_offset += count
+                
+                state._X_train = X_chunks
+                state._y_train = y_chunks
+                state._day_idx_train = list(buffer_days)
+        
+        return state
+
+
+def create_linear_combiner(
+    *,
+    horizon: int = 21,
+    update_interval: int = 21,
+    ridge_lambda: float = 10.0,
+    window: int = 126,
+    max_window: int = 252,
+    min_samples: int = 63,
+    time_decay_halflife: int = 42,
+    use_interactions: bool = False,
+    use_sectors: bool = False,
+    sector_map: Optional[Dict[str, str]] = None,
+    symbols: Sequence[str] = (),
+    r2_threshold: float = 0.05,
+    drift_threshold: float = 0.15,
+    corr_threshold: float = 0.3,
+    sign_disagree_threshold: float = 0.4,
+    min_stable_updates: int = 3,
+) -> LinearCombinerState:
+    """Factory function to create LinearCombinerState with config.
+    
+    Args:
+        horizon: Prediction horizon (days)
+        update_interval: Days between refits
+        ridge_lambda: Ridge regularization strength
+        window: Rolling training window size
+        max_window: Maximum samples to retain
+        min_samples: Minimum samples before first fit
+        time_decay_halflife: Exponential decay halflife for time weighting (0 = no decay)
+        use_interactions: Enable interaction features (z_mamba * volatility, etc.)
+        use_sectors: Enable sector indicator features
+        sector_map: Symbol -> sector mapping (required if use_sectors=True)
+        symbols: Symbol list (for feature builder)
+        r2_threshold: Minimum acceptable R² for quality gating (default: 0.05)
+        drift_threshold: Maximum acceptable coefficient drift (default: 0.15)
+        corr_threshold: Minimum acceptable correlation with Mamba (default: 0.3)
+        sign_disagree_threshold: Maximum acceptable sign disagreement (default: 0.4)
+        min_stable_updates: Require N stable updates before trusting model (default: 3)
+    
+    Returns:
+        Configured LinearCombinerState
+    """
+    feature_builder = LinearFeatureBuilder(
+        symbols=list(symbols),
+        use_interactions=use_interactions,
+        use_sectors=use_sectors,
+        sector_map=sector_map,
+    )
+    
+    # n_features is updated in __post_init__ based on enabled features
+    model = RidgeModel(
+        n_features=feature_builder.n_features,
+        lambda_=ridge_lambda,
+    )
+    
+    return LinearCombinerState(
+        horizon=horizon,
+        update_interval=update_interval,
+        ridge_lambda=ridge_lambda,
+        window=window,
+        max_window=max_window,
+        min_samples=min_samples,
+        time_decay_halflife=time_decay_halflife,
+        feature_builder=feature_builder,
+        model=model,
+        r2_threshold=r2_threshold,
+        drift_threshold=drift_threshold,
+        corr_threshold=corr_threshold,
+        sign_disagree_threshold=sign_disagree_threshold,
+        min_stable_updates=min_stable_updates,
+    )

@@ -4,7 +4,7 @@ import json
 import logging
 import hashlib
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -21,9 +21,55 @@ from src.stage_b.sequence_models import (
     build_master_arrays,
     build_sequence_data,
     train_mamba_fold,
+    # Level 2: Cross-Section Mamba
+    CrossSectionSequenceData,
+    build_cross_section_data,
+    CrossSectionMamba,
+    train_cross_section_mamba,
+    CrossSectionInferenceBuffer,
+    compute_vram_requirements,
+    # Multi-Horizon (Workstream 6)
+    MultiHorizonSequenceData,
+    MultiHorizonMambaRegressor,
+    train_multi_horizon_mamba,
+    build_multi_horizon_data,
 )
 from src.stage_b_stateful.maturity import maturity_cutoff
-from src.portfolio.policy_controller import PolicyAction, PolicyController
+from src.stage_b_stateful.mamba_calibration import (
+    MambaCalibrationTracker,
+    MambaCalibrationSnapshot,
+    create_mamba_calibration_tracker,
+    MAMBA_CALIB_WINDOW,
+)
+from src.stage_b_stateful.governance_persistence import (
+    GovernanceStateKey,
+    make_state_key,
+    save_mamba_calibration_state,
+    load_mamba_calibration_state,
+    save_online_learning_state,
+    load_online_learning_state,
+)
+from src.portfolio.policy_controller import (
+    PolicyAction,
+    PolicyController,
+    POLICY_STATE_DIM_V2,
+    build_default_policy_actions_v2,
+)
+from src.portfolio.linear_alpha_combiner import (
+    LinearCombinerState,
+    LinearFeatureBuilder,
+    RidgeModel,
+    create_linear_combiner,
+    ALL_FEATURE_NAMES,
+)
+from src.portfolio.linear_alpha_persistence import (
+    save_linear_combiner_state,
+    load_linear_combiner_state,
+)
+from src.features.symbol_graph_context import (
+    build_sgc_for_multi_symbol,
+    get_symbol_graph_context_columns,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -339,6 +385,244 @@ def _effective_n_bets_from_weights(w: np.ndarray) -> float:
         return 0.0
     return float((gross * gross) / denom)
 
+
+# ---------------------------------------------------------------------------
+# HF Block Confidence Synthesis (Phase-2 Intermediate Step)
+# ---------------------------------------------------------------------------
+# HF blocks sit BETWEEN Mamba inference and portfolio allocation.
+# They annotate, NOT replace. They cannot flip Mamba direction.
+#
+# Architecture:
+#   1. Load base family parquets
+#   2. Run Mamba → z_mamba(t)
+#   3. Load HF block parquets  ← HF synthesis starts here
+#   4. Compute stateful confidence & stress
+#   5. Produce final signal package
+#   6. Hand off to portfolio engine
+#
+# HF blocks are model outputs (meta-opinions), NOT features.
+# They do NOT participate in feature_roles.py.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HFBlockContext:
+    """HF block synthesis context for a single day.
+    
+    Contains aggregated confidence and optional stress from HF blocks.
+    Used to modulate z_mamba → z_final without flipping direction.
+    """
+    # Aggregated confidence from all HF blocks
+    confidence: np.ndarray  # shape (n_symbols,), in [0, 1]
+    # Disagreement penalty (1.0 = full agreement, <1.0 = disagreement)
+    agreement_factor: np.ndarray  # shape (n_symbols,), in [0, 1]
+    # Final exposure scaler: alpha = confidence * agreement_factor
+    alpha: np.ndarray  # shape (n_symbols,), in [alpha_min, 1.0]
+    # HF uncertainty as stress (1 - confidence * agreement)
+    hf_stress: np.ndarray  # shape (n_symbols,), in [0, 1]
+    # Symbol list for alignment
+    symbols: List[str]
+
+
+def _load_hf_merged_panel(
+    symbol: str,
+    horizon: int,
+    *,
+    hf_blocks: Sequence[str] = ("tech_micro_hf", "forecast_hf"),
+) -> Optional[pd.DataFrame]:
+    """Load the HF merged parquet for a symbol/horizon.
+    
+    Returns DataFrame with columns: {block}_score, {block}_conf for each HF block.
+    Returns None if not available.
+    """
+    from src.cache_paths import symbol_hf_merged_path, hf_block_path, hf_block_horizon_path
+    
+    merged_path = symbol_hf_merged_path(symbol, horizon)
+    if merged_path.exists():
+        try:
+            return pd.read_parquet(merged_path)
+        except Exception:
+            pass
+    
+    # Fallback: load individual HF blocks and merge
+    dfs = []
+    for block in hf_blocks:
+        # Try horizon-specific first (for horizon-bound blocks like forecast_hf)
+        p = hf_block_horizon_path(symbol, horizon, block)
+        if not p.exists():
+            # Fall back to horizon-invariant
+            p = hf_block_path(symbol, block)
+        if p.exists():
+            try:
+                df = pd.read_parquet(p)
+                # Rename columns to have block prefix if not already
+                cols_map = {}
+                for c in df.columns:
+                    if not str(c).startswith(block):
+                        if c in ("score", "conf", "confidence", "score_raw"):
+                            cols_map[c] = f"{block}_{c}"
+                if cols_map:
+                    df = df.rename(columns=cols_map)
+                dfs.append(df)
+            except Exception:
+                continue
+    
+    if not dfs:
+        return None
+    
+    # Merge on index
+    result = dfs[0]
+    for df in dfs[1:]:
+        result = result.join(df, how="outer", rsuffix="_dup")
+    return result
+
+
+def _synthesize_hf_confidence(
+    hf_panels: Dict[str, pd.DataFrame],
+    day: pd.Timestamp,
+    symbols: Sequence[str],
+    *,
+    hf_blocks: Sequence[str] = ("tech_micro_hf", "forecast_hf"),
+    block_weights: Optional[Dict[str, float]] = None,
+    disagreement_k: float = 2.0,
+    alpha_min: float = 0.15,
+) -> HFBlockContext:
+    """Synthesize HF block confidence for a single day.
+    
+    HF blocks provide meta-opinions (score, confidence) that modulate exposure.
+    They NEVER flip Mamba direction — only scale it down via alpha.
+    
+    Formal math:
+        C_i(t) = Σ(w_b × c_i^b(t))  # weighted confidence
+        Δs_i(t) = |s_i^a(t) - s_i^b(t)|  # disagreement (pairwise)
+        P_i(t) = exp(-k × max_disagreement)  # penalty
+        Ĉ_i(t) = C_i(t) × P_i(t)  # final confidence
+        α_i(t) = clamp(Ĉ_i(t), α_min, 1.0)  # exposure scaler
+        z_final(t) = α_i(t) × z_mamba(t)
+    
+    Properties:
+        - sign(z_final) = sign(z_mamba) always
+        - HF blocks cannot flip direction
+        - Worst case: exposure shrinks toward zero
+    """
+    n = len(symbols)
+    
+    # Default weights if not provided
+    if block_weights is None:
+        n_blocks = len(hf_blocks)
+        block_weights = {b: 1.0 / n_blocks for b in hf_blocks}
+    
+    # Normalize weights
+    w_total = sum(block_weights.values())
+    if w_total > 0:
+        block_weights = {b: w / w_total for b, w in block_weights.items()}
+    
+    # Extract per-symbol scores and confidences
+    scores_by_block: Dict[str, np.ndarray] = {}
+    confs_by_block: Dict[str, np.ndarray] = {}
+    
+    for block in hf_blocks:
+        scores = np.full(n, 0.5, dtype=float)  # neutral default
+        confs = np.zeros(n, dtype=float)  # zero confidence if missing
+        
+        for j, sym in enumerate(symbols):
+            sym_upper = str(sym).upper()
+            panel = hf_panels.get(sym_upper)
+            if panel is None or panel.empty:
+                continue
+            
+            # Get row for this day
+            if day in panel.index:
+                row = panel.loc[day]
+            else:
+                # Try closest earlier date
+                mask = panel.index <= day
+                if mask.any():
+                    row = panel.loc[panel.index[mask][-1]]
+                else:
+                    continue
+            
+            # Extract score and confidence
+            score_col = f"{block}_score"
+            conf_col = f"{block}_conf"
+            if conf_col not in row.index:
+                conf_col = f"{block}_confidence"
+            
+            if score_col in row.index:
+                val = float(row[score_col])
+                if np.isfinite(val):
+                    scores[j] = np.clip(val, 0.0, 1.0)
+            if conf_col in row.index:
+                val = float(row[conf_col])
+                if np.isfinite(val):
+                    confs[j] = np.clip(val, 0.0, 1.0)
+        
+        scores_by_block[block] = scores
+        confs_by_block[block] = confs
+    
+    # Weighted confidence aggregation
+    # C_i(t) = Σ(w_b × c_i^b(t))
+    confidence = np.zeros(n, dtype=float)
+    for block in hf_blocks:
+        w = block_weights.get(block, 0.0)
+        confidence += w * confs_by_block.get(block, np.zeros(n))
+    
+    # Disagreement penalty (optional, recommended)
+    # Δs_i(t) = max over pairs |s_i^a - s_i^b|
+    max_disagreement = np.zeros(n, dtype=float)
+    blocks_list = list(hf_blocks)
+    for i in range(len(blocks_list)):
+        for j in range(i + 1, len(blocks_list)):
+            s_a = scores_by_block.get(blocks_list[i], np.full(n, 0.5))
+            s_b = scores_by_block.get(blocks_list[j], np.full(n, 0.5))
+            disagreement = np.abs(s_a - s_b)
+            max_disagreement = np.maximum(max_disagreement, disagreement)
+    
+    # P_i(t) = exp(-k × Δs_i(t))
+    agreement_factor = np.exp(-disagreement_k * max_disagreement)
+    
+    # Final confidence: Ĉ_i(t) = C_i(t) × P_i(t)
+    final_confidence = confidence * agreement_factor
+    
+    # Exposure scaler: α_i(t) = clamp(Ĉ_i(t), α_min, 1.0)
+    alpha = np.clip(final_confidence, alpha_min, 1.0)
+    
+    # HF stress = 1 - final_confidence (for stress aggregator)
+    hf_stress = 1.0 - final_confidence
+    
+    return HFBlockContext(
+        confidence=confidence,
+        agreement_factor=agreement_factor,
+        alpha=alpha,
+        hf_stress=hf_stress,
+        symbols=list(symbols),
+    )
+
+
+def _apply_hf_modulation(
+    z_mamba: np.ndarray,
+    hf_ctx: HFBlockContext,
+    symbols: Sequence[str],
+) -> np.ndarray:
+    """Apply HF confidence modulation to Mamba z-scores.
+    
+    z_final(t) = α_i(t) × z_mamba(t)
+    
+    CRITICAL: This preserves sign(z_mamba) — HF blocks cannot flip direction.
+    """
+    z = np.asarray(z_mamba, dtype=float).copy()
+    
+    # Build symbol -> index map for HF context
+    hf_idx_map = {str(s).upper(): j for j, s in enumerate(hf_ctx.symbols)}
+    
+    for j, sym in enumerate(symbols):
+        sym_upper = str(sym).upper()
+        hf_j = hf_idx_map.get(sym_upper)
+        if hf_j is not None and hf_j < len(hf_ctx.alpha):
+            z[j] *= hf_ctx.alpha[hf_j]
+    
+    return z
+
+
 # ---------------------------------------------------------------------------
 # Default Phase-2 date blocks (as requested)
 # ---------------------------------------------------------------------------
@@ -351,6 +635,18 @@ DEFAULT_PHASE2_OOS_START = "2021-01-01"
 DEFAULT_PHASE2_OOS_END = "2023-12-31"
 DEFAULT_PHASE2_HOLDOUT_START = "2024-01-01"
 DEFAULT_PHASE2_HOLDOUT_END = "2025-06-20"
+
+# ---------------------------------------------------------------------------
+# Multi-Horizon Training (Workstream 6)
+# ---------------------------------------------------------------------------
+# multi_horizon_mode: when True, trains on multiple horizons simultaneously
+# multi_horizon_set: horizons used for training (short→long for representation learning)
+# multi_horizon_primary: the horizon whose predictions are used for downstream
+#                        (portfolio, policy controller, logging)
+# All other horizons are training-only regularizers.
+DEFAULT_MULTI_HORIZON_MODE = True
+DEFAULT_MULTI_HORIZON_SET = [5, 21, 63, 126]
+DEFAULT_MULTI_HORIZON_PRIMARY = 63
 
 
 @dataclass(frozen=True)
@@ -392,6 +688,10 @@ class Phase2Result:
     preds_by_symbol: Dict[str, pd.Series]
     equity_by_symbol: Dict[str, pd.DataFrame]
     portfolio_equity: pd.DataFrame
+    daily_traces: Optional[List["DailyTracePayload"]] = None  # Per-day trace instrumentation
+    events: Optional[List[Dict[str, Any]]] = None  # Structured events for telemetry
+    event_summary: Optional[str] = None  # Human-readable event summary
+    z_explainer_logs: Optional[List[Dict[str, Any]]] = None  # Daily z-explainer logs with fidelity metrics
 
 
 @dataclass(frozen=True)
@@ -1202,6 +1502,353 @@ def _stateful_predict_batched_across_symbols(
     return {sym: pd.Series(preds_out[sym], index=union_oos_index) for sym in symbols}
 
 
+def _stateful_predict_roll_window_mu_sigma(
+    *,
+    model,
+    device,
+    features_std: np.ndarray,
+    index: pd.DatetimeIndex,
+    oos_pos: np.ndarray,
+    burnin_end_pos: int,
+    seq_len: int,
+    sigma_floor: float = 1e-6,
+    sigma_cap: float = 10.0,
+) -> Tuple[pd.Series, pd.Series]:
+    """Continuous OOS distributional inference with burn-in and no resets.
+
+    Returns both mu (mean prediction) and sigma (uncertainty estimate).
+
+    Implementation detail:
+    - This code treats the model's "state" as the rolling window of the last
+      `seq_len` standardized feature rows.
+    - For models with Gaussian head, returns true sigma from the model.
+    - For scalar head models, returns a proxy sigma.
+    """
+
+    import torch
+
+    if burnin_end_pos < 0:
+        raise ValueError("burnin_end_pos must be >= 0")
+
+    # Burn-in window is the seq_len rows immediately before OOS start.
+    burnin_slice = np.arange(max(0, burnin_end_pos - seq_len + 1), burnin_end_pos + 1)
+    if len(burnin_slice) < seq_len:
+        raise ValueError(f"insufficient burn-in rows: have {len(burnin_slice)}, need {seq_len}")
+
+    buffer = features_std[burnin_slice].copy()  # (seq_len, n_features)
+
+    mu_list: List[float] = []
+    sigma_list: List[float] = []
+    ts_list: List[pd.Timestamp] = []
+
+    # Check if model has predict_distribution method
+    has_predict_dist = hasattr(model, 'predict_distribution') and callable(getattr(model, 'predict_distribution'))
+    has_uncertainty_head = getattr(model, 'has_uncertainty_head', False)
+
+    model.eval()
+    with torch.no_grad():
+        for pos in oos_pos:
+            buffer[:-1] = buffer[1:]
+            buffer[-1] = features_std[pos]
+
+            # Phase-2 failure policy: explicitly fail on non-finite inputs.
+            if not np.isfinite(buffer).all():
+                ts_str = str(index[pos])
+                raise NonFiniteError(f"Non-finite detected: state_buffer symbol=? ts={ts_str}")
+
+            x = torch.from_numpy(buffer[None, :, :]).to(device)
+
+            if has_predict_dist:
+                # Use predict_distribution for proper mu/sigma extraction
+                mu_t, sigma_t = model.predict_distribution(x, sigma_floor=sigma_floor, sigma_cap=sigma_cap)
+                if not (torch.isfinite(mu_t).all() and torch.isfinite(sigma_t).all()):
+                    ts_str = str(index[pos])
+                    raise NonFiniteError(f"Non-finite detected: predict_distribution output ts={ts_str}")
+                mu = float(mu_t.detach().float().cpu().numpy().reshape(-1)[0])
+                sigma = float(sigma_t.detach().float().cpu().numpy().reshape(-1)[0])
+            elif has_uncertainty_head:
+                # Model returns (mu, log_var) - extract manually
+                y_t = model(x)
+                if not torch.isfinite(y_t).all():
+                    ts_str = str(index[pos])
+                    raise NonFiniteError(f"Non-finite detected: model_output ts={ts_str}")
+                if y_t.ndim == 2 and y_t.shape[1] == 2:
+                    mu = float(y_t[0, 0].detach().float().cpu().numpy())
+                    log_var = float(y_t[0, 1].detach().float().cpu().numpy())
+                    var = float(np.clip(np.exp(log_var), sigma_floor**2, sigma_cap**2))
+                    sigma = float(np.sqrt(var + sigma_floor))
+                else:
+                    mu = float(y_t.detach().float().cpu().numpy().reshape(-1)[0])
+                    sigma = 0.02  # Default proxy
+            else:
+                # Scalar head: return mu and proxy sigma
+                y_t = model(x)
+                if not torch.isfinite(y_t).all():
+                    ts_str = str(index[pos])
+                    raise NonFiniteError(f"Non-finite detected: model_output ts={ts_str}")
+                mu = float(y_t.detach().float().cpu().numpy().reshape(-1)[0])
+                sigma = 0.02  # Default proxy ~2% daily vol
+
+            mu_list.append(mu)
+            sigma_list.append(sigma)
+            ts_list.append(index[pos])
+
+    ts_index = pd.DatetimeIndex(ts_list)
+    return pd.Series(mu_list, index=ts_index), pd.Series(sigma_list, index=ts_index)
+
+
+def _stateful_predict_multi_horizon_primary(
+    *,
+    model: "MultiHorizonMambaRegressor",
+    device: "torch.device",
+    primary_horizon: int,
+    features_std_by_symbol: Mapping[str, np.ndarray],
+    index_by_symbol: Mapping[str, pd.DatetimeIndex],
+    union_oos_index: pd.DatetimeIndex,
+    burnin_end_ts: pd.Timestamp,
+    seq_len: int,
+) -> Tuple[Dict[str, pd.Series], Dict[str, pd.Series]]:
+    """Stateful inference for multi-horizon model using only the primary horizon.
+    
+    The multi-horizon model is trained on multiple horizons simultaneously, but
+    at inference time we only use the primary horizon (e.g., 63 days) for
+    downstream portfolio construction and policy controller.
+    
+    This keeps the interface identical to single-horizon inference, ensuring
+    zero changes to portfolio logic.
+    
+    Args:
+        model: MultiHorizonMambaRegressor trained on multiple horizons
+        device: PyTorch device
+        primary_horizon: The horizon (in days) to use for predictions (e.g., 63)
+        features_std_by_symbol: Standardized features per symbol
+        index_by_symbol: DatetimeIndex per symbol
+        union_oos_index: Union OOS index across symbols
+        burnin_end_ts: End of burn-in period
+        seq_len: Sequence length
+        
+    Returns:
+        Tuple of (preds_by_symbol, sigma_by_symbol) - same format as single-horizon
+    """
+    import torch
+    
+    symbols = [str(s).upper() for s in features_std_by_symbol.keys()]
+    if not symbols:
+        raise ValueError("no symbols for multi-horizon inference")
+    
+    # Validate dimensions
+    feat_dims = {features_std_by_symbol[s].shape[1] for s in symbols}
+    if len(feat_dims) != 1:
+        raise ValueError(f"feature_dim mismatch across symbols: {feat_dims}")
+    feature_dim = int(next(iter(feat_dims)))
+    
+    # Build initial burn-in buffers
+    init_buffers: List[np.ndarray] = []
+    for sym in symbols:
+        idx = index_by_symbol[sym]
+        feats = features_std_by_symbol[sym]
+        pos = np.where((idx <= burnin_end_ts).to_numpy() if hasattr(idx <= burnin_end_ts, "to_numpy") else np.asarray(idx <= burnin_end_ts))[0]
+        if len(pos) < seq_len:
+            raise ValueError(f"insufficient burn-in rows for {sym}: have {len(pos)}, need {seq_len}")
+        burnin_slice = pos[-seq_len:]
+        buf = feats[burnin_slice]
+        init_buffers.append(buf)
+    
+    buffer = torch.from_numpy(np.stack(init_buffers, axis=0)).to(device)  # (B, L, F)
+    
+    # Precompute per-symbol date->row maps
+    maps: Dict[str, Dict[pd.Timestamp, int]] = {}
+    for sym in symbols:
+        idx = index_by_symbol[sym]
+        maps[sym] = {pd.Timestamp(t): int(i) for i, t in enumerate(idx)}
+    
+    # Output arrays
+    mu_out = {sym: np.full(len(union_oos_index), 0.0, dtype=np.float32) for sym in symbols}
+    sigma_out = {sym: np.full(len(union_oos_index), 0.02, dtype=np.float32) for sym in symbols}
+    
+    model.eval()
+    with torch.no_grad():
+        for t_i, ts in enumerate(union_oos_index):
+            # Build x_t for all symbols
+            x_np = np.zeros((len(symbols), feature_dim), dtype=np.float32)
+            has_row = np.zeros(len(symbols), dtype=bool)
+            for s_i, sym in enumerate(symbols):
+                row = maps[sym].get(pd.Timestamp(ts))
+                if row is None:
+                    continue
+                x_np[s_i] = features_std_by_symbol[sym][row]
+                has_row[s_i] = True
+            
+            x_t = torch.from_numpy(x_np).to(device)
+            
+            # Update rolling buffers for symbols with data
+            if has_row.any():
+                mask = torch.from_numpy(has_row).to(device)
+                buf_m = buffer[mask]
+                buf_m[:, :-1, :] = buf_m[:, 1:, :]
+                buf_m[:, -1, :] = x_t[mask]
+                buffer[mask] = buf_m
+            
+            # Query model for primary horizon only
+            # model.query(x, horizon) returns (mu, sigma) for that horizon
+            mu_t, sigma_t = model.query(buffer, primary_horizon)
+            
+            mu_arr = mu_t.detach().float().cpu().numpy().reshape(-1)
+            sigma_arr = sigma_t.detach().float().cpu().numpy().reshape(-1)
+            
+            # Store predictions
+            for s_i, sym in enumerate(symbols):
+                if has_row[s_i]:
+                    mu_out[sym][t_i] = float(mu_arr[s_i])
+                    sigma_out[sym][t_i] = float(np.clip(sigma_arr[s_i], 1e-6, 10.0))
+    
+    # Convert to Series
+    preds_by_symbol = {
+        sym: pd.Series(mu_out[sym], index=union_oos_index)
+        for sym in symbols
+    }
+    sigma_by_symbol = {
+        sym: pd.Series(sigma_out[sym], index=union_oos_index)
+        for sym in symbols
+    }
+    
+    return preds_by_symbol, sigma_by_symbol
+
+
+def _stateful_predict_batched_mu_sigma(
+    *,
+    model,
+    device,
+    features_std_by_symbol: Mapping[str, np.ndarray],
+    index_by_symbol: Mapping[str, pd.DatetimeIndex],
+    union_oos_index: pd.DatetimeIndex,
+    burnin_end_ts: pd.Timestamp,
+    seq_len: int,
+    sigma_floor: float = 1e-6,
+    sigma_cap: float = 10.0,
+) -> Tuple[Dict[str, pd.Series], Dict[str, pd.Series]]:
+    """Stateful distributional inference batched across symbols.
+
+    Returns both mu (mean predictions) and sigma (uncertainty estimates) per symbol.
+
+    Model state is the rolling buffer per symbol, stored as a tensor of shape:
+      buffer: (B, seq_len, F)
+    where B = number of symbols.
+
+    For missing rows on a given day, feed zeros (neutral) so we don't trade.
+    """
+
+    import torch
+
+    symbols = [str(s).upper() for s in features_std_by_symbol.keys()]
+    if not symbols:
+        raise ValueError("no symbols for batched inference")
+
+    # Validate dimensions and feature dims are consistent.
+    feat_dims = {features_std_by_symbol[s].shape[1] for s in symbols}
+    if len(feat_dims) != 1:
+        raise ValueError(f"feature_dim mismatch across symbols: {feat_dims}")
+    feature_dim = int(next(iter(feat_dims)))
+
+    # Build initial burn-in buffers for each symbol using the last seq_len rows <= burnin_end_ts.
+    init_buffers: List[np.ndarray] = []
+    for sym in symbols:
+        idx = index_by_symbol[sym]
+        feats = features_std_by_symbol[sym]
+        # Positions up to burnin_end_ts.
+        pos = np.where((idx <= burnin_end_ts).to_numpy() if hasattr(idx <= burnin_end_ts, "to_numpy") else np.asarray(idx <= burnin_end_ts))[0]
+        if len(pos) < seq_len:
+            raise ValueError(f"insufficient burn-in rows for {sym}: have {len(pos)}, need {seq_len}")
+        burnin_slice = pos[-seq_len:]
+        buf = feats[burnin_slice]
+        if buf.shape != (seq_len, feature_dim):
+            raise ValueError(f"burn-in buffer shape mismatch for {sym}: {buf.shape}")
+        init_buffers.append(buf)
+
+    buffer = torch.from_numpy(np.stack(init_buffers, axis=0)).to(device)  # (B, L, F)
+
+    # Precompute per-symbol date->row maps for fast gather.
+    maps: Dict[str, Dict[pd.Timestamp, int]] = {}
+    for sym in symbols:
+        idx = index_by_symbol[sym]
+        maps[sym] = {pd.Timestamp(t): int(i) for i, t in enumerate(idx)}
+
+    # Output arrays
+    mu_out = {sym: np.full(len(union_oos_index), 0.0, dtype=np.float32) for sym in symbols}
+    sigma_out = {sym: np.full(len(union_oos_index), 0.02, dtype=np.float32) for sym in symbols}
+
+    # Check if model has predict_distribution method
+    has_predict_dist = hasattr(model, 'predict_distribution') and callable(getattr(model, 'predict_distribution'))
+    has_uncertainty_head = getattr(model, 'has_uncertainty_head', False)
+
+    model.eval()
+    with torch.no_grad():
+        for t_i, ts in enumerate(union_oos_index):
+            # Build x_t for all symbols.
+            x_np = np.zeros((len(symbols), feature_dim), dtype=np.float32)
+            has_row = np.zeros(len(symbols), dtype=bool)
+            for s_i, sym in enumerate(symbols):
+                row = maps[sym].get(pd.Timestamp(ts))
+                if row is None:
+                    continue
+                x_np[s_i] = features_std_by_symbol[sym][row]
+                has_row[s_i] = True
+
+            if has_row.any() and (not np.isfinite(x_np[has_row]).all()):
+                raise NonFiniteError(f"Non-finite detected: x_t_batched ts={ts}")
+
+            x_t = torch.from_numpy(x_np).to(device)
+
+            # Update rolling buffers only for symbols that have data for this timestamp.
+            if has_row.any():
+                mask = torch.from_numpy(has_row).to(device)
+                buf_m = buffer[mask]
+                buf_m[:, :-1, :] = buf_m[:, 1:, :]
+                buf_m[:, -1, :] = x_t[mask]
+                buffer[mask] = buf_m
+
+            if has_predict_dist:
+                # Use predict_distribution for proper mu/sigma extraction
+                mu_t, sigma_t = model.predict_distribution(buffer, sigma_floor=sigma_floor, sigma_cap=sigma_cap)
+                if not (torch.isfinite(mu_t).all() and torch.isfinite(sigma_t).all()):
+                    raise NonFiniteError(f"Non-finite detected: predict_distribution output ts={ts}")
+                mu_arr = mu_t.detach().float().cpu().numpy().reshape(-1)
+                sigma_arr = sigma_t.detach().float().cpu().numpy().reshape(-1)
+            elif has_uncertainty_head:
+                # Model returns (mu, log_var) - extract manually
+                y_t = model(buffer)
+                if not torch.isfinite(y_t).all():
+                    raise NonFiniteError(f"Non-finite detected: model_output_batched ts={ts}")
+                if y_t.ndim == 2 and y_t.shape[1] == 2:
+                    mu_arr = y_t[:, 0].detach().float().cpu().numpy().reshape(-1)
+                    log_var_arr = y_t[:, 1].detach().float().cpu().numpy().reshape(-1)
+                    var_arr = np.clip(np.exp(log_var_arr), sigma_floor**2, sigma_cap**2)
+                    sigma_arr = np.sqrt(var_arr + sigma_floor)
+                else:
+                    mu_arr = y_t.detach().float().cpu().numpy().reshape(-1)
+                    sigma_arr = np.full_like(mu_arr, 0.02)
+            else:
+                # Scalar head: return mu and proxy sigma
+                y_t = model(buffer)
+                if not torch.isfinite(y_t).all():
+                    raise NonFiniteError(f"Non-finite detected: model_output_batched ts={ts}")
+                mu_arr = y_t.detach().float().cpu().numpy().reshape(-1)
+                sigma_arr = np.full_like(mu_arr, 0.02)
+
+            for s_i, sym in enumerate(symbols):
+                if not has_row[s_i]:
+                    mu_out[sym][t_i] = 0.0
+                    sigma_out[sym][t_i] = 0.02  # Default proxy
+                else:
+                    mu_out[sym][t_i] = float(mu_arr[s_i])
+                    sigma_out[sym][t_i] = float(sigma_arr[s_i])
+
+    return (
+        {sym: pd.Series(mu_out[sym], index=union_oos_index) for sym in symbols},
+        {sym: pd.Series(sigma_out[sym], index=union_oos_index) for sym in symbols},
+    )
+
+
 def _evaluate_phase2_stateful_symbol_once(
     *,
     best_trial_json: Path,
@@ -1358,6 +2005,20 @@ def _evaluate_phase2_stateful_symbol_once(
     if track_c is None or track_c.empty:
         raise ValueError("Track C is empty")
 
+    # HYGIENE GUARD: Block governance columns from model inputs (suffix-based)
+    # These columns are for data quality tracking, NOT predictive features.
+    gov_suffixes = (
+        "_has_data", "_activity", "_days_since_update", 
+        "_source_asof_ts", "_confidence", "_conf"
+    )
+    bad_cols = [c for c in track_c.columns if str(c).endswith(gov_suffixes)]
+    if bad_cols:
+        raise ValueError(
+            f"GOVERNANCE LEAKAGE DETECTED: {len(bad_cols)} columns with governance suffixes found in model inputs.\n"
+            f"First 50: {bad_cols[:50]}\n"
+            f"These columns must be excluded before Stage-B. Check feature_roles.py classification."
+        )
+
     seq_len = int(cfg.get("mamba_seq_len", 128))
 
     # Pooled scaler stats (single symbol here, but keep same API).
@@ -1428,6 +2089,26 @@ def _evaluate_phase2_stateful_symbol_once(
     )
     _assert_finite_series(name="preds", symbol=str(symbol).upper(), s=preds)
 
+    # Try to get model sigma using the new mu_sigma inference
+    model_sigma: Optional[pd.Series] = None
+    head_type = str(cfg.get("mamba_head_type", "linear")).lower()
+    if head_type in ("gaussian", "uncertainty", "gaussian_nll"):
+        try:
+            _, model_sigma = _stateful_predict_roll_window_mu_sigma(
+                model=model,
+                device=device,
+                features_std=features_std,
+                index=index,
+                oos_pos=oos_pos,
+                burnin_end_pos=burnin_end_pos,
+                seq_len=seq_len,
+                sigma_floor=float(cfg.get("phase2_sigma_floor_base", 1e-6)),
+                sigma_cap=float(cfg.get("phase2_sigma_cap", 10.0)),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to get model sigma, using proxy: {e}")
+            model_sigma = None
+
     # Build preds_df and evaluate with Stage-B backtest engine (frozen decision logic).
     price_data = pipeline._get_price_data_for_horizon(int(horizon))
     if price_data is None or price_data.empty:
@@ -1443,13 +2124,26 @@ def _evaluate_phase2_stateful_symbol_once(
     preds_df["actual_return"] = actual_returns
     preds_df["mu_hat"] = preds.astype(float)
 
-    # Derive probability proxy and sigma proxy like StageBPipeline.
+    # Derive probability proxy and sigma
+    # Use true model sigma if available, otherwise fall back to realized volatility proxy
     sigma_proxy = actual_returns.abs().rolling(window=max(5, int(horizon))).std().fillna(0.02).clip(lower=1e-4)
-    denom = sigma_proxy.replace(0.0, np.nan).fillna(0.02)
+    
+    if model_sigma is not None:
+        # Use true model sigma (calibrated)
+        sigma_hat = model_sigma.reindex(preds.index).clip(lower=1e-6, upper=10.0)
+        # Fill any missing/non-finite with proxy
+        sigma_hat = sigma_hat.where(sigma_hat.notna() & np.isfinite(sigma_hat), sigma_proxy)
+        preds_df["sigma_hat"] = sigma_hat
+        preds_df["sigma_source"] = "model"
+    else:
+        # Use proxy sigma
+        preds_df["sigma_hat"] = sigma_proxy
+        preds_df["sigma_source"] = "proxy"
+    
+    denom = preds_df["sigma_hat"].replace(0.0, np.nan).fillna(0.02)
     logits = (preds / denom).clip(-8, 8)
     probs = 1.0 / (1.0 + np.exp(-logits))
     preds_df["p_up"] = probs.clip(0.0, 1.0)
-    preds_df["sigma_hat"] = sigma_proxy
     # Confidence proxy in [0,1]: closer to 0.5 => low confidence.
     preds_df["rho"] = (preds_df["p_up"] - 0.5).abs().mul(2.0).clip(0.0, 1.0)
     preds_df["drift_flag"] = 0.0
@@ -1805,6 +2499,78 @@ def _build_trackc_multi_symbol(
         )
         post_std_weights_by[sym] = (np.asarray(post_w, dtype=np.float32), list(post_cols))
 
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Symbol Graph Context (cross-sectional embeddings + neighbor features)
+    # Runs AFTER Track-C is built, using the ActiveUniverse(t) = syms + anchor ETFs
+    # ─────────────────────────────────────────────────────────────────────────────
+    sgc_enabled = bool(cfg.get("sgc_enabled", True))
+    if sgc_enabled and len(syms) >= 2:
+        try:
+            # Extract price series (close) from panels for correlation adjacency
+            price_series_by_symbol: Dict[str, pd.Series] = {}
+            for sym in syms:
+                pnl = panels.get(sym)
+                if pnl is not None and "ohlcv_close" in pnl.columns:
+                    price_series_by_symbol[sym] = pnl["ohlcv_close"].copy()
+                elif pnl is not None and "close" in pnl.columns:
+                    price_series_by_symbol[sym] = pnl["close"].copy()
+
+            # Extract optional sector/group map for sector adjacency blending
+            group_map_by_symbol: Optional[Dict[str, str]] = None
+            group_map_path = cfg.get("phase2_symbol_group_map_path")
+            if group_map_path:
+                try:
+                    gmap_df = pd.read_csv(str(group_map_path))
+                    if "symbol" in gmap_df.columns and "group" in gmap_df.columns:
+                        group_map_by_symbol = dict(zip(
+                            gmap_df["symbol"].astype(str).str.upper(),
+                            gmap_df["group"].astype(str),
+                        ))
+                except Exception as gmap_err:
+                    logger.debug(f"[SGC] Failed to load group map: {gmap_err}")
+
+            # Build the SGC panel for all active symbols using multi-symbol builder
+            sgc_panel = build_sgc_for_multi_symbol(
+                active_symbols=syms,
+                price_series_by_symbol=price_series_by_symbol,
+                group_map_by_symbol=group_map_by_symbol,
+                train_end_date=train_end,
+                corr_window=int(cfg.get("sgc_corr_window", 63)),
+                embed_dim=int(cfg.get("sgc_embed_dim", 8)),
+                top_k=int(cfg.get("sgc_top_k", 10)),
+                sector_blend_weight=float(cfg.get("sgc_sector_blend_weight", 0.3)),
+                temperature_base=float(cfg.get("sgc_temperature_base", 1.0)),
+                regime_aware=bool(cfg.get("sgc_regime_aware", True)),
+                anchor_etfs=list(cfg.get("sgc_anchor_etfs", ["SPY", "QQQ", "IWM", "XLF", "XLE", "XLV", "XLK", "XLI", "XLU", "XLP", "XLY", "TLT", "GLD", "HYG", "VIX", "EEM", "EFA", "DIA"])),
+                cache_dir=str(cfg.get("sgc_cache_dir", "cache/shared/symbol_graph")),
+            )
+
+            # Merge SGC features into each symbol's Track-C
+            sgc_cols = get_symbol_graph_context_columns()
+            if sgc_panel is not None and not sgc_panel.empty:
+                for sym in syms:
+                    tc = trackc_by.get(sym)
+                    if tc is None or tc.empty:
+                        continue
+                    # Filter SGC panel to this symbol
+                    if "symbol" in sgc_panel.columns:
+                        sym_sgc = sgc_panel[sgc_panel["symbol"].astype(str).str.upper() == str(sym).upper()].copy()
+                        sym_sgc = sym_sgc.set_index("date") if "date" in sym_sgc.columns else sym_sgc
+                    else:
+                        sym_sgc = sgc_panel  # Assume already per-symbol
+
+                    # Align to Track-C index (forward-fill for weekly adjacency)
+                    sym_sgc_aligned = sym_sgc.reindex(tc.index, method="ffill")
+                    for col in sgc_cols:
+                        if col in sym_sgc_aligned.columns:
+                            tc[col] = sym_sgc_aligned[col].values
+                    trackc_by[sym] = tc
+
+                n_sgc_cols = len([c for c in sgc_cols if c in trackc_by[syms[0]].columns])
+                logger.info(f"[SGC] ✓ Merged {n_sgc_cols} symbol_graph_context features into Track-C for {len(syms)} symbols")
+        except Exception as sgc_err:
+            logger.warning(f"[SGC] Failed to compute symbol_graph_context: {sgc_err}", exc_info=True)
+
     return pipelines, panels, labels_by, trackc_by, post_std_weights_by, train_pos_by, oos_pos_by
 
 
@@ -2062,6 +2828,19 @@ def _estimate_beta_vector(
 
 
 def _apply_beta_neutralization(w: np.ndarray, beta: np.ndarray, *, max_abs_beta_exposure: float) -> np.ndarray:
+    """Apply HARD beta neutralization with optional exposure cap.
+    
+    This is NOT a "soft guardrail" - it ALWAYS neutralizes beta exposure first,
+    then optionally allows a capped beta exposure if max_abs_beta_exposure > 0.
+    
+    Args:
+        w: Portfolio weights [n_assets]
+        beta: Beta vector [n_assets]
+        max_abs_beta_exposure: Maximum absolute beta exposure (0 = full neutralization)
+    
+    Returns:
+        Adjusted weights with beta neutralized/capped
+    """
     w = np.asarray(w, dtype=float)
     b = np.asarray(beta, dtype=float).reshape(-1)
     if w.shape[0] != b.shape[0]:
@@ -2072,15 +2851,20 @@ def _apply_beta_neutralization(w: np.ndarray, beta: np.ndarray, *, max_abs_beta_
         return w
     exposure = float(b @ w)
 
-    # Always neutralize first.
+    # STEP 1: Always neutralize first (HARD neutralization, not soft)
     w0 = w - b * (exposure / denom)
 
+    # STEP 2: If cap specified, allow up to max_abs_beta_exposure
     cap = float(max_abs_beta_exposure)
     if not np.isfinite(cap) or cap <= 0:
+        # No cap specified → full neutralization
         return w0
+    
     exp0 = float(b @ w0)
     if abs(exp0) <= cap:
+        # Already within cap (numeric precision)
         return w0
+    
     # If numeric drift remains, scale the component.
     # (This should rarely trigger.)
     return w0 - b * ((exp0 - np.sign(exp0) * cap) / denom)
@@ -2126,6 +2910,19 @@ def _policy_reward_from_window(
     return float(pnl - float(lambda_turnover) * turn_mean - float(lambda_drawdown) * dd)
 
 
+# Import v2 state utilities from policy_controller
+from src.portfolio.policy_controller import (
+    POLICY_STATE_DIM_V2,
+    compute_vol_of_vol,
+    compute_correlation_hhi,
+    compute_expected_shortfall,
+    compute_drawdown_velocity,
+    compute_mu_sigma_dispersion,
+    normalize_state_feature,
+    compute_policy_reward,  # v2 reward function
+)
+
+
 def _policy_state_vector(
     *,
     i: int,
@@ -2136,6 +2933,7 @@ def _policy_state_vector(
     costs: np.ndarray,
     equity: np.ndarray,
     mu_mat: np.ndarray,
+    sigma_mat: np.ndarray,  # NEW: predicted sigma
     fwd_ret_mat: np.ndarray,
     market_regime: pd.Series,
     state_window: int = 20,
@@ -2147,29 +2945,43 @@ def _policy_state_vector(
     cboe_vol_risk_premium_z: float = 0.0,
     calibration_overall_score: float = 1.0,
     online_trust_score: float = 1.0,
+    # NEW v2: Additional context for expanded state
+    weights: Optional[np.ndarray] = None,
+    sector_map: Optional[Dict[int, str]] = None,
+    adv_arr: Optional[np.ndarray] = None,  # Average daily volume
 ) -> np.ndarray:
-    """Compute 15-dimensional policy state vector.
+    """Compute 25-dimensional policy state vector (v2).
     
-    Dimensions 0-9: Portfolio performance metrics (historical)
-    Dimensions 10-14: Portfolio family features from RoleAwareContext (current market state)
+    Dimensions 0-9: Portfolio performance metrics (historical) - PRESERVED
+    Dimensions 10-14: Portfolio family features (CBOE, calibration, trust) - PRESERVED
+    Dimensions 15-24: NEW v2 features for enhanced policy control:
+      - Tail risk (Expected Shortfall)
+      - Volatility-of-volatility
+      - Liquidity stress
+      - Model reliability metrics
+      - Regime transition indicators
+      - Drawdown momentum
+      - Sector concentration
     
-    This gives the contextual bandit information about both:
+    This gives the contextual bandit comprehensive information about:
     - How the portfolio has been performing (adapt based on recent results)
     - Current market stress/quality conditions (adapt based on environment)
+    - Model reliability and regime transitions (adapt proactively)
     """
     # Use only information up to t-1.
     end = int(max(0, i - 1))
     if end <= 0:
-        return np.zeros((15,), dtype=float)
+        return np.zeros((POLICY_STATE_DIM_V2,), dtype=float)
 
     w = int(max(5, state_window))
     start = int(max(0, end - w + 1))
     r_hist = np.asarray(net_ret[start : end + 1], dtype=float)
     t_hist = np.asarray(turnover[start : end + 1], dtype=float)
     c_hist = np.asarray(costs[start : end + 1], dtype=float)
+    eq_hist = np.asarray(equity[start : end + 1], dtype=float)
 
     realized_vol = float(np.std(r_hist) * np.sqrt(252.0)) if r_hist.size >= 2 else 0.0
-    dd = float(_max_drawdown_from_equity(pd.Series(equity[start : end + 1]))) if end >= start else 0.0
+    dd = float(_max_drawdown_from_equity(pd.Series(eq_hist))) if end >= start else 0.0
 
     sw = int(max(10, sharpe_window))
     s_start = int(max(0, end - sw + 1))
@@ -2180,28 +2992,33 @@ def _policy_state_vector(
     cost_mean = float(np.mean(np.where(np.isfinite(c_hist), c_hist, 0.0))) if c_hist.size else 0.0
 
     # Correlation concentration and dispersion from cross-asset returns.
+    corr_hhi = 0.0
+    avg_corr = 0.0
+    disp = 0.0
+    top_eigen_share = 0.0  # FIX Gap #7: Use top eigenvalue share instead of duplicating corr_hhi
     try:
         r_win = returns_df.iloc[start : end + 1].to_numpy(dtype=float)
         if r_win.shape[0] >= 5:
             r_win = np.where(np.isfinite(r_win), r_win, 0.0)
             corr = np.corrcoef(r_win.T)
             corr = np.where(np.isfinite(corr), corr, 0.0)
-            eigvals = np.linalg.eigvalsh(corr)
-            eigvals = np.where(np.isfinite(eigvals), eigvals, 0.0)
-            top_share = float(np.max(eigvals) / (np.sum(eigvals) + 1e-12)) if eigvals.size else 0.0
+            # Use HHI of eigenvalues for concentration (v2)
+            corr_hhi = compute_correlation_hhi(corr)
             if corr.shape[0] > 1:
                 avg_corr = float((np.sum(corr) - np.trace(corr)) / (corr.shape[0] * (corr.shape[0] - 1)))
-            else:
-                avg_corr = 0.0
             disp = float(np.mean(np.std(r_win, axis=1)))
-        else:
-            top_share = 0.0
-            avg_corr = 0.0
-            disp = 0.0
+            # FIX Gap #7: Compute top eigenvalue share as distinct metric
+            try:
+                eigs = np.linalg.eigvalsh(corr)
+                eigs = np.sort(eigs)[::-1]  # Descending
+                eigs = np.maximum(eigs, 0.0)  # Numerical stability
+                total = float(np.sum(eigs))
+                if total > 0:
+                    top_eigen_share = float(eigs[0] / total)  # First PC variance share
+            except Exception:
+                top_eigen_share = 0.0
     except Exception:
-        top_share = 0.0
-        avg_corr = 0.0
-        disp = 0.0
+        pass
 
     # Calibration proxy: sign accuracy on matured forward returns.
     calib_end = int(max(0, end - int(horizon)))
@@ -2221,28 +3038,120 @@ def _policy_state_vector(
     except Exception:
         regime_val = 0.0
 
-    # Clip/scale to keep features bounded.
-    # Dims 0-9: Portfolio performance metrics
-    # Dims 10-14: Portfolio family features (CBOE, calibration, online learning)
+    # =========================================================================
+    # v2 NEW FEATURES (dims 15-24)
+    # =========================================================================
+    
+    # 15: Tail risk - Expected Shortfall at 5%
+    tail_risk_es = compute_expected_shortfall(r_hist, alpha=0.05)
+    
+    # 16: Volatility-of-volatility (market stress indicator)
+    vol_of_vol = compute_vol_of_vol(r_hist, vol_window=5, vov_window=min(20, len(r_hist)))
+    
+    # 17: Liquidity stress (inverse of ADV, normalized)
+    # FIX Gap #6: adv_arr is per-asset (1D), not per-time (2D)
+    liquidity_stress = 0.0
+    if adv_arr is not None:
+        try:
+            adv = np.asarray(adv_arr, dtype=float)
+            adv = adv[np.isfinite(adv)]
+            if adv.size > 0:
+                # Lower ADV = higher stress
+                # Use min ADV relative to mean as stress indicator
+                mean_adv = float(np.mean(adv))
+                min_adv = float(np.min(adv))
+                if mean_adv > 0:
+                    # Stress = 1 - (min/mean), higher when one asset has low ADV
+                    liquidity_stress = float(1.0 - min_adv / mean_adv)
+                    liquidity_stress = float(np.clip(liquidity_stress, 0.0, 1.0))
+        except Exception:
+            liquidity_stress = 0.0
+    
+    # 18: Model reliability - mean sigma_reliability (from predictions)
+    mu_reliability_mean = 0.0
+    if sigma_mat is not None and end < len(sigma_mat):
+        sigma_day = np.asarray(sigma_mat[end], dtype=float)
+        sigma_day = sigma_day[np.isfinite(sigma_day)]
+        if sigma_day.size > 0:
+            # Lower sigma = higher reliability
+            mean_sigma = float(np.mean(sigma_day))
+            mu_reliability_mean = 1.0 / (1.0 + mean_sigma) if mean_sigma > 0 else 1.0
+    
+    # 19: |μ|/σ dispersion (model confidence spread)
+    mu_sigma_dispersion = 0.0
+    if mu_mat is not None and sigma_mat is not None and end < len(mu_mat):
+        mu_day = np.asarray(mu_mat[end], dtype=float)
+        sigma_day = np.asarray(sigma_mat[end], dtype=float)
+        mu_sigma_dispersion = compute_mu_sigma_dispersion(mu_day, sigma_day)
+    
+    # 20: Sector imbalance (max sector deviation from equal weight)
+    sector_imbalance = 0.0
+    if weights is not None and sector_map is not None:
+        from src.portfolio.policy_controller import compute_sector_imbalance
+        sector_imbalance = compute_sector_imbalance(weights, sector_map)
+    
+    # 21: Recent hit rate (last 5 sessions sign accuracy)
+    recent_hit_rate = 0.0
+    recent_end = int(max(0, end - int(horizon)))
+    recent_start = int(max(0, recent_end - 5))
+    if recent_end >= recent_start and recent_end < len(mu_mat):
+        mu_recent = np.asarray(mu_mat[recent_start : recent_end + 1], dtype=float)
+        fr_recent = np.asarray(fwd_ret_mat[recent_start : recent_end + 1], dtype=float)
+        m = np.isfinite(mu_recent) & np.isfinite(fr_recent)
+        if np.any(m):
+            recent_hit_rate = float(np.mean(np.sign(mu_recent[m]) == np.sign(fr_recent[m])))
+    
+    # 22: Drawdown velocity (momentum of drawdown)
+    dd_velocity = compute_drawdown_velocity(eq_hist, window=5)
+    
+    # 23: Regime transition probability (change frequency)
+    regime_trans_prob = 0.0
+    try:
+        if end >= 5 and len(market_regime) > end:
+            regime_hist = market_regime.iloc[max(0, end - 20) : end + 1].to_numpy()
+            regime_hist = regime_hist[np.isfinite(regime_hist)]
+            if len(regime_hist) >= 2:
+                changes = np.sum(np.diff(regime_hist) != 0)
+                regime_trans_prob = float(changes) / (len(regime_hist) - 1)
+    except Exception:
+        pass
+    
+    # 24: Top eigenvalue share (distinct from corr_hhi in dim 6)
+    # Measures first principal component's variance share
+
+    # =========================================================================
+    # Build 25-dim state vector
+    # =========================================================================
     vec = np.asarray(
         [
-            # Portfolio performance metrics (dims 0-9)
+            # Dims 0-9: Portfolio performance metrics (PRESERVED from v1)
             float(np.clip(realized_vol, 0.0, 1.0)),
             float(np.clip(dd, 0.0, 1.0)),
-            float(np.clip(sharpe / 3.0, -1.0, 1.0)),  # Normalize to [-1, 1]
+            float(np.clip(sharpe / 3.0, -1.0, 1.0)),
             float(np.clip(turn_mean, 0.0, 1.0)),
             float(np.clip(cost_mean, 0.0, 1.0)),
             float(np.clip(avg_corr, -1.0, 1.0)),
-            float(np.clip(top_share, 0.0, 1.0)),
+            float(np.clip(corr_hhi, 0.0, 1.0)),  # v2: use HHI instead of top_share
             float(np.clip(disp, 0.0, 1.0)),
             float(np.clip(acc, 0.0, 1.0)),
             float(np.clip(regime_val / 2.0, 0.0, 1.0)),
-            # Portfolio family features (dims 10-14)
-            float(np.clip(cboe_panic_premium / 3.0, -1.0, 1.0)),  # z-scored, normalize to [-1, 1]
-            float(np.clip(cboe_term_slope / 3.0, -1.0, 1.0)),  # z-scored, normalize to [-1, 1]
-            float(np.clip(cboe_vol_risk_premium_z / 3.0, -1.0, 1.0)),  # z-scored, normalize to [-1, 1]
-            float(np.clip(calibration_overall_score, 0.0, 1.0)),  # Already in [0, 1]
-            float(np.clip(online_trust_score, 0.0, 1.0)),  # Already in [0, 1]
+            # Dims 10-14: Portfolio family features (PRESERVED from v1)
+            float(np.clip(cboe_panic_premium / 3.0, -1.0, 1.0)),
+            float(np.clip(cboe_term_slope / 3.0, -1.0, 1.0)),
+            float(np.clip(cboe_vol_risk_premium_z / 3.0, -1.0, 1.0)),
+            float(np.clip(calibration_overall_score, 0.0, 1.0)),
+            float(np.clip(online_trust_score, 0.0, 1.0)),
+            # Dims 15-24: NEW v2 features
+            float(np.clip(tail_risk_es * 10, 0.0, 1.0)),  # Scale ES
+            float(np.clip(vol_of_vol * 100, 0.0, 1.0)),   # Scale vol-of-vol
+            float(np.clip(liquidity_stress, 0.0, 1.0)),
+            float(np.clip(mu_reliability_mean, 0.0, 1.0)),
+            float(np.clip(mu_sigma_dispersion, 0.0, 1.0)),
+            float(np.clip(sector_imbalance * 5, 0.0, 1.0)),  # Scale sector imbalance
+            float(np.clip(recent_hit_rate, 0.0, 1.0)),
+            float(np.clip(dd_velocity * 10 + 0.5, 0.0, 1.0)),  # Center and scale
+            float(np.clip(regime_trans_prob, 0.0, 1.0)),
+            float(np.clip(top_eigen_share, 0.0, 1.0)),  # FIX Gap #7: Top eigenvalue share (distinct from corr_hhi)
         ],
         dtype=float,
     )
@@ -2340,6 +3249,693 @@ def _build_default_policy_actions(
         quantile_blend_weight=0.3,  # Significant quantile blending
     )
     return [base, conservative, aggressive, low_turn, quantile_trust]
+
+
+# ---------------------------------------------------------------------------
+# Structured Event Bus (Workstream: Telemetry)
+# ---------------------------------------------------------------------------
+
+class EventSeverity:
+    """Event severity levels for structured telemetry."""
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class EventCode:
+    """Machine-readable event codes for dashboard aggregation."""
+    # Cooldown/Gating
+    COOLDOWN_ACTIVE = "COOLDOWN_ACTIVE"
+    UNIVERSE_CHANGED = "UNIVERSE_CHANGED"
+    REGISTRY_GATE = "REGISTRY_GATE"
+    
+    # Calibration
+    MAMBA_CALIB_UPDATED = "MAMBA_CALIB_UPDATED"
+    
+    # Signal Processing
+    SIGMA_CLIPPED = "SIGMA_CLIPPED"
+    HYGIENE_VETO = "HYGIENE_VETO"
+    RISK_SCALE_APPLIED = "RISK_SCALE_APPLIED"
+    REGIME_MULT_APPLIED = "REGIME_MULT_APPLIED"
+    SPLIT_STRESS_APPLIED = "SPLIT_STRESS_APPLIED"
+    EVENT_RISK_APPLIED = "EVENT_RISK_APPLIED"
+    LINEAR_BLEND_APPLIED = "LINEAR_BLEND_APPLIED"
+    QUANTILE_BLEND_APPLIED = "QUANTILE_BLEND_APPLIED"
+    
+    # Learning Governance
+    LEARNING_FROZEN = "LEARNING_FROZEN"
+    LEARNING_GOV_DECISION = "LEARNING_GOV_DECISION"
+    LEARNING_GOV_LOCKED = "LEARNING_GOV_LOCKED"
+    LEARNING_GOV_UNLOCKED = "LEARNING_GOV_UNLOCKED"
+    
+    # Kill Switches
+    NAN_INF_KILLSWITCH = "NAN_INF_KILLSWITCH"
+    DD_THROTTLE = "DD_THROTTLE"
+    DD_KILL = "DD_KILL"
+    VOL_THROTTLE = "VOL_THROTTLE"
+    VOL_KILL = "VOL_KILL"
+    TURNOVER_KILL = "TURNOVER_KILL"
+    
+    # Risk Latch (Unified state machine)
+    RISK_LATCH_THROTTLE = "RISK_LATCH_THROTTLE"
+    RISK_LATCH_FLATTEN = "RISK_LATCH_FLATTEN"
+    RISK_LATCH_SAFE_FALLBACK = "RISK_LATCH_SAFE_FALLBACK"
+    RISK_LATCH_EMERGENCY = "RISK_LATCH_EMERGENCY"
+    
+    # Optimizer
+    OPTIMIZER_FALLBACK = "OPTIMIZER_FALLBACK"
+    OPTIMIZER_INFEASIBLE = "OPTIMIZER_INFEASIBLE"
+    OPTIMIZER_SUCCESS = "OPTIMIZER_SUCCESS"
+    
+    # Policy
+    POLICY_ACTION = "POLICY_ACTION"
+    POLICY_REWARD = "POLICY_REWARD"
+    
+    # Execution
+    PARTIAL_FILL = "PARTIAL_FILL"
+    BORROW_CONSTRAINT = "BORROW_CONSTRAINT"
+    HALTED_ASSET = "HALTED_ASSET"
+
+
+@dataclass
+class StructuredEvent:
+    """A single structured event for telemetry.
+    
+    Machine-readable event that can be aggregated into dashboards.
+    """
+    date: str
+    day_idx: int
+    severity: str
+    code: str
+    message: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+    timestamp: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = pd.Timestamp.now().isoformat()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "date": self.date,
+            "day_idx": self.day_idx,
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+            "payload": self.payload,
+            "timestamp": self.timestamp,
+        }
+
+
+class EventBus:
+    """Collects structured events during Phase-2 execution.
+    
+    Provides:
+    - Event emission with severity/code/message/payload
+    - Event filtering by code or severity
+    - Summary generation for dashboards
+    - JSON export for downstream analysis
+    """
+    
+    def __init__(self):
+        self.events: List[StructuredEvent] = []
+        self._enabled = True
+    
+    def emit(
+        self,
+        date: str,
+        day_idx: int,
+        severity: str,
+        code: str,
+        message: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a structured event."""
+        if not self._enabled:
+            return
+        event = StructuredEvent(
+            date=str(date),
+            day_idx=int(day_idx),
+            severity=str(severity),
+            code=str(code),
+            message=str(message),
+            payload=dict(payload or {}),
+        )
+        self.events.append(event)
+    
+    def filter_by_code(self, code: str) -> List[StructuredEvent]:
+        """Get all events with a specific code."""
+        return [e for e in self.events if e.code == code]
+    
+    def filter_by_severity(self, severity: str) -> List[StructuredEvent]:
+        """Get all events at or above a severity level."""
+        levels = [EventSeverity.DEBUG, EventSeverity.INFO, EventSeverity.WARNING, 
+                  EventSeverity.ERROR, EventSeverity.CRITICAL]
+        try:
+            min_idx = levels.index(severity)
+        except ValueError:
+            min_idx = 0
+        return [e for e in self.events if levels.index(e.severity) >= min_idx]
+    
+    def count_by_code(self) -> Dict[str, int]:
+        """Count events by code for summary."""
+        counts: Dict[str, int] = {}
+        for e in self.events:
+            counts[e.code] = counts.get(e.code, 0) + 1
+        return counts
+    
+    def generate_summary(self) -> str:
+        """Generate a human-readable summary for dashboards."""
+        counts = self.count_by_code()
+        if not counts:
+            return "No events recorded."
+        
+        lines = ["=== Event Summary ==="]
+        
+        # Group by category
+        kill_events = ["DD_THROTTLE", "DD_KILL", "VOL_THROTTLE", "VOL_KILL", 
+                       "TURNOVER_KILL", "NAN_INF_KILLSWITCH"]
+        signal_events = ["HYGIENE_VETO", "SIGMA_CLIPPED", "RISK_SCALE_APPLIED",
+                        "REGIME_MULT_APPLIED", "SPLIT_STRESS_APPLIED"]
+        optimizer_events = ["OPTIMIZER_FALLBACK", "OPTIMIZER_INFEASIBLE", "OPTIMIZER_SUCCESS"]
+        
+        # Kill switches
+        kill_counts = {k: v for k, v in counts.items() if k in kill_events}
+        if kill_counts:
+            lines.append("\n🚨 Kill Switches / Throttles:")
+            for code, count in sorted(kill_counts.items(), key=lambda x: -x[1]):
+                lines.append(f"  - {code}: {count} events")
+        
+        # Signal processing
+        sig_counts = {k: v for k, v in counts.items() if k in signal_events}
+        if sig_counts:
+            lines.append("\n⚡ Signal Processing:")
+            for code, count in sorted(sig_counts.items(), key=lambda x: -x[1]):
+                lines.append(f"  - {code}: {count} events")
+        
+        # Optimizer
+        opt_counts = {k: v for k, v in counts.items() if k in optimizer_events}
+        if opt_counts:
+            lines.append("\n🔧 Optimizer:")
+            for code, count in sorted(opt_counts.items(), key=lambda x: -x[1]):
+                lines.append(f"  - {code}: {count} events")
+        
+        # Other
+        other_counts = {k: v for k, v in counts.items() 
+                       if k not in kill_events + signal_events + optimizer_events}
+        if other_counts:
+            lines.append("\n📊 Other:")
+            for code, count in sorted(other_counts.items(), key=lambda x: -x[1]):
+                lines.append(f"  - {code}: {count} events")
+        
+        return "\n".join(lines)
+    
+    def to_list(self) -> List[Dict[str, Any]]:
+        """Export all events as list of dicts."""
+        return [e.to_dict() for e in self.events]
+    
+    def clear(self) -> None:
+        """Clear all events."""
+        self.events.clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-Day Trace Instrumentation (Workstream: Debuggability)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DailyTracePayload:
+    """Complete per-day trace capturing the full signal chain.
+    
+    Captures: mu/sigma → sigma_exec → z_raw → z_overlays → z_blend → z_thr 
+              → w_target → w_safety → exec_w → pnl_gross → costs → pnl_net → reward
+    
+    This trace makes debugging 10x faster by capturing boundary artifacts.
+    """
+    # ─── Identifiers ───
+    date: str
+    day_idx: int
+    horizon: int
+    
+    # ─── Masks (summary) ───
+    n_eligible: int = 0
+    n_universe: int = 0
+    n_total: int = 0
+    dropped_syms: List[str] = field(default_factory=list)  # Top dropped from prev day
+    added_syms: List[str] = field(default_factory=list)    # Top added from prev day
+    
+    # ─── Realized Returns ───
+    r_vec_mean: float = 0.0
+    r_vec_std: float = 0.0
+    r_vec_min: float = 0.0
+    r_vec_max: float = 0.0
+    
+    # ─── Model Outputs ───
+    mu_vec_mean: float = 0.0
+    mu_vec_std: float = 0.0
+    mu_vec_min: float = 0.0
+    mu_vec_max: float = 0.0
+    mu_top_k: List[Tuple[str, float]] = field(default_factory=list)  # Top 5 by |mu|
+    
+    sigma_raw_mean: float = 0.0
+    sigma_raw_std: float = 0.0
+    sigma_raw_min: float = 0.0
+    sigma_raw_max: float = 0.0
+    
+    sigma_exec_mean: float = 0.0
+    sigma_exec_std: float = 0.0
+    sigma_exec_min: float = 0.0
+    sigma_exec_max: float = 0.0
+    sigma_exec_n_clipped: int = 0
+    
+    # ─── Signal Chain ───
+    z_raw_mean: float = 0.0
+    z_raw_std: float = 0.0
+    z_raw_min: float = 0.0
+    z_raw_max: float = 0.0
+    
+    z_after_role_overlays_mean: float = 0.0
+    z_after_role_overlays_std: float = 0.0
+    
+    z_after_quantile_blend_mean: float = 0.0
+    z_after_quantile_blend_std: float = 0.0
+    quantile_blend_weight: float = 0.0
+    
+    z_thr_mean: float = 0.0
+    z_thr_std: float = 0.0
+    z_thr_n_zeroed: int = 0
+    
+    # ─── Policy State ───
+    policy_state_vec: Optional[List[float]] = None  # 25-dim state vector
+    policy_action_idx: Optional[int] = None
+    policy_knobs: Dict[str, float] = field(default_factory=dict)  # All action knobs
+    
+    # ─── Optimizer ───
+    optimizer_path: str = "unknown"  # "robust" or "mv_fallback"
+    optimizer_status: str = "unknown"
+    optimizer_iterations: int = 0
+    constraints_used: Dict[str, float] = field(default_factory=dict)
+    
+    w_target_gross: float = 0.0
+    w_target_net: float = 0.0
+    w_target_n_nonzero: int = 0
+    w_target_max_abs: float = 0.0
+    
+    # ─── Safety Overlays ───
+    w_after_safety_gross: float = 0.0
+    w_after_safety_net: float = 0.0
+    dd_current: float = 0.0
+    rv_current: float = 0.0
+    turnover_intent: float = 0.0
+    dd_throttle_triggered: bool = False
+    vol_throttle_triggered: bool = False
+    kill_triggered: bool = False
+    flattened: bool = False
+    
+    # ─── Execution & Accounting ───
+    exec_w_gross: float = 0.0
+    exec_w_net: float = 0.0
+    prev_exec_w_gross: float = 0.0
+    prev_exec_w_net: float = 0.0
+    turnover_exec: float = 0.0
+    
+    pnl_gross: float = 0.0
+    cost_spread: float = 0.0
+    cost_impact: float = 0.0
+    cost_borrow: float = 0.0
+    cost_total: float = 0.0
+    pnl_net: float = 0.0
+    
+    equity: float = 1.0
+    drawdown: float = 0.0
+    equity_peak: float = 1.0
+    
+    # ─── Reward (delayed) ───
+    reward: Optional[float] = None
+    reward_window_start: Optional[int] = None
+    reward_window_end: Optional[int] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        d = {}
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if isinstance(val, np.ndarray):
+                val = val.tolist()
+            elif isinstance(val, (np.floating, np.integer)):
+                val = float(val) if isinstance(val, np.floating) else int(val)
+            d[f.name] = val
+        return d
+
+
+def _summarize_vector(v: np.ndarray, eps: float = 1e-12) -> Dict[str, float]:
+    """Compute summary stats for a vector."""
+    if v is None or len(v) == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    v_clean = np.asarray(v, dtype=float)
+    v_clean = np.where(np.isfinite(v_clean), v_clean, 0.0)
+    return {
+        "mean": float(np.mean(v_clean)),
+        "std": float(np.std(v_clean) + eps),
+        "min": float(np.min(v_clean)),
+        "max": float(np.max(v_clean)),
+    }
+
+
+def _top_k_by_abs(v: np.ndarray, syms: List[str], k: int = 5) -> List[Tuple[str, float]]:
+    """Get top k symbols by absolute value."""
+    if v is None or len(v) == 0:
+        return []
+    v_clean = np.asarray(v, dtype=float)
+    v_clean = np.where(np.isfinite(v_clean), v_clean, 0.0)
+    idx = np.argsort(-np.abs(v_clean))[:k]
+    return [(str(syms[i]), float(v_clean[i])) for i in idx if i < len(syms)]
+
+
+# ---------------------------------------------------------------------------
+# Execution Realism Helpers (Workstream: Backtest Realism)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecutionContext:
+    """Per-day execution context for realistic backtest simulation.
+    
+    Tracks:
+    - ADV per asset (for liquidity participation constraints)
+    - Spread per asset (for asset-aware slippage)
+    - Borrow status per asset (HTB tiers, availability)
+    - Partial fill residuals (carried trades from liquidity constraints)
+    - Corporate action flags (dividends, halts)
+    """
+    n_assets: int
+    capital_usd: float = 1_000_000.0
+    
+    # Per-asset ADV in USD (rolling 20d)
+    adv_usd: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    # Per-asset spread in bps (estimated from bid-ask or price impact)
+    spread_bps: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    # Per-asset borrow fee in annual bps (0 = GC, 50-100 = easy, 100-500 = hard, >500 = HTB)
+    borrow_fee_bps: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    # Per-asset borrow availability (0 = unavailable, 1 = available)
+    borrow_available: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    # Partial fill residuals (unfilled trade from previous day)
+    partial_fill_residual: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    # Corporate action flags
+    halted: np.ndarray = field(default_factory=lambda: np.array([]))
+    ex_dividend: np.ndarray = field(default_factory=lambda: np.array([]))
+    dividend_yield: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    def __post_init__(self):
+        n = int(self.n_assets)
+        if self.adv_usd.size == 0:
+            self.adv_usd = np.full(n, 10_000_000.0)  # Default $10M ADV
+        if self.spread_bps.size == 0:
+            self.spread_bps = np.full(n, 5.0)  # Default 5 bps spread
+        if self.borrow_fee_bps.size == 0:
+            self.borrow_fee_bps = np.full(n, 50.0)  # Default 50 bps GC rate
+        if self.borrow_available.size == 0:
+            self.borrow_available = np.ones(n, dtype=float)
+        if self.partial_fill_residual.size == 0:
+            self.partial_fill_residual = np.zeros(n, dtype=float)
+        if self.halted.size == 0:
+            self.halted = np.zeros(n, dtype=float)
+        if self.ex_dividend.size == 0:
+            self.ex_dividend = np.zeros(n, dtype=float)
+        if self.dividend_yield.size == 0:
+            self.dividend_yield = np.zeros(n, dtype=float)
+
+
+def _compute_asset_aware_slippage(
+    delta_w: np.ndarray,
+    exec_ctx: ExecutionContext,
+    *,
+    impact_exponent: float = 1.0,
+    impact_scale: float = 0.1,
+) -> np.ndarray:
+    """Compute per-asset slippage based on spread + market impact.
+    
+    Model:
+        slippage[i] = 0.5 * spread_bps[i] * |Δw[i]| 
+                    + impact_scale * (trade_$/ADV_$)^impact_exponent
+    
+    Args:
+        delta_w: Weight changes per asset
+        exec_ctx: Execution context with ADV, spreads
+        impact_exponent: Market impact exponent (typically 1.0-1.7)
+        impact_scale: Market impact coefficient
+        
+    Returns:
+        Per-asset slippage in return space (to be summed for total cost)
+    """
+    n = len(delta_w)
+    slippage = np.zeros(n, dtype=float)
+    
+    capital = float(exec_ctx.capital_usd)
+    if capital <= 0:
+        return slippage
+    
+    for i in range(n):
+        dw = abs(float(delta_w[i]))
+        if dw < 1e-12:
+            continue
+        
+        # Spread component: half-spread * notional (in bps)
+        spread_bps = float(exec_ctx.spread_bps[i]) if i < len(exec_ctx.spread_bps) else 5.0
+        spread_cost = 0.5 * (spread_bps / 10000.0) * dw
+        
+        # Impact component: k * (trade_$/ADV_$)^gamma
+        adv_usd = float(exec_ctx.adv_usd[i]) if i < len(exec_ctx.adv_usd) else 10_000_000.0
+        trade_usd = dw * capital
+        if adv_usd > 0:
+            participation = trade_usd / adv_usd
+            impact_cost = impact_scale * (participation ** impact_exponent) * dw
+        else:
+            impact_cost = 0.0
+        
+        slippage[i] = spread_cost + impact_cost
+    
+    return slippage
+
+
+def _apply_liquidity_participation_constraint(
+    target_w: np.ndarray,
+    prev_w: np.ndarray,
+    exec_ctx: ExecutionContext,
+    *,
+    max_participation_rate: float = 0.10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply liquidity participation constraint with partial fills.
+    
+    Caps daily traded notional per name:
+        trade_$ <= participation_rate * ADV_$
+    
+    If violated: partial fill and carry residual to next day.
+    
+    Args:
+        target_w: Target weights for today
+        prev_w: Previous weights (starting point)
+        exec_ctx: Execution context with ADV
+        max_participation_rate: Max fraction of ADV to trade (default 10%)
+        
+    Returns:
+        Tuple of:
+        - executed_w: Actually executed weights (may differ from target)
+        - residual: Unfilled portion to carry forward
+    """
+    n = len(target_w)
+    capital = float(exec_ctx.capital_usd)
+    
+    if capital <= 0 or max_participation_rate <= 0:
+        return target_w.copy(), np.zeros(n, dtype=float)
+    
+    # FIX Gap #4: Do NOT add residual_in to delta_w
+    # Rationale: prev_w already reflects the partially executed position from yesterday.
+    # The difference (target_w - prev_w) already captures what still needs to be done.
+    # Adding residual_in would DOUBLE-COUNT the unfilled portion.
+    #
+    # Example: Day 1: target=10%, prev=0%, execute 5% → executed=5%, residual=5%
+    #          Day 2: target=10%, prev=5% (from day 1 execution)
+    #                 delta should be 5% (10% - 5%), NOT 10% (10% - 5% + 5%)
+    #
+    # The residual tracking is kept for diagnostics/monitoring but not used in computation.
+    delta_w = target_w - prev_w
+    
+    executed_delta = np.zeros(n, dtype=float)
+    residual_out = np.zeros(n, dtype=float)
+    
+    for i in range(n):
+        dw = float(delta_w[i])
+        if abs(dw) < 1e-12:
+            continue
+        
+        adv_usd = float(exec_ctx.adv_usd[i]) if i < len(exec_ctx.adv_usd) else 10_000_000.0
+        max_trade_usd = max_participation_rate * adv_usd
+        max_trade_w = max_trade_usd / capital if capital > 0 else 1.0
+        
+        if abs(dw) <= max_trade_w:
+            # Full fill
+            executed_delta[i] = dw
+        else:
+            # Partial fill: cap at max participation
+            sign = 1.0 if dw > 0 else -1.0
+            executed_delta[i] = sign * max_trade_w
+            residual_out[i] = dw - executed_delta[i]
+    
+    executed_w = prev_w + executed_delta
+    return executed_w, residual_out
+
+
+def _apply_borrow_constraints(
+    w: np.ndarray,
+    exec_ctx: ExecutionContext,
+    *,
+    htb_threshold_bps: float = 500.0,
+    htb_max_short_weight: float = 0.05,
+) -> np.ndarray:
+    """Apply borrow constraints for short positions.
+    
+    - If borrow unavailable: zero short weight
+    - If HTB (high borrow fee): cap short weight
+    
+    Args:
+        w: Target weights
+        exec_ctx: Execution context with borrow info
+        htb_threshold_bps: Borrow fee above which name is HTB
+        htb_max_short_weight: Max short weight for HTB names
+        
+    Returns:
+        Adjusted weights with borrow constraints applied
+    """
+    w_out = w.copy()
+    n = len(w)
+    
+    for i in range(n):
+        if w_out[i] >= 0:
+            continue  # Long position, no borrow needed
+        
+        # Check availability
+        avail = float(exec_ctx.borrow_available[i]) if i < len(exec_ctx.borrow_available) else 1.0
+        if avail < 0.5:
+            w_out[i] = 0.0  # Borrow unavailable
+            continue
+        
+        # Check HTB status
+        borrow_fee = float(exec_ctx.borrow_fee_bps[i]) if i < len(exec_ctx.borrow_fee_bps) else 50.0
+        if borrow_fee >= htb_threshold_bps:
+            # HTB: cap short weight
+            w_out[i] = max(w_out[i], -htb_max_short_weight)
+    
+    return w_out
+
+
+def _compute_per_asset_borrow_cost(
+    w: np.ndarray,
+    exec_ctx: ExecutionContext,
+) -> float:
+    """Compute total daily borrow cost across all short positions.
+    
+    Each short pays: (short_notional * borrow_fee_bps / 10000) / 252
+    
+    Args:
+        w: Current weights
+        exec_ctx: Execution context with per-asset borrow fees
+        
+    Returns:
+        Total daily borrow cost as fraction of capital
+    """
+    capital = float(exec_ctx.capital_usd)
+    if capital <= 0:
+        return 0.0
+    
+    total_cost = 0.0
+    for i in range(len(w)):
+        if w[i] >= 0:
+            continue  # Long, no borrow cost
+        
+        short_w = abs(float(w[i]))
+        borrow_bps = float(exec_ctx.borrow_fee_bps[i]) if i < len(exec_ctx.borrow_fee_bps) else 50.0
+        daily_rate = (borrow_bps / 10000.0) / 252.0
+        total_cost += short_w * daily_rate
+    
+    return total_cost
+
+
+def _apply_corporate_action_constraints(
+    w: np.ndarray,
+    exec_ctx: ExecutionContext,
+    *,
+    reduce_on_ex_div: bool = True,
+    ex_div_reduction_mult: float = 0.5,
+) -> np.ndarray:
+    """Apply corporate action constraints.
+    
+    - Halted: zero weight (cannot trade)
+    - Ex-dividend: optionally reduce weight (tax drag on shorts)
+    
+    Args:
+        w: Target weights
+        exec_ctx: Execution context with corp action flags
+        reduce_on_ex_div: Whether to reduce short positions on ex-div
+        ex_div_reduction_mult: Multiplier for shorts on ex-div day
+        
+    Returns:
+        Adjusted weights
+    """
+    w_out = w.copy()
+    n = len(w)
+    
+    for i in range(n):
+        # Halted: force flat
+        halted = float(exec_ctx.halted[i]) if i < len(exec_ctx.halted) else 0.0
+        if halted > 0.5:
+            w_out[i] = 0.0
+            continue
+        
+        # Ex-dividend: reduce shorts (dividend payment obligation)
+        if reduce_on_ex_div and w_out[i] < 0:
+            ex_div = float(exec_ctx.ex_dividend[i]) if i < len(exec_ctx.ex_dividend) else 0.0
+            if ex_div > 0.5:
+                w_out[i] = w_out[i] * ex_div_reduction_mult
+    
+    return w_out
+
+
+def _compute_open_to_open_returns(price_data: pd.DataFrame) -> pd.Series:
+    """Compute open-to-open daily returns from a price DataFrame.
+    
+    For realistic execution: weights decided at close, executed at next open.
+    Returns are measured open-to-open to match execution timing.
+    """
+    if price_data is None or price_data.empty:
+        return pd.Series(dtype=float)
+    
+    df = price_data.copy()
+    try:
+        df = df.sort_index()
+    except Exception:
+        pass
+    
+    # Try to find open price column
+    open_col = None
+    for col in ("open", "Open", "OPEN", "adjusted_open", "adj_open"):
+        if col in df.columns:
+            open_col = col
+            break
+    
+    if open_col is None:
+        # Fall back to close-to-close
+        return _compute_close_to_close_returns(price_data)
+    
+    px = pd.to_numeric(df[open_col], errors="coerce").astype(float)
+    r = px.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return r
 
 
 def _compute_close_to_close_returns(price_data: pd.DataFrame) -> pd.Series:
@@ -2825,7 +4421,12 @@ def evaluate_phase2_stateful_once(
         max_group_gross = float(cfg.get("phase2_group_max_gross", 0.0))
         max_group_net = float(cfg.get("phase2_group_max_net", 0.0))
 
-        beta_neutral = bool(cfg.get("phase2_beta_neutral", False))
+        # Beta neutralization: Controlled by phase2_beta_max_abs_exposure cap
+        # - If cap = 0: Full beta neutralization (market neutral)
+        # - If cap > 0: Neutralize first, then allow up to ±cap beta exposure
+        # - If cap not set or negative: No beta constraint
+        # NOTE: phase2_beta_neutral flag is DEPRECATED (use beta_cap threshold instead)
+        beta_neutral = bool(cfg.get("phase2_beta_neutral", False))  # DEPRECATED
         beta_cap = float(cfg.get("phase2_beta_max_abs_exposure", 0.0))
         beta_lookback = int(cfg.get("phase2_beta_lookback_days", 252))
 
@@ -2836,6 +4437,131 @@ def evaluate_phase2_stateful_once(
         max_adv_frac_name = float(cfg.get("phase2_max_adv_frac_name", 0.0))
         max_turnover_adv_frac = float(cfg.get("phase2_max_turnover_adv_frac", 0.0))
         borrow_fee_bps_annual = float(cfg.get("phase2_borrow_fee_bps_annual", 0.0))
+
+        # ──────────────────────────────────────────────────────────────────────
+        # EXECUTION REALISM CONTROLS (Workstream: Backtest Realism)
+        # ──────────────────────────────────────────────────────────────────────
+        # Execution price timing: 'close_to_close' (default), 'open_to_open', 'vwap'
+        exec_price_mode = str(cfg.get("phase2_exec_price_mode", "close_to_close"))
+        
+        # Liquidity participation constraint: max fraction of ADV per name per day
+        # If trade exceeds this, partial fill with residual carried forward
+        exec_participation_rate = float(cfg.get("phase2_exec_participation_rate", 0.10))
+        exec_enable_partial_fills = bool(cfg.get("phase2_exec_enable_partial_fills", True))
+        
+        # Asset-aware slippage: per-asset spread + market impact model
+        # slippage = 0.5 * spread_bps * |Δw| + impact_scale * (trade_$/ADV_$)^impact_exp
+        exec_asset_aware_slippage = bool(cfg.get("phase2_exec_asset_aware_slippage", True))
+        exec_impact_exponent = float(cfg.get("phase2_exec_impact_exponent", 1.0))
+        exec_impact_scale = float(cfg.get("phase2_exec_impact_scale", 0.1))
+        exec_default_spread_bps = float(cfg.get("phase2_exec_default_spread_bps", 5.0))
+        
+        # Per-name borrow fees (vs flat borrow_fee_bps_annual)
+        # HTB threshold: names with borrow fee >= this are capped
+        exec_per_name_borrow = bool(cfg.get("phase2_exec_per_name_borrow", True))
+        exec_htb_threshold_bps = float(cfg.get("phase2_exec_htb_threshold_bps", 500.0))
+        exec_htb_max_short_weight = float(cfg.get("phase2_exec_htb_max_short_weight", 0.05))
+        
+        # Corporate actions handling
+        exec_halted_to_flat = bool(cfg.get("phase2_exec_halted_to_flat", True))
+        exec_reduce_short_on_ex_div = bool(cfg.get("phase2_exec_reduce_short_on_ex_div", False))
+        exec_ex_div_reduction_mult = float(cfg.get("phase2_exec_ex_div_reduction_mult", 0.5))
+
+        # Workstream-7: Robust Portfolio Optimizer config
+        use_robust_optimizer = bool(cfg.get("phase2_use_robust_optimizer", False))
+        robust_lambda_var = float(cfg.get("phase2_robust_lambda_var", 1.0))
+        robust_lambda_turnover = float(cfg.get("phase2_robust_lambda_turnover", 0.0))
+        robust_lambda_tail = float(cfg.get("phase2_robust_lambda_tail", 0.0))
+        robust_use_predicted_sigma = bool(cfg.get("phase2_robust_use_predicted_sigma", True))
+        robust_predicted_sigma_blend = float(cfg.get("phase2_robust_predicted_sigma_blend", 0.7))
+        robust_cov_method = str(cfg.get("phase2_robust_covariance_method", "ewma_shrink"))
+        robust_cvar_constraint = bool(cfg.get("phase2_robust_cvar_constraint", False))
+        robust_cvar_alpha = float(cfg.get("phase2_robust_cvar_alpha", 0.05))
+        robust_cvar_limit = cfg.get("phase2_robust_cvar_limit")
+        robust_cvar_limit_f = float(robust_cvar_limit) if robust_cvar_limit is not None else None
+        robust_uncertainty_caps = bool(cfg.get("phase2_robust_uncertainty_caps", True))
+        robust_mu_sigma_cap = float(cfg.get("phase2_robust_mu_sigma_cap", 3.0))
+        robust_reliability_min = float(cfg.get("phase2_robust_reliability_min", 0.3))
+        robust_n_factors = int(cfg.get("phase2_robust_n_factors", 5))
+        robust_use_graph_shrinkage = bool(cfg.get("phase2_robust_use_graph_shrinkage", False))
+
+        # ──────────────────────────────────────────────────────────────────────
+        # LINEAR ALPHA COMBINER: Ridge-regularized alpha signal blending
+        # Replaces static quantile blending with learned z_lin = f(z_mamba, quantile_z, ...)
+        # ──────────────────────────────────────────────────────────────────────
+        linear_model_enabled = bool(cfg.get("phase2_linear_model_enabled", False))
+        linear_update_interval = int(cfg.get("phase2_linear_update_interval", 21))
+        linear_ridge_lambda = float(cfg.get("phase2_linear_ridge_lambda", 10.0))
+        linear_window = int(cfg.get("phase2_linear_window", 126))
+        linear_max_window = int(cfg.get("phase2_linear_max_window", 252))
+        linear_min_samples = int(cfg.get("phase2_linear_min_samples", 63))
+        linear_blend_max = float(cfg.get("phase2_linear_blend_max", 0.5))
+        linear_time_decay_halflife = int(cfg.get("phase2_linear_time_decay_halflife", 42))
+        linear_confidence_enabled = bool(cfg.get("phase2_linear_confidence_enabled", True))
+
+        # Initialize robust optimizer if enabled
+        robust_optimizer = None
+        if use_robust_optimizer:
+            try:
+                from src.portfolio.robust_optimizer import (
+                    RobustPortfolioOptimizer,
+                    PredictionBundle,
+                    CovarianceModel,
+                    PortfolioConstraints,
+                    build_sector_adjacency,
+                )
+                robust_optimizer = RobustPortfolioOptimizer(
+                    lambda_var=robust_lambda_var,
+                    lambda_turnover=robust_lambda_turnover,
+                    lambda_tail=robust_lambda_tail,
+                    use_predicted_sigma=robust_use_predicted_sigma,
+                    predicted_sigma_blend=robust_predicted_sigma_blend,
+                    covariance_method=robust_cov_method,
+                    cvar_constraint=robust_cvar_constraint,
+                    uncertainty_caps=robust_uncertainty_caps,
+                )
+                logger.info("[phase2.robust_optimizer] Initialized with lambda_var=%.2f, uncertainty_caps=%s", 
+                           robust_lambda_var, robust_uncertainty_caps)
+            except Exception as e:
+                logger.warning("[phase2.robust_optimizer] Failed to initialize: %s; falling back to standard", e)
+                robust_optimizer = None
+                use_robust_optimizer = False
+
+        # Initialize linear alpha combiner if enabled
+        linear_state: Optional[LinearCombinerState] = None
+        if linear_model_enabled:
+            try:
+                # Try to load existing state
+                saved_state = load_linear_combiner_state(
+                    horizon=int(horizon),
+                    symbols=syms,
+                )
+                if saved_state is not None:
+                    linear_state = LinearCombinerState.from_dict(saved_state)
+                    logger.info(
+                        "[phase2.linear] Loaded saved state: n_updates=%d, is_ready=%s",
+                        linear_state._n_updates, linear_state.is_ready()
+                    )
+                else:
+                    # Create fresh state
+                    linear_state = create_linear_combiner(
+                        horizon=int(horizon),
+                        update_interval=linear_update_interval,
+                        ridge_lambda=linear_ridge_lambda,
+                        window=linear_window,
+                        max_window=linear_max_window,
+                        min_samples=linear_min_samples,
+                        time_decay_halflife=linear_time_decay_halflife,
+                        symbols=syms,
+                    )
+                    logger.info(
+                        "[phase2.linear] Created new combiner: lambda=%.1f, window=%d, min_samples=%d",
+                        linear_ridge_lambda, linear_window, linear_min_samples
+                    )
+            except Exception as e:
+                logger.warning("[phase2.linear] Failed to initialize: %s; disabled", e)
+                linear_state = None
+                linear_model_enabled = False
 
         # Regime-aware thresholding knobs (re-using Stage-B convention).
         thr_base = float(cfg.get("regime_threshold_base", cfg.get("threshold", 0.10)))
@@ -2850,7 +4576,9 @@ def evaluate_phase2_stateful_once(
             try:
                 from src.portfolio.role_aware_context import RoleAwareContext
 
-                role_parquet_dir = Path(str(cfg.get("phase2_role_aware_parquet_dir", "cache/features")))
+                # Default to cache/merged which contains per-symbol subdirectories
+                # (e.g., cache/merged/AAPL/AAPL_h63_merged_portfolio.parquet)
+                role_parquet_dir = Path(str(cfg.get("phase2_role_aware_parquet_dir", "cache/merged")))
                 role_registry_path = cfg.get("phase2_role_aware_registry_path")
                 role_ctx = RoleAwareContext(
                     symbols=syms,
@@ -2858,7 +4586,7 @@ def evaluate_phase2_stateful_once(
                     parquet_dir=role_parquet_dir,
                     strict=bool(cfg.get("phase2_role_aware_strict", False)),
                     registry_path=Path(str(role_registry_path)) if role_registry_path else None,
-                    data_source=str(cfg.get("phase2_role_aware_data_source", "merged")),
+                    data_source=str(cfg.get("phase2_role_aware_data_source", "portfolio")),
                 )
             except Exception as e:
                 logger.warning("[phase2.role_aware] failed to initialize: %s", e)
@@ -2927,9 +4655,14 @@ def evaluate_phase2_stateful_once(
         policy_reward_window = int(cfg.get("phase2_policy_reward_window", 10))
         policy_reward_lambda_turn = float(cfg.get("phase2_policy_reward_lambda_turn", 0.2))
         policy_reward_lambda_dd = float(cfg.get("phase2_policy_reward_lambda_dd", 0.5))
+        # v2 exploration annealing
+        policy_exploration_half_life = int(cfg.get("phase2_policy_exploration_half_life", 63))
+        policy_exploration_floor = float(cfg.get("phase2_policy_exploration_floor", 0.15))
+        
         if policy_enabled:
             try:
-                policy_actions = _build_default_policy_actions(
+                # Use v2 action menu (7 actions with expanded knobs)
+                policy_actions = build_default_policy_actions_v2(
                     base_threshold=thr_base,
                     regime_mult_bull=thr_bull,
                     regime_mult_bear=thr_bear,
@@ -2939,12 +4672,10 @@ def evaluate_phase2_stateful_once(
                     max_gross=max_gross,
                     max_net=max_net,
                     max_name=max_name,
-                    weight_smoothing_alpha=weight_smoothing_alpha,
-                    vol_scaler=float(cfg.get("phase2_policy_vol_scaler", 1.0)),
                 )
                 policy = PolicyController(
                     actions=policy_actions,
-                    feature_dim=15,  # 10 portfolio metrics + 5 portfolio family features
+                    feature_dim=POLICY_STATE_DIM_V2,  # v2: 25 dims
                     method=str(cfg.get("phase2_policy_controller_method", "lin_ts")),
                     seed=int(cfg.get("phase2_policy_controller_seed", 1337)),
                     ts_prior_var=float(cfg.get("phase2_policy_ts_prior_var", 1.0)),
@@ -2952,6 +4683,9 @@ def evaluate_phase2_stateful_once(
                     ewa_eta=float(cfg.get("phase2_policy_ewa_eta", 0.25)),
                     ewa_temperature=float(cfg.get("phase2_policy_ewa_temperature", 1.0)),
                     warmup_steps=int(cfg.get("phase2_policy_warmup_days", 20)),
+                    # v2: Exploration annealing
+                    exploration_half_life=policy_exploration_half_life,
+                    exploration_floor=policy_exploration_floor,
                 )
             except Exception as e:
                 logger.warning("[phase2.policy] failed to initialize: %s", e)
@@ -2997,9 +4731,109 @@ def evaluate_phase2_stateful_once(
         mu_mat = np.zeros((len(union_oos_index), n_assets), dtype=float)
         sigma_mat = np.zeros((len(union_oos_index), n_assets), dtype=float)
         w_mat = np.zeros((len(union_oos_index), n_assets), dtype=float)
-        turnover = np.zeros(len(union_oos_index), dtype=float)
+        
+        # DIAGNOSTIC FIX: Track BOTH intent and executed turnover separately
+        # - turnover_intent: from optimizer target (w - prev_w), used for policy enforcement
+        # - turnover_exec: from execution queue (exec_w - prev_exec_w), used for cost computation
+        # This fixes the blind spot where costs were attributed to intent but PnL came from exec
+        turnover_intent = np.zeros(len(union_oos_index), dtype=float)
+        turnover_exec = np.zeros(len(union_oos_index), dtype=float)
+        turnover = np.zeros(len(union_oos_index), dtype=float)  # Legacy: points to turnover_exec for backwards compat
+        
         costs = np.zeros(len(union_oos_index), dtype=float)
         net_ret = np.zeros(len(union_oos_index), dtype=float)
+        
+        # Track prev_exec_w for executed turnover calculation
+        prev_exec_w = np.zeros(n_assets, dtype=float)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Mamba-based calibration tracker (AUTHORITATIVE for learning gates).
+        # Tracks Mamba (μ, σ²) predictions vs realized returns.
+        # Replaces quantile-based calibration as the primary learning authority.
+        #
+        # GOVERNANCE PERSISTENCE:
+        # - State key = (model_id, horizon, symbol_hash)
+        # - Persists to artifacts/governance/mamba_calibration/
+        # - If horizon changes → key mismatch → clean initialization
+        # ─────────────────────────────────────────────────────────────────────
+        
+        # Build governance state key (includes horizon for leakage prevention)
+        _gov_model_id = "phase2_stateful"
+        if best_trial_json is not None:
+            _gov_model_id = f"phase2_{Path(best_trial_json).stem}"
+        elif trial_cfg is not None:
+            # Hash the trial config for uniqueness
+            import hashlib as _hlib
+            _cfg_hash = _hlib.sha256(str(sorted(trial_cfg.items())).encode()).hexdigest()[:8]
+            _gov_model_id = f"phase2_cfg_{_cfg_hash}"
+        
+        # For multi-symbol portfolio, use hash of symbol set as "symbol" in key
+        _sym_hash = hashlib.sha256(",".join(sorted(syms)).encode()).hexdigest()[:8]
+        governance_state_key = make_state_key(
+            model_id=_gov_model_id,
+            horizon=int(horizon),
+            symbol=f"portfolio_{_sym_hash}",
+        )
+        
+        # Try to load existing tracker state
+        _saved_calib_state = load_mamba_calibration_state(governance_state_key)
+        if _saved_calib_state is not None:
+            try:
+                mamba_calib_tracker = MambaCalibrationTracker.deserialize(_saved_calib_state)
+                logger.info("[phase2.governance] ✅ Loaded Mamba calibration state: %s", governance_state_key)
+            except Exception as e:
+                logger.warning("[phase2.governance] Failed to deserialize calibration state: %s", e)
+                mamba_calib_tracker = create_mamba_calibration_tracker(
+                    horizon=int(horizon),
+                    window=MAMBA_CALIB_WINDOW,
+                )
+        else:
+            mamba_calib_tracker = create_mamba_calibration_tracker(
+                horizon=int(horizon),
+                window=MAMBA_CALIB_WINDOW,
+            )
+            logger.info("[phase2.governance] New Mamba calibration tracker for: %s", governance_state_key)
+        
+        mamba_calib_snapshot: Optional[MambaCalibrationSnapshot] = None
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Learning Governor: Calibration-driven runtime risk control.
+        # Three-zone policy:
+        #   GREEN (cal >= 0.70): Allow slow updates
+        #   YELLOW (0.55 <= cal < 0.70): Allow normal updates
+        #   RED (cal < 0.55): Freeze learning
+        #
+        # Also handles:
+        #   - Drift-triggered micro-updates
+        #   - Human-in-the-loop auto-revert gate
+        # ─────────────────────────────────────────────────────────────────────
+        learning_governor = None
+        learning_governor_enabled = bool(cfg.get("phase2_learning_governor_enabled", True))
+        if learning_governor_enabled:
+            try:
+                from src.stage_b_stateful.learning_governor import (
+                    LearningGovernor,
+                    create_learning_governor,
+                    LearningDecision,
+                )
+                
+                gov_checkpoint_dir = Path(cfg.get(
+                    "phase2_learning_governor_checkpoint_dir",
+                    "artifacts/governance/learning_governor"
+                ))
+                gov_log_path = Path(cfg.get(
+                    "phase2_learning_governor_log_path",
+                    "artifacts/logs/learning_governor_decisions.jsonl"
+                ))
+                
+                learning_governor = create_learning_governor(
+                    checkpoint_dir=gov_checkpoint_dir,
+                    decision_log_path=gov_log_path,
+                )
+                logger.info("[phase2.governance] ✅ Learning Governor initialized")
+            except Exception as e:
+                logger.warning("[phase2.governance] Failed to initialize Learning Governor: %s", e)
+                learning_governor = None
         equity = np.ones(len(union_oos_index), dtype=float)
 
         # Daily diagnostics (cheap to compute).
@@ -3032,6 +4866,237 @@ def evaluate_phase2_stateful_once(
         _sigma_exec_eps = 1e-4
         sigma_ema = np.ones(n_assets, dtype=float) * 0.02
         sigma_ema_hist = [deque(maxlen=int(_sigma_exec_roll)) for _ in range(n_assets)]
+
+        # ─────────────────────────────────────────────────────────────────────
+        # EXECUTION REALISM: Initialize ExecutionContext for daily updates
+        # ─────────────────────────────────────────────────────────────────────
+        exec_ctx = ExecutionContext(
+            n_assets=n_assets,
+            capital_usd=capital_usd_f if capital_usd_f > 0 else 1_000_000.0,
+        )
+        # Default spread and borrow fees (can be updated per-day from data)
+        exec_ctx.spread_bps = np.full(n_assets, exec_default_spread_bps, dtype=float)
+        exec_ctx.borrow_fee_bps = np.full(n_assets, borrow_fee_bps_annual, dtype=float)
+        
+        # Compute open-to-open returns if needed
+        open_returns_df: Optional[pd.DataFrame] = None
+        if exec_price_mode == "open_to_open":
+            allow_exec_fallback = bool(cfg.get("phase2_allow_exec_price_fallback", False))
+            open_returns_cols: Dict[str, pd.Series] = {}
+            for sym in syms:
+                if sym not in prepared.pipelines_by:
+                    msg = f"[phase2.exec_realism] Missing pipeline for {sym}; cannot build open-to-open returns"
+                    if allow_exec_fallback:
+                        logger.warning("%s", msg)
+                        open_returns_cols = {}
+                        break
+                    raise ValueError(msg)
+                pipe = prepared.pipelines_by[sym]
+                try:
+                    price_data = pipe._get_price_data_for_horizon(
+                        sym, int(horizon), union_oos_index[0], union_oos_index[-1]
+                    )
+                    open_returns_cols[sym] = _compute_open_to_open_returns(price_data)
+                except Exception as e:
+                    msg = f"[phase2.exec_realism] Failed open-to-open for {sym}: {e}"
+                    if allow_exec_fallback:
+                        logger.warning("%s", msg)
+                        open_returns_cols = {}
+                        break
+                    raise
+
+            if open_returns_cols:
+                open_returns_df = pd.concat(open_returns_cols, axis=1).reindex(union_oos_index).fillna(0.0)
+                logger.info("[phase2.exec_realism] Using open-to-open returns for execution pricing")
+            else:
+                open_returns_df = None
+                if allow_exec_fallback:
+                    logger.warning("[phase2.exec_realism] open_to_open failed; falling back to close_to_close")
+                    exec_price_mode = "close_to_close"
+
+        # ─────────────────────────────────────────────────────────────────────
+        # DAILY TRACE INSTRUMENTATION: Initialize trace collection
+        # ─────────────────────────────────────────────────────────────────────
+        trace_enabled = bool(cfg.get("phase2_trace_enabled", True))
+        trace_persist = bool(cfg.get("phase2_trace_persist", True))
+        trace_persist_path = cfg.get("phase2_trace_persist_path")
+        daily_traces: List[DailyTracePayload] = []
+        # Note: prev_exec_w is now initialized earlier in the main tracking section
+        _prev_eligible_set: Optional[Set[str]] = None  # For dropped/added tracking
+
+        # ─────────────────────────────────────────────────────────────────────
+        # STRUCTURED EVENT BUS: Initialize telemetry collection
+        # ─────────────────────────────────────────────────────────────────────
+        events_enabled = bool(cfg.get("phase2_events_enabled", True))
+        events_persist = bool(cfg.get("phase2_events_persist", True))
+        event_bus = EventBus()
+        event_bus._enabled = events_enabled
+
+        # ─────────────────────────────────────────────────────────────────────
+        # GAP #8: PER-ASSET CALIBRATION TRACKING
+        # Track per-symbol (mu, sigma, realized) for post-hoc calibration stats.
+        # 
+        # USAGE: Reporting/diagnostics ONLY. Not used in risk latch or model structure.
+        # Output: Included in per_symbol_metrics for dashboard/analysis.
+        # Future: Could be used for per-asset risk scaling or single-stock anomaly detection.
+        # ─────────────────────────────────────────────────────────────────────
+        per_symbol_calib_enabled = bool(cfg.get("phase2_per_symbol_calib", True))
+        # Accumulators: [n_samples, n_assets] - grow dynamically
+        _per_sym_mu_acc: List[np.ndarray] = []
+        _per_sym_sigma_acc: List[np.ndarray] = []
+        _per_sym_realized_acc: List[np.ndarray] = []
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Z-EXPLAINER: Track z-signal chain for interpretability
+        # Explains z_final (post-threshold) from interpretable features.
+        # Uses Rolling Ridge surrogate with weekly refitting and fidelity gating.
+        # ─────────────────────────────────────────────────────────────────────
+        z_explainer_enabled = bool(cfg.get("phase2_z_explainer", True))
+        z_explainer_buffer: Optional["ZExplainerBuffer"] = None
+        z_surrogate: Optional["RollingSurrogate"] = None
+        z_validation_companion: Optional["ValidationCompanion"] = None  # Step 7
+        z_explainer_logs: List[Dict[str, Any]] = []  # Daily explanation logs
+        
+        if z_explainer_enabled:
+            try:
+                from src.stage_b_stateful.z_explainer import (
+                    ZExplainerBuffer,
+                    RollingSurrogate,
+                    ValidationCompanion,
+                )
+                z_explainer_buffer = ZExplainerBuffer()
+                z_surrogate = RollingSurrogate(
+                    window=int(cfg.get("phase2_z_explainer_window", 126)),
+                    max_window=int(cfg.get("phase2_z_explainer_max_window", 252)),
+                    refit_interval=int(cfg.get("phase2_z_explainer_refit_interval", 5)),
+                    regularization=float(cfg.get("phase2_z_explainer_regularization", 10.0)),
+                    min_samples_for_fit=int(cfg.get("phase2_z_explainer_min_samples", 50)),
+                    top_n_symbols=int(cfg.get("phase2_z_explainer_top_symbols", 10)),
+                    top_k_features=int(cfg.get("phase2_z_explainer_top_features", 5)),
+                )
+                
+                # Step 7: Validation companion (sanity check z_final vs forward returns)
+                validation_enabled = bool(cfg.get("phase2_z_explainer_validation", True))
+                if validation_enabled:
+                    z_validation_companion = ValidationCompanion(
+                        window=int(cfg.get("phase2_z_explainer_window", 126)),
+                        max_window=int(cfg.get("phase2_z_explainer_max_window", 252)),
+                        refit_interval=int(cfg.get("phase2_z_explainer_validation_refit", 10)),
+                        regularization=float(cfg.get("phase2_z_explainer_regularization", 10.0)),
+                        min_samples=int(cfg.get("phase2_z_explainer_validation_min_samples", 100)),
+                    )
+                
+                logger.info(
+                    "[phase2.z_explainer] Enabled: window=%d-%d, refit every %d days, λ=%.2f, validation=%s",
+                    z_surrogate.window, z_surrogate.max_window,
+                    z_surrogate.refit_interval, z_surrogate.regularization,
+                    "ON" if z_validation_companion else "OFF"
+                )
+            except ImportError as e:
+                logger.warning("[phase2.z_explainer] z_explainer module not available: %s", e)
+                z_explainer_enabled = False
+
+        # ─────────────────────────────────────────────────────────────────────
+        # RISK LATCH: Unified risk-control state machine
+        # Consolidates all risk mechanisms (policy, kill-switches, overlays)
+        # into a single state machine with clear precedence.
+        # ─────────────────────────────────────────────────────────────────────
+        risk_latch_enabled = bool(cfg.get("phase2_risk_latch_enabled", True))
+        risk_latch: Optional["RiskLatch"] = None
+        risk_events_ledger = None  # type: ignore
+        
+        if risk_latch_enabled:
+            try:
+                from src.stage_b_stateful.risk_latch import (
+                    RiskLatch,
+                    RiskLatchMode,
+                    create_risk_latch,
+                )
+                risk_latch = create_risk_latch(cfg, n_assets)
+                logger.info(
+                    "[phase2.risk_latch] Enabled: DD_kill=%.1f%%, vol_kill=%.1f%%, throttle_min=%.1f%%",
+                    risk_latch.thresholds.max_drawdown_kill * 100,
+                    risk_latch.thresholds.max_vol_kill * 100,
+                    risk_latch.thresholds.throttle_min_scale * 100,
+                )
+                
+                # ─────────────────────────────────────────────────────────────
+                # RISK EVENTS LEDGER: Daily diagnostic output
+                # Writes JSONL file with all risk events for post-run analysis.
+                # ─────────────────────────────────────────────────────────────
+                try:
+                    from src.stage_b_stateful.risk_events_ledger import (
+                        RiskEventsLedger,
+                        EventType,
+                        ActionTaken,
+                        create_ledger,
+                    )
+                    risk_events_ledger = create_ledger(
+                        symbol=symbol_to_run,
+                        horizon=horizon,
+                        base_dir=str(cfg.get(
+                            "phase2_risk_events_dir",
+                            "cache/debugging/risk_events",
+                        )),
+                        run_id=str(cfg.get("phase2_run_id", None)),
+                    )
+                    logger.info(
+                        "[phase2.risk_events_ledger] Enabled: path=%s",
+                        risk_events_ledger.path,
+                    )
+                except ImportError as e:
+                    logger.warning(
+                        "[phase2.risk_events_ledger] risk_events_ledger not available: %s",
+                        e,
+                    )
+                    risk_events_ledger = None
+                    
+            except ImportError as e:
+                logger.warning("[phase2.risk_latch] risk_latch module not available: %s", e)
+                risk_latch_enabled = False
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # INTRADAY MONITOR: Read live monitor snapshots (for live trading)
+        # The intraday monitor runs as a separate process and writes a JSON
+        # snapshot. We read it at the top of each day to check for alerts.
+        # ─────────────────────────────────────────────────────────────────────
+        intraday_monitor_enabled = bool(cfg.get("phase2_intraday_monitor_enabled", False))
+        intraday_snapshot_path = str(cfg.get(
+            "phase2_intraday_snapshot_path",
+            "artifacts/intraday_monitor/latest_snapshot.json",
+        ))
+        intraday_snapshot_max_age = float(cfg.get("phase2_intraday_snapshot_max_age", 300.0))
+        
+        if intraday_monitor_enabled:
+            logger.info(
+                "[phase2.intraday_monitor] Enabled: snapshot_path=%s, max_age=%.0fs",
+                intraday_snapshot_path,
+                intraday_snapshot_max_age,
+            )
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # STRESS OVERLAY: On-the-fly scenario stress tests
+        # Applied after optimizer, before final safety overlays.
+        # ─────────────────────────────────────────────────────────────────────
+        stress_overlay_enabled = bool(cfg.get("phase2_stress_enabled", True))
+        stress_overlay = None
+        
+        if stress_overlay_enabled:
+            try:
+                from src.stage_b_stateful.stress_overlay import (
+                    StressTestOverlay,
+                    create_stress_overlay,
+                )
+                stress_overlay = create_stress_overlay(cfg, n_assets)
+                logger.info(
+                    "[phase2.stress_overlay] Enabled: k_sigma=%.0f, loss_throttle=%.1f%%, loss_flatten=%.1f%%",
+                    stress_overlay.config.shock_k_sigma,
+                    stress_overlay.config.shock_loss_throttle_pct * 100,
+                    stress_overlay.config.shock_loss_flatten_pct * 100,
+                )
+            except ImportError as e:
+                logger.warning("[phase2.stress_overlay] stress_overlay module not available: %s", e)
+                stress_overlay_enabled = False
 
         # Per-update and per-fold structured logs.
         update_logs: List[Dict[str, Any]] = []
@@ -3535,7 +5600,105 @@ def evaluate_phase2_stateful_once(
         elif universe_enabled and universe_mode == "full":
             logger.info("[phase2.v2] runtime universe gate enabled: mode=full (eligible universe)")
 
+        # Track previous eligible count for collapse detection
+        _prev_eligible_count: int = n_assets
+        # Track previous z-scores for sign flip detection
+        _prev_z_for_flip: Optional[np.ndarray] = None
+
         for i, day in enumerate(union_oos_index):
+            # ─────────────────────────────────────────────────────────────────
+            # RISK LATCH: Begin session (decrement latches, check releases)
+            # ─────────────────────────────────────────────────────────────────
+            if risk_latch_enabled and risk_latch is not None:
+                risk_latch.begin_session(i)
+            
+            # ─────────────────────────────────────────────────────────────────
+            # INTRADAY MONITOR: Check for live alerts (top of each day)
+            # If the intraday monitor has flagged EMERGENCY, we do not argue:
+            # we set w_target=0 and skip the rest of the day.
+            # KEY RULE: Intraday monitor never touches Mamba. It only sets a
+            # risk latch that overrides allocations.
+            # ─────────────────────────────────────────────────────────────────
+            intraday_emergency = False
+            if intraday_monitor_enabled:
+                try:
+                    from src.stage_b_stateful.intraday_monitor import (
+                        read_intraday_snapshot,
+                        apply_intraday_snapshot_to_latch,
+                    )
+                    intraday_snapshot = read_intraday_snapshot(
+                        path=intraday_snapshot_path,
+                        max_age_seconds=intraday_snapshot_max_age,
+                    )
+                    
+                    if intraday_snapshot is not None:
+                        if intraday_snapshot.should_emergency_stop():
+                            intraday_emergency = True
+                            logger.warning(
+                                "[phase2.intraday_monitor] EMERGENCY from live monitor: %s",
+                                intraday_snapshot.trigger_reason,
+                            )
+                            
+                            # Apply to risk latch
+                            if risk_latch is not None:
+                                apply_intraday_snapshot_to_latch(intraday_snapshot, risk_latch)
+                            
+                            # EMIT: RISK_LATCH_EMERGENCY
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.CRITICAL,
+                                code=EventCode.RISK_LATCH_EMERGENCY,
+                                message=f"Intraday monitor EMERGENCY: {intraday_snapshot.trigger_reason}",
+                                payload=intraday_snapshot.to_dict(),
+                            )
+                            
+                            # Force flatten for this day
+                            w = np.zeros(n_assets, dtype=float)
+                            w_mat[i, :] = w
+                            
+                            # Still need to track PnL on current positions
+                            r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+                            pnl = float(exec_w @ r_vec)
+                            
+                            if trade_delay_sessions > 1:
+                                _queue.append(w.copy())
+                                w_next = np.asarray(_queue.popleft(), dtype=float)
+                            else:
+                                w_next = w.copy()
+                            
+                            tval_intent = float(np.sum(np.abs(w - prev_w)))
+                            tval_exec = float(np.sum(np.abs(w_next - exec_w)))
+                            turnover_intent[i] = tval_intent
+                            turnover_exec[i] = tval_exec
+                            turnover[i] = tval_exec
+                            
+                            cost = float(k_spread * tval_exec + k_impact * (tval_exec ** 1.5))
+                            costs[i] = cost
+                            pnl_net = float(pnl - cost)
+                            net_ret[i] = pnl_net
+                            equity[i] = float((equity[i - 1] if i > 0 else 1.0) * (1.0 + pnl_net))
+                            equity_peak = float(max(equity_peak, equity[i]))
+                            cov = _ewma_cov_update(cov, r_vec, cov_lam)
+                            
+                            prev_exec_w = exec_w.copy()
+                            exec_w = w_next
+                            prev_w = w
+                            continue
+                        
+                        elif intraday_snapshot.should_throttle():
+                            # Apply throttle to risk latch
+                            if risk_latch is not None:
+                                apply_intraday_snapshot_to_latch(intraday_snapshot, risk_latch)
+                            logger.info(
+                                "[phase2.intraday_monitor] Throttle from live monitor: %s (scale=%.2f)",
+                                intraday_snapshot.trigger_reason,
+                                intraday_snapshot.recommended_scale,
+                            )
+                
+                except Exception as e:
+                    logger.debug("[phase2.intraday_monitor] Error reading snapshot: %s", e)
+            
             # Compute registry eligibility mask for this day (used for training/inference/weights gating).
             if _registry_df is not None:
                 try:
@@ -3590,19 +5753,195 @@ def evaluate_phase2_stateful_once(
                     current_universe = None
                     _universe_mask = None
 
+            # ─────────────────────────────────────────────────────────────────
+            # POINT 1: INPUT HEALTH CHECKS (before inference)
+            # Check role_ctx availability, hygiene_ok %, eligible mask collapse
+            # ─────────────────────────────────────────────────────────────────
+            input_health_fallback = False
+            if risk_latch_enabled and risk_latch is not None:
+                try:
+                    # 1. Role context availability and staleness
+                    role_ctx_ok = role_ctx is not None
+                    role_ctx_stale_days = 0
+                    
+                    # 2. Hygiene percentage from role_ctx
+                    hygiene_ok_pct_for_check = 1.0
+                    if role_ctx is not None:
+                        try:
+                            _day_ctx_health = role_ctx.get_for_day(pd.Timestamp(day))
+                            _hygiene_arr = np.asarray(_day_ctx_health.hygiene_ok, dtype=bool)
+                            if len(_hygiene_arr) > 0:
+                                hygiene_ok_pct_for_check = float(np.mean(_hygiene_arr))
+                            # Check staleness (compare day_ctx date to current day)
+                            if hasattr(_day_ctx_health, 'date') and _day_ctx_health.date is not None:
+                                ctx_date = pd.Timestamp(_day_ctx_health.date).normalize()
+                                day_date = pd.Timestamp(day).normalize()
+                                role_ctx_stale_days = int((day_date - ctx_date).days)
+                        except Exception:
+                            pass
+                    
+                    # 3. Eligible mask collapse detection
+                    eligible_count_today = n_assets  # Default to all eligible
+                    if _eligible_mask is not None:
+                        eligible_count_today = int(np.sum(_eligible_mask))
+                    
+                    # Run the input health check
+                    input_health_mode = risk_latch.check_input_health(
+                        hygiene_ok_pct=hygiene_ok_pct_for_check,
+                        role_ctx_available=role_ctx_ok,
+                        role_ctx_days_stale=role_ctx_stale_days,
+                        eligible_count_today=eligible_count_today,
+                        eligible_count_yesterday=_prev_eligible_count,
+                    )
+                    
+                    # Update prev count for next iteration
+                    _prev_eligible_count = eligible_count_today
+                    
+                    # If triggered SAFE_FALLBACK or worse, resolve and handle
+                    if input_health_mode >= RiskLatchMode.SAFE_FALLBACK:
+                        input_health_state = risk_latch.resolve()
+                        
+                        # Check if we should flatten OR hold fallback
+                        if input_health_state.should_flatten() or input_health_state.should_hold_fallback():
+                            input_health_fallback = True
+                            
+                            # Determine action taken for logging
+                            if input_health_state.should_hold_fallback():
+                                action_taken = "SAFE_FALLBACK_HOLD"
+                                exposure_scale_log = 1.0 if input_health_state.last_good_weights is not None else 0.0
+                            else:
+                                action_taken = "FLATTEN"
+                                exposure_scale_log = 0.0
+                            
+                            # ─────────────────────────────────────────────────────
+                            # LEDGER: Log input health fail event
+                            # ─────────────────────────────────────────────────────
+                            if risk_events_ledger is not None:
+                                try:
+                                    risk_events_ledger.add_event(
+                                        date=str(pd.Timestamp(day))[:10],
+                                        day_idx=i,
+                                        event_type="INPUT_HEALTH_FAIL",
+                                        threshold="hygiene_ok >= 30% AND role_ctx fresh AND eligible stable",
+                                        threshold_crossed=True,
+                                        action_taken=action_taken,
+                                        exposure_scale=exposure_scale_log,
+                                        trigger_reason=(
+                                            input_health_state.primary_reason.name
+                                            if input_health_state.primary_reason
+                                            else "unknown"
+                                        ),
+                                        details={
+                                            "hygiene_ok_pct": hygiene_ok_pct_for_check,
+                                            "role_ctx_ok": role_ctx_ok,
+                                            "role_ctx_stale_days": role_ctx_stale_days,
+                                            "eligible_count_today": eligible_count_today,
+                                            "eligible_count_yesterday": _prev_eligible_count,
+                                        },
+                                    )
+                                except Exception as le:
+                                    logger.debug("[phase2.ledger] Failed to log event: %s", le)
+                            
+                            # EMIT: RISK_LATCH event
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.RISK_LATCH_SAFE_FALLBACK,
+                                message=f"Input health {input_health_state.mode.name}: {input_health_state.primary_reason.name if input_health_state.primary_reason else 'unknown'}",
+                                payload=input_health_state.to_dict(),
+                            )
+                            
+                            # Apply safe fallback or flatten
+                            w = input_health_state.get_effective_weights(
+                                np.zeros(n_assets, dtype=float),
+                                n_assets,
+                            )
+                            w_mat[i, :] = w
+                            
+                            # Handle PnL and execution queue
+                            r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+                            pnl = float(exec_w @ r_vec)
+                            
+                            if trade_delay_sessions > 1:
+                                _queue.append(w.copy())
+                                w_next = np.asarray(_queue.popleft(), dtype=float)
+                            else:
+                                w_next = w.copy()
+                            
+                            tval_intent = float(np.sum(np.abs(w - prev_w)))
+                            tval_exec = float(np.sum(np.abs(w_next - exec_w)))
+                            turnover_intent[i] = tval_intent
+                            turnover_exec[i] = tval_exec
+                            turnover[i] = tval_exec
+                            
+                            cost = float(k_spread * tval_exec + k_impact * (tval_exec ** 1.5))
+                            costs[i] = cost
+                            pnl_net = float(pnl - cost)
+                            net_ret[i] = pnl_net
+                            equity[i] = float((equity[i - 1] if i > 0 else 1.0) * (1.0 + pnl_net))
+                            equity_peak = float(max(equity_peak, equity[i]))
+                            cov = _ewma_cov_update(cov, r_vec, cov_lam)
+                            
+                            prev_exec_w = exec_w.copy()
+                            exec_w = w_next
+                            prev_w = w
+                            
+                            if risk_latch is not None:
+                                risk_latch.end_session(None)
+                            continue
+                except Exception as e:
+                    logger.debug("[phase2.risk_latch] Input health check error: %s", e)
+
             # If we are in a forced-flat safety cooldown, keep portfolio flat.
             if safety_enabled and int(flat_until_idx) >= 0 and i <= int(flat_until_idx):
-                w_mat[i, :] = prev_w
-                # Realized PnL still accrues on the existing weights (prev_w).
+                # EMIT: COOLDOWN_ACTIVE
+                event_bus.emit(
+                    date=str(pd.Timestamp(day))[:10],
+                    day_idx=i,
+                    severity=EventSeverity.WARNING,
+                    code=EventCode.COOLDOWN_ACTIVE,
+                    message=f"Cooldown active until day {flat_until_idx}",
+                    payload={"flat_until_idx": int(flat_until_idx), "days_remaining": int(flat_until_idx - i)},
+                )
+                
+                # FIX Gap #5: Cooldown means FLAT (zeros), not "hold prev_w"
+                # Intent is to flatten, so target = zeros
+                w_target_cooldown = np.zeros(n_assets, dtype=float)
+                w_mat[i, :] = w_target_cooldown
+                
+                # Realized PnL accrues on current EXECUTED weights
                 r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
                 pnl = float(exec_w @ r_vec)
-                turnover[i] = 0.0
-                costs[i] = 0.0
-                pnl_net = float(pnl)
+                
+                # FIX Gap #2: ALWAYS advance the execution queue, even during cooldown
+                # Otherwise exec_w becomes stale and we get mis-timed exposures
+                if trade_delay_sessions > 1:
+                    _queue.append(w_target_cooldown.copy())
+                    w_next_hold = np.asarray(_queue.popleft(), dtype=float)
+                else:
+                    w_next_hold = w_target_cooldown.copy()
+                
+                # Compute turnover for the actual execution that will happen
+                tval_intent = float(np.sum(np.abs(w_target_cooldown - prev_w)))
+                tval_exec = float(np.sum(np.abs(w_next_hold - exec_w)))
+                turnover_intent[i] = tval_intent
+                turnover_exec[i] = tval_exec
+                turnover[i] = tval_exec
+                
+                # Costs on executed turnover (liquidation cost if we're unwinding)
+                cost = float(k_spread * tval_exec + k_impact * (tval_exec ** 1.5))
+                costs[i] = cost
+                pnl_net = float(pnl - cost)
                 net_ret[i] = pnl_net
                 equity[i] = float((equity[i - 1] if i > 0 else 1.0) * (1.0 + pnl_net))
                 equity_peak = float(max(equity_peak, equity[i]))
                 cov = _ewma_cov_update(cov, r_vec, cov_lam)
+                
+                # Update state for next iteration
+                prev_exec_w = exec_w.copy()
+                exec_w = w_next_hold
+                prev_w = w_target_cooldown
                 continue
 
             if i in update_positions:
@@ -3692,6 +6031,118 @@ def evaluate_phase2_stateful_once(
                     cfg_upd["early_stopping_patience"] = int(cfg.get("early_stopping_patience", 2))
                     cfg_upd["max_epochs"] = int(update_epochs)
 
+                    # ─────────────────────────────────────────────────────────────
+                    # Build calibration context for calibration-gated learning.
+                    # AUTHORITATIVE: Use Mamba-based calibration (μ, σ²) tracking.
+                    # Quantile-based calibration is now SECONDARY (20-30% weight).
+                    # ─────────────────────────────────────────────────────────────
+                    calibration_context: Optional[Dict[str, Any]] = None
+                    learning_gov_decision = None
+                    
+                    try:
+                        # Primary: Mamba calibration from tracker.
+                        if mamba_calib_snapshot is not None and mamba_calib_snapshot.is_reliable:
+                            calib_overall = float(mamba_calib_snapshot.calibration_overall)
+                        else:
+                            # Fallback: quantile-based during warm-up.
+                            calib_overall = 1.0
+                            if role_ctx is not None:
+                                try:
+                                    upd_day_ctx = role_ctx.get_for_day(pd.Timestamp(cutoff))
+                                    calib_overall = float(upd_day_ctx.calibration_overall_score)
+                                except Exception:
+                                    pass
+                        
+                        # ─────────────────────────────────────────────────────────
+                        # Learning Governor: Three-zone policy with drift detection
+                        # This gates learning based on calibration:
+                        #   GREEN (cal >= 0.70): slow updates
+                        #   YELLOW (0.55 <= cal < 0.70): normal updates
+                        #   RED (cal < 0.55): freeze learning
+                        # ─────────────────────────────────────────────────────────
+                        if learning_governor is not None:
+                            try:
+                                from src.stage_b_stateful.learning_governor import LearningDecision
+                                
+                                learning_gov_decision = learning_governor.get_decision(
+                                    date=str(pd.Timestamp(day))[:10],
+                                    day_idx=i,
+                                    calibration_score=calib_overall,
+                                )
+                                
+                                # Apply learning rate multiplier from governor
+                                lr_mult_from_gov = float(learning_gov_decision.learning_rate_mult)
+                                
+                                # If frozen or locked, skip update entirely
+                                if learning_gov_decision.decision in (LearningDecision.FREEZE_LEARNING, LearningDecision.REQUIRE_UNLOCK):
+                                    logger.info(
+                                        "[phase2.learning_gov] Skipping update: %s (zone=%s, cal=%.3f)",
+                                        learning_gov_decision.reason,
+                                        learning_gov_decision.zone.value,
+                                        calib_overall,
+                                    )
+                                    # Emit event
+                                    event_bus.emit(
+                                        date=str(pd.Timestamp(day))[:10],
+                                        day_idx=i,
+                                        severity=EventSeverity.WARNING,
+                                        code=EventCode.LEARNING_FROZEN,
+                                        message=f"Learning frozen: {learning_gov_decision.reason}",
+                                        payload={
+                                            "zone": learning_gov_decision.zone.value,
+                                            "calibration_score": calib_overall,
+                                            "decision": learning_gov_decision.decision.value,
+                                            "is_locked": learning_gov_decision.is_locked,
+                                        },
+                                    )
+                                    # Skip the update entirely
+                                    continue
+                            except Exception as e:
+                                logger.warning("[phase2.learning_gov] Decision error: %s", e)
+                                lr_mult_from_gov = 1.0
+                        else:
+                            lr_mult_from_gov = 1.0
+                        
+                        # Online trust from role context (still valid).
+                        online_trust = 1.0
+                        if role_ctx is not None:
+                            try:
+                                upd_day_ctx = role_ctx.get_for_day(pd.Timestamp(cutoff))
+                                online_trust = float(upd_day_ctx.online_trust_score)
+                            except Exception:
+                                pass
+                        
+                        calibration_context = {
+                            "calibration_overall_score": calib_overall,
+                            "online_trust_score": online_trust,
+                            # Thresholds from cfg (with defaults)
+                            "calib_freeze_threshold": float(cfg.get("calib_freeze_threshold", 0.3)),
+                            "trust_freeze_threshold": float(cfg.get("trust_freeze_threshold", 0.3)),
+                            "calib_decay_threshold": float(cfg.get("calib_decay_threshold", 0.6)),
+                            "overconfidence_penalty_lambda": float(cfg.get("overconfidence_penalty_lambda", 0.1)),
+                            # Learning governor multiplier
+                            "lr_mult_from_governor": lr_mult_from_gov,
+                            # Mamba calibration details for diagnostics.
+                            "mamba_calib_reliable": bool(mamba_calib_snapshot.is_reliable) if mamba_calib_snapshot else False,
+                            "mamba_mu_score": float(mamba_calib_snapshot.mu_score) if mamba_calib_snapshot else 0.5,
+                            "mamba_sigma_score": float(mamba_calib_snapshot.sigma_score) if mamba_calib_snapshot else 0.5,
+                            "mamba_nll_score": float(mamba_calib_snapshot.nll_score) if mamba_calib_snapshot else 0.5,
+                            "mamba_n_matured": int(mamba_calib_snapshot.n_matured) if mamba_calib_snapshot else 0,
+                        }
+                    except Exception as e:
+                        logger.debug("[phase2.calib_gate] failed to build calibration context for %s: %s", cutoff, e)
+                        calibration_context = None
+
+                    # Apply learning governor's learning rate multiplier to cfg_upd
+                    if lr_mult_from_gov != 1.0:
+                        base_lr = float(cfg_upd.get("learning_rate", cfg_upd.get("lr", 1e-4)))
+                        cfg_upd["learning_rate"] = base_lr * lr_mult_from_gov
+                        cfg_upd["lr"] = base_lr * lr_mult_from_gov
+                        logger.debug(
+                            "[phase2.learning_gov] Applied lr_mult=%.3f: base_lr=%.2e -> effective_lr=%.2e",
+                            lr_mult_from_gov, base_lr, cfg_upd["learning_rate"],
+                        )
+
                     # Optional: baseline evaluation before update.
                     pre_eval: Optional[Dict[str, float]] = None
                     if diag_enabled and diag_pre_post and warm_state is not None:
@@ -3712,6 +6163,7 @@ def evaluate_phase2_stateful_once(
                         device=device,
                         warm_state=warm_state,
                         return_model=True,
+                        calibration_context=calibration_context,
                     )
 
                     upd_elapsed = float(max(0.0, time.time() - upd_t0))
@@ -3732,6 +6184,83 @@ def evaluate_phase2_stateful_once(
                     except Exception:
                         post_corr = float("nan")
 
+                    # ─────────────────────────────────────────────────────────
+                    # Report update outcome to LearningGovernor for auto-revert
+                    # ─────────────────────────────────────────────────────────
+                    if learning_governor is not None and learning_gov_decision is not None:
+                        try:
+                            # Get post-update calibration (use the updated model's calibration)
+                            post_update_calib = calib_overall  # Start with pre-update
+                            if mamba_calib_tracker is not None:
+                                try:
+                                    # Try to get fresh calibration after update
+                                    # Note: Full calibration update happens later, so we estimate
+                                    # based on val_corr improvement as proxy
+                                    delta_corr = post_corr - (float(pre_eval.get("val_corr", 0.5)) if pre_eval else 0.5)
+                                    # Scale calibration estimate by correlation improvement
+                                    post_update_calib = min(1.0, max(0.0, calib_overall + 0.1 * delta_corr))
+                                except Exception:
+                                    post_update_calib = calib_overall
+                            
+                            # Check lock state before update
+                            was_locked = learning_gov_decision.is_locked
+                            
+                            # Report outcome - this can trigger auto-lock if calibration dropped
+                            update_accepted = learning_governor.report_update_outcome(
+                                date=str(pd.Timestamp(day))[:10],
+                                pre_calib=float(calib_overall),
+                                post_calib=float(post_update_calib),
+                                checkpoint_path=None,  # TODO: implement checkpoint saving
+                            )
+                            
+                            # Check if lock state changed
+                            # Get fresh decision to check current lock state
+                            from src.stage_b_stateful.learning_governor import LearningDecision
+                            current_decision = learning_governor.get_decision(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                calibration_score=float(post_update_calib),
+                            )
+                            is_now_locked = current_decision.is_locked
+                            
+                            # Emit LOCKED event if state transitioned to locked
+                            if not was_locked and is_now_locked:
+                                event_bus.emit(
+                                    date=str(pd.Timestamp(day))[:10],
+                                    day_idx=i,
+                                    severity=EventSeverity.WARNING,
+                                    code=EventCode.LEARNING_GOV_LOCKED,
+                                    message=f"Learning governor auto-locked: calibration dropped {post_update_calib - calib_overall:.3f}",
+                                    payload={
+                                        "pre_calibration": float(calib_overall),
+                                        "post_calibration": float(post_update_calib),
+                                        "delta": float(post_update_calib - calib_overall),
+                                        "lock_reason": str(getattr(learning_governor._state, "lock_reason", "unknown")),
+                                    },
+                                )
+                            
+                            # Emit event for governor decision
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.INFO,
+                                code=EventCode.LEARNING_GOV_DECISION,
+                                message=f"Learning update: zone={learning_gov_decision.zone.value}, lr_mult={learning_gov_decision.learning_rate_mult:.3f}",
+                                payload={
+                                    "zone": learning_gov_decision.zone.value,
+                                    "decision": learning_gov_decision.decision.value,
+                                    "lr_mult": float(learning_gov_decision.learning_rate_mult),
+                                    "cadence_mult": float(learning_gov_decision.cadence_mult),
+                                    "pre_calibration": float(calib_overall),
+                                    "post_calibration": float(post_update_calib),
+                                    "drift_detected": learning_gov_decision.drift_detected,
+                                    "is_locked": is_now_locked,
+                                    "update_accepted": bool(update_accepted),
+                                },
+                            )
+                        except Exception as e:
+                            logger.warning("[phase2.learning_gov] Outcome reporting error: %s", e)
+
                     if diag_enabled:
                         rec: Dict[str, Any] = {
                             "kind": "update",
@@ -3746,6 +6275,38 @@ def evaluate_phase2_stateful_once(
                             "val_loss_post": float(post_val_loss),
                             "val_corr_post": float(post_corr),
                         }
+                        # Add calibration-gated learning decisions to diagnostics
+                        learning_decisions = train_result.get("learning_decisions", {})
+                        if learning_decisions:
+                            rec.update({
+                                "calib_learning_allowed": bool(learning_decisions.get("learning_allowed", True)),
+                                "calib_learning_frozen_reason": str(learning_decisions.get("learning_frozen_reason") or ""),
+                                "calib_score": float(learning_decisions.get("calib_score", 1.0)),
+                                "trust_score": float(learning_decisions.get("trust_score", 1.0)),
+                                "calib_lr_scale": float(learning_decisions.get("lr_scale", 1.0)),
+                                "calib_effective_lr": float(learning_decisions.get("effective_lr", 0.0)),
+                                "calib_gradients_applied": int(learning_decisions.get("gradients_applied", 0)),
+                                "calib_gradients_skipped": int(learning_decisions.get("gradients_skipped", 0)),
+                            })
+                        # Add Mamba calibration tracker details (AUTHORITATIVE source)
+                        if mamba_calib_snapshot is not None:
+                            rec.update({
+                                "mamba_calib_overall": float(mamba_calib_snapshot.calibration_overall),
+                                "mamba_calib_mamba_only": float(mamba_calib_snapshot.mamba_overall),
+                                "mamba_mu_score": float(mamba_calib_snapshot.mu_score),
+                                "mamba_mu_correlation": float(mamba_calib_snapshot.mu_correlation),
+                                "mamba_mu_directional_accuracy": float(mamba_calib_snapshot.mu_directional_accuracy),
+                                "mamba_sigma_score": float(mamba_calib_snapshot.sigma_score),
+                                "mamba_sigma_calibration": float(mamba_calib_snapshot.sigma_calibration),
+                                "mamba_sigma_coverage_1std": float(mamba_calib_snapshot.sigma_coverage_1std),
+                                "mamba_sigma_coverage_2std": float(mamba_calib_snapshot.sigma_coverage_2std),
+                                "mamba_nll_score": float(mamba_calib_snapshot.nll_score),
+                                "mamba_nll_mean": float(mamba_calib_snapshot.nll_mean),
+                                "mamba_nll_std": float(mamba_calib_snapshot.nll_std),
+                                "mamba_quantile_secondary": float(mamba_calib_snapshot.quantile_score),
+                                "mamba_n_matured": int(mamba_calib_snapshot.n_matured),
+                                "mamba_is_reliable": bool(mamba_calib_snapshot.is_reliable),
+                            })
                         if pre_eval is not None:
                             rec.update(
                                 {
@@ -3757,6 +6318,20 @@ def evaluate_phase2_stateful_once(
                             try:
                                 rec["delta_val_loss"] = float(rec["val_loss_post"] - rec["val_loss_pre"])  # lower is better
                                 rec["delta_val_corr"] = float(rec["val_corr_post"] - rec["val_corr_pre"])  # higher is better
+                            except Exception:
+                                pass
+                        # Add LearningGovernor decision to diagnostics
+                        if learning_gov_decision is not None:
+                            try:
+                                rec.update({
+                                    "gov_zone": str(learning_gov_decision.zone.value),
+                                    "gov_decision": str(learning_gov_decision.decision.value),
+                                    "gov_lr_mult": float(learning_gov_decision.learning_rate_mult),
+                                    "gov_cadence_mult": float(learning_gov_decision.cadence_mult),
+                                    "gov_is_drift_triggered": bool(learning_gov_decision.is_drift_triggered),
+                                    "gov_is_locked": bool(learning_gov_decision.is_locked),
+                                    "gov_reason": str(learning_gov_decision.reason),
+                                })
                             except Exception:
                                 pass
                         update_logs.append(rec)
@@ -3814,6 +6389,111 @@ def evaluate_phase2_stateful_once(
             mu_mat[i, :] = mu_vec
             sigma_mat[i, :] = sigma_vec
 
+            # ─────────────────────────────────────────────────────────────────
+            # Mamba calibration tracking:
+            # 1. Add today's prediction to tracker.
+            # 2. If matured predictions exist (i >= horizon), add realized returns.
+            # 3. Get updated calibration score for learning gates.
+            # ─────────────────────────────────────────────────────────────────
+            try:
+                mamba_calib_tracker.add_prediction(i, mu_vec, sigma_vec)
+                
+                # Add realized returns for matured predictions.
+                matured_idx = i - horizon
+                if matured_idx >= 0:
+                    # fwd_ret_mat[matured_idx, :] contains realized H-day returns
+                    # for predictions made at matured_idx.
+                    realized_ret = fwd_ret_mat[matured_idx, :]
+                    if np.any(np.isfinite(realized_ret)):
+                        mamba_calib_tracker.add_realized(matured_idx, realized_ret)
+                
+                # ─────────────────────────────────────────────────────────────
+                # LINEAR ALPHA COMBINER: Update with matured predictions
+                # Uses same maturity gating as Mamba calibration.
+                # Freeze updates when calibration < 0.55 (RED zone).
+                # ─────────────────────────────────────────────────────────────
+                if linear_state is not None and matured_idx >= 0:
+                    try:
+                        # Get calibration score for freeze decision
+                        # (use quantile score as fallback during warmup)
+                        _calib_for_freeze = 1.0
+                        if mamba_calib_snapshot is not None and mamba_calib_snapshot.is_reliable:
+                            _calib_for_freeze = float(mamba_calib_snapshot.calibration_overall)
+                        elif role_ctx is not None:
+                            try:
+                                _day_ctx_freeze = role_ctx.get_for_day(pd.Timestamp(day))
+                                _calib_for_freeze = float(_day_ctx_freeze.calibration_overall_score)
+                            except Exception:
+                                pass
+                        
+                        refit_report = linear_state.update_if_matured(
+                            i, fwd_ret_mat, 
+                            freeze=(_calib_for_freeze < 0.55)
+                        )
+                        
+                        # Log refit if it occurred
+                        if refit_report is not None and refit_report.get("status") == "fitted":
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.INFO,
+                                code=EventCode.MAMBA_CALIB_UPDATED,  # Reuse event code
+                                message=f"Linear combiner refit: R²={refit_report.get('r_squared', 0):.3f}",
+                                payload={
+                                    "linear_refit": True,
+                                    "r_squared": float(refit_report.get("r_squared", 0.0)),
+                                    "n_samples": int(refit_report.get("n_samples", 0)),
+                                    "drift": float(refit_report.get("drift", 0.0)),
+                                    "z_mamba_coef": float(refit_report.get("z_mamba_coef", 0.0)),
+                                    "quantile_z_coef": float(refit_report.get("quantile_z_coef", 0.0)),
+                                },
+                            )
+                    except Exception as e:
+                        logger.debug("[phase2.linear] Maturity update failed: %s", e)
+                
+                # ─────────────────────────────────────────────────────────────
+                # GAP #8: Accumulate per-symbol (mu, sigma, realized) for post-hoc stats
+                # ─────────────────────────────────────────────────────────────
+                if per_symbol_calib_enabled and matured_idx >= 0:
+                    # Store prediction made at matured_idx paired with realized_ret
+                    # We need mu/sigma from matured_idx, but those are in mu_mat/sigma_mat
+                    if matured_idx < len(mu_mat) and matured_idx < len(sigma_mat):
+                        _per_sym_mu_acc.append(mu_mat[matured_idx, :].copy())
+                        _per_sym_sigma_acc.append(sigma_mat[matured_idx, :].copy())
+                        _per_sym_realized_acc.append(fwd_ret_mat[matured_idx, :].copy())
+                
+                # Get current Mamba-based calibration (AUTHORITATIVE).
+                # Optionally blend with quantile-based score as secondary diagnostic.
+                quantile_score_for_blend: Optional[float] = None
+                if role_ctx is not None:
+                    try:
+                        _day_ctx_calib = role_ctx.get_for_day(pd.Timestamp(day))
+                        quantile_score_for_blend = float(_day_ctx_calib.calibration_overall_score)
+                    except Exception:
+                        pass
+                
+                mamba_calib_snapshot = mamba_calib_tracker.get_calibration(
+                    quantile_score=quantile_score_for_blend
+                )
+                
+                # EMIT: MAMBA_CALIB_UPDATED
+                if mamba_calib_snapshot is not None:
+                    event_bus.emit(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=i,
+                        severity=EventSeverity.INFO,
+                        code=EventCode.MAMBA_CALIB_UPDATED,
+                        message=f"Mamba calibration updated: score={mamba_calib_snapshot.calibration_overall:.3f}",
+                        payload={
+                            "calibration_overall": float(mamba_calib_snapshot.calibration_overall),
+                            "is_reliable": bool(mamba_calib_snapshot.is_reliable),
+                            "quantile_score_blend": float(quantile_score_for_blend) if quantile_score_for_blend else None,
+                            "n_matured": int(getattr(mamba_calib_snapshot, "n_matured", 0)),
+                        },
+                    )
+            except Exception as e:
+                logger.debug("[phase2.mamba_calib] tracking error: %s", e)
+
             # Compute sigma_exec from sigma_train (sizing-only).
             sigma_vec = np.asarray(sigma_vec, dtype=float)
             sigma_vec = np.clip(sigma_vec, _sigma_exec_eps, 10.0)
@@ -3840,6 +6520,55 @@ def evaluate_phase2_stateful_once(
                     hi, lo = lo, hi
                 sigma_exec[j] = float(np.clip(float(sigma_ema[j]), lo, hi))
             sigma_exec = np.clip(sigma_exec, _sigma_exec_eps, 10.0)
+            
+            # EMIT: SIGMA_CLIPPED (if any assets were clipped)
+            n_clipped = int(np.sum((sigma_ema != sigma_exec)))
+            if n_clipped > 0:
+                # Find worst offenders (largest clip magnitude)
+                clip_diff = np.abs(sigma_ema - sigma_exec)
+                worst_idx = np.argsort(-clip_diff)[:5]
+                worst_syms = [(str(syms[j]), float(clip_diff[j])) for j in worst_idx if clip_diff[j] > 1e-9]
+                event_bus.emit(
+                    date=str(pd.Timestamp(day))[:10],
+                    day_idx=i,
+                    severity=EventSeverity.INFO,
+                    code=EventCode.SIGMA_CLIPPED,
+                    message=f"Sigma clipped for {n_clipped} assets",
+                    payload={
+                        "n_clipped": n_clipped,
+                        "worst_offenders": worst_syms,
+                        "sigma_exec_mean": float(np.mean(sigma_exec)),
+                        "sigma_exec_std": float(np.std(sigma_exec)),
+                    },
+                )
+
+            # Optional split-stress execution conservatism.
+            # Mode:
+            # - shrink_z (default): apply after z is computed
+            # - inflate_sigma: inflate sigma_exec before z is computed
+            # - both: apply both
+            day_ctx_for_overlays = None
+            split_mode = str(os.environ.get("PORTFOLIO_SPLIT_STRESS_MODE", "shrink_z")).strip().lower()
+            use_split_inflate = "inflate" in split_mode
+            use_split_shrink = "shrink" in split_mode or split_mode == "both"
+            split_penalty_k = float(os.environ.get("PORTFOLIO_SPLIT_STRESS_K", "0.3"))
+            if role_ctx is not None and use_split_inflate:
+                try:
+                    day_ctx_for_overlays = role_ctx.get_for_day(pd.Timestamp(day))
+                    idx_map = {str(s).upper(): int(j) for j, s in enumerate(day_ctx_for_overlays.symbols)}
+                    split_stress = np.asarray(
+                        [
+                            day_ctx_for_overlays.split_stress[idx_map.get(str(s).upper(), -1)]
+                            if idx_map.get(str(s).upper(), -1) >= 0
+                            else 0.0
+                            for s in syms
+                        ],
+                        dtype=float,
+                    )
+                    sigma_exec = sigma_exec * (1.0 + split_penalty_k * split_stress)
+                    sigma_exec = np.clip(sigma_exec, _sigma_exec_eps, 10.0)
+                except Exception:
+                    day_ctx_for_overlays = None
 
             z = np.divide(mu_vec, sigma_exec + 1e-9)
             z = np.clip(z, -z_clip, z_clip)
@@ -3847,7 +6576,7 @@ def evaluate_phase2_stateful_once(
             # Apply role-aware overlays (hygiene/risk/regime multipliers).
             if role_ctx is not None:
                 try:
-                    day_ctx = role_ctx.get_for_day(pd.Timestamp(day))
+                    day_ctx = day_ctx_for_overlays or role_ctx.get_for_day(pd.Timestamp(day))
                     idx_map = {str(s).upper(): int(j) for j, s in enumerate(day_ctx.symbols)}
                     risk_scale = np.asarray([day_ctx.risk_scale[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 1.0 for s in syms], dtype=float)
                     regime_mult = np.asarray([day_ctx.regime_multiplier[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 1.0 for s in syms], dtype=float)
@@ -3855,15 +6584,145 @@ def evaluate_phase2_stateful_once(
                     # Split stress penalty: shrink z when split recently occurred
                     # z *= (1 - k * split_stress) where split_stress = max(flag, post_5d, post_20d, recency) * |log_ratio|
                     split_stress = np.asarray([day_ctx.split_stress[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 0.0 for s in syms], dtype=float)
-                    split_penalty_k = float(os.environ.get("PORTFOLIO_SPLIT_STRESS_K", "0.3"))
-                    split_discount = np.clip(1.0 - split_penalty_k * split_stress, 0.1, 1.0)
-                    z = np.where(hygiene_ok, z * risk_scale * regime_mult * split_discount, 0.0)
+                    split_discount = np.clip(1.0 - split_penalty_k * split_stress, 0.1, 1.0) if use_split_shrink else 1.0
+                    
+                    # EMIT: HYGIENE_VETO
+                    n_hygiene_veto = int(np.sum(~hygiene_ok))
+                    if n_hygiene_veto > 0:
+                        veto_syms = [str(syms[j]) for j in range(n_assets) if not hygiene_ok[j]][:10]
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.WARNING,
+                            code=EventCode.HYGIENE_VETO,
+                            message=f"Hygiene veto for {n_hygiene_veto} assets",
+                            payload={"n_vetoed": n_hygiene_veto, "vetoed_syms": veto_syms},
+                        )
+                    
+                    # EMIT: RISK_SCALE_APPLIED (if non-trivial)
+                    n_risk_scaled = int(np.sum(np.abs(risk_scale - 1.0) > 0.01))
+                    if n_risk_scaled > 0:
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.INFO,
+                            code=EventCode.RISK_SCALE_APPLIED,
+                            message=f"Risk scale applied to {n_risk_scaled} assets",
+                            payload={
+                                "n_scaled": n_risk_scaled,
+                                "risk_scale_mean": float(np.mean(risk_scale)),
+                                "risk_scale_min": float(np.min(risk_scale)),
+                            },
+                        )
+                    
+                    # EMIT: REGIME_MULT_APPLIED (if non-trivial)
+                    n_regime_mult = int(np.sum(np.abs(regime_mult - 1.0) > 0.01))
+                    if n_regime_mult > 0:
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.INFO,
+                            code=EventCode.REGIME_MULT_APPLIED,
+                            message=f"Regime multiplier applied to {n_regime_mult} assets",
+                            payload={
+                                "n_scaled": n_regime_mult,
+                                "regime_mult_mean": float(np.mean(regime_mult)),
+                            },
+                        )
+                    
+                    # EMIT: SPLIT_STRESS_APPLIED (if non-trivial)
+                    n_split_stress = int(np.sum(split_stress > 0.01))
+                    if n_split_stress > 0 and use_split_shrink:
+                        stressed_syms = [(str(syms[j]), float(split_stress[j])) for j in range(n_assets) if split_stress[j] > 0.01][:5]
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.WARNING,
+                            code=EventCode.SPLIT_STRESS_APPLIED,
+                            message=f"Split stress applied to {n_split_stress} assets",
+                            payload={
+                                "mode": split_mode,
+                                "n_stressed": n_split_stress,
+                                "stressed_syms": stressed_syms,
+                                "max_stress": float(np.max(split_stress)),
+                            },
+                        )
+                    
+                    # ─────────────────────────────────────────────────────────
+                    # EVENT RISK OVERLAY: Explicit, controllable event management
+                    # - earnings_next_1d: scale down z for names with earnings within 1 day
+                    # - earnings_next_3d: lighter scale for 3-day window (optional)
+                    # - macro_next_1d: scale down entire book for major macro events
+                    # ─────────────────────────────────────────────────────────
+                    event_risk_k_earnings = float(os.environ.get("PORTFOLIO_EVENT_RISK_K_EARNINGS", "0.5"))
+                    event_risk_k_macro = float(os.environ.get("PORTFOLIO_EVENT_RISK_K_MACRO", "0.3"))
+                    event_risk_enabled = str(os.environ.get("PORTFOLIO_EVENT_RISK_ENABLED", "1")).strip() in {"1", "true", "yes"}
+                    
+                    event_discount = np.ones(n_assets, dtype=float)
+                    if event_risk_enabled:
+                        # Extract event risk features from day_ctx
+                        earnings_1d = np.asarray(
+                            [day_ctx.event_risk_earnings_next_1d[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 0.0 for s in syms],
+                            dtype=float
+                        )
+                        earnings_3d = np.asarray(
+                            [day_ctx.event_risk_earnings_next_3d[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 0.0 for s in syms],
+                            dtype=float
+                        )
+                        macro_1d = float(day_ctx.event_risk_macro_next_1d)
+                        event_score = float(np.nanmean(day_ctx.event_risk_score)) if hasattr(day_ctx, "event_risk_score") else 0.0
+                        
+                        # Apply earnings overlay: z *= (1 - k_earn) for names with earnings_next_1d == 1
+                        # Softer discount for 3-day window (25% of full penalty)
+                        earnings_discount = 1.0 - event_risk_k_earnings * earnings_1d - 0.25 * event_risk_k_earnings * (earnings_3d - earnings_1d)
+                        earnings_discount = np.clip(earnings_discount, 0.1, 1.0)
+                        
+                        # Apply macro overlay: global book scale-down
+                        macro_discount = 1.0 - event_risk_k_macro * macro_1d
+                        macro_discount = float(np.clip(macro_discount, 0.3, 1.0))
+
+                        # Apply composite event risk score (0..1) as an additional mild discount
+                        event_score_discount = float(np.clip(1.0 - 0.3 * event_score, 0.7, 1.0))
+                        
+                        event_discount = earnings_discount * macro_discount * event_score_discount
+                        
+                        # EMIT: EVENT_RISK_APPLIED
+                        n_earnings_risk = int(np.sum(earnings_1d > 0.5))
+                        if n_earnings_risk > 0 or macro_1d > 0.5 or event_score > 0.1:
+                            earnings_syms = [str(syms[j]) for j in range(n_assets) if earnings_1d[j] > 0.5][:5]
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.EVENT_RISK_APPLIED,
+                                message=f"Event risk applied: {n_earnings_risk} earnings, macro={macro_1d:.0f}, score={event_score:.2f}",
+                                payload={
+                                    "n_earnings_risk": n_earnings_risk,
+                                    "earnings_syms": earnings_syms,
+                                    "macro_1d": float(macro_1d),
+                                    "event_score": float(event_score),
+                                    "k_earnings": float(event_risk_k_earnings),
+                                    "k_macro": float(event_risk_k_macro),
+                                },
+                            )
+                    
+                    z = np.where(hygiene_ok, z * risk_scale * regime_mult * split_discount * event_discount, 0.0)
                     # Store quantile_z and policy state features for later use
                     day_quantile_z = np.asarray([day_ctx.quantile_z[idx_map.get(str(s).upper(), -1)] if idx_map.get(str(s).upper(), -1) >= 0 else 0.0 for s in syms], dtype=float)
                     day_cboe_panic = float(day_ctx.cboe_panic_premium)
                     day_cboe_slope = float(day_ctx.cboe_term_slope)
                     day_cboe_vrp = float(day_ctx.cboe_vol_risk_premium_z)
-                    day_calib_score = float(day_ctx.calibration_overall_score)
+                    # ─────────────────────────────────────────────────────────
+                    # AUTHORITATIVE calibration: Mamba-based (μ, σ²) tracking.
+                    # Quantile-based score is now SECONDARY (20-30% weight).
+                    # ─────────────────────────────────────────────────────────
+                    day_quantile_calib_score = float(day_ctx.calibration_overall_score)  # Secondary
+                    if mamba_calib_snapshot is not None and mamba_calib_snapshot.is_reliable:
+                        # Use Mamba calibration as primary (already blended with quantile).
+                        day_calib_score = float(mamba_calib_snapshot.calibration_overall)
+                    else:
+                        # Fallback to quantile if Mamba not yet reliable (early warm-up).
+                        day_calib_score = day_quantile_calib_score
                     day_online_trust = float(day_ctx.online_trust_score)
                 except Exception:
                     day_quantile_z = np.zeros(n_assets, dtype=float)
@@ -3877,7 +6736,11 @@ def evaluate_phase2_stateful_once(
                 day_cboe_panic = 0.0
                 day_cboe_slope = 0.0
                 day_cboe_vrp = 0.0
-                day_calib_score = 1.0
+                # Use Mamba calibration if available.
+                if mamba_calib_snapshot is not None and mamba_calib_snapshot.is_reliable:
+                    day_calib_score = float(mamba_calib_snapshot.calibration_overall)
+                else:
+                    day_calib_score = 1.0
                 day_online_trust = 1.0
 
             # Policy controller (contextual bandit) selects knobs for this day.
@@ -3893,9 +6756,46 @@ def evaluate_phase2_stateful_once(
             weight_smoothing_alpha_day = float(weight_smoothing_alpha)
             vol_scaler_day = float(cfg.get("phase2_policy_vol_scaler", 1.0))
             quantile_blend_weight_day = 0.0  # Default: pure Mamba
+            confidence_floor_day = 0.0
+            max_group_gross_day = float(max_group_gross)
+            max_group_net_day = float(max_group_net)
 
             if policy is not None:
                 try:
+                    # Build sector map for v2 state vector
+                    sector_map_for_policy: Optional[Dict[int, str]] = None
+                    if sector_groups is not None:
+                        sector_map_for_policy = {
+                            j: str(sector_groups.get(str(s).upper(), "unknown"))
+                            for j, s in enumerate(syms)
+                        }
+                    
+                    # FIX Gap #3: Compute ADV vector for liquidity stress calculation
+                    adv_vec_for_policy: Optional[np.ndarray] = None
+                    if adv_usd_by_sym:
+                        try:
+                            adv_vec_for_policy = np.zeros(len(syms), dtype=float)
+                            for j, sym in enumerate(syms):
+                                adv_s = adv_usd_by_sym.get(str(sym).upper())
+                                if adv_s is not None and not adv_s.empty:
+                                    try:
+                                        adv_val = float(pd.to_numeric(adv_s.reindex([pd.Timestamp(day)]).iloc[0], errors="coerce"))
+                                        if np.isfinite(adv_val):
+                                            adv_vec_for_policy[j] = adv_val
+                                        else:
+                                            adv_vec_for_policy[j] = 0.0
+                                    except Exception:
+                                        adv_vec_for_policy[j] = 0.0
+                                else:
+                                    adv_vec_for_policy[j] = 0.0
+                            # Only use if we have valid data
+                            if not np.all(adv_vec_for_policy == 0.0):
+                                pass  # Keep the computed vector
+                            else:
+                                adv_vec_for_policy = None
+                        except Exception:
+                            adv_vec_for_policy = None
+                    
                     state_vec = _policy_state_vector(
                         i=i,
                         horizon=int(horizon),
@@ -3905,6 +6805,7 @@ def evaluate_phase2_stateful_once(
                         costs=costs,
                         equity=equity,
                         mu_mat=mu_mat,
+                        sigma_mat=sigma_mat,  # v2: pass sigma predictions
                         fwd_ret_mat=fwd_ret_mat,
                         market_regime=market_regime,
                         state_window=int(cfg.get("phase2_policy_state_window", 20)),
@@ -3916,6 +6817,10 @@ def evaluate_phase2_stateful_once(
                         cboe_vol_risk_premium_z=day_cboe_vrp,
                         calibration_overall_score=day_calib_score,
                         online_trust_score=day_online_trust,
+                        # v2: Additional context for expanded state
+                        weights=prev_w,
+                        sector_map=sector_map_for_policy,
+                        adv_arr=adv_vec_for_policy,  # FIX Gap #3: Pass computed ADV vector
                     )
                     action_idx, action = policy.select_action(state_vec)
                     policy_action_history[i] = int(action_idx)
@@ -3932,35 +6837,231 @@ def evaluate_phase2_stateful_once(
                     weight_smoothing_alpha_day = float(action.weight_smoothing_alpha)
                     vol_scaler_day = float(action.vol_scaler)
                     quantile_blend_weight_day = float(action.quantile_blend_weight)
+                    linear_blend_weight_day = float(action.linear_blend_weight)
+                    confidence_floor_day = float(action.confidence_floor)
+                    # Risk-off leverage schedule (policy-controlled)
+                    if np.isfinite(action.max_leverage_schedule) and action.max_leverage_schedule >= 0:
+                        max_gross_day = float(max_gross_day) * float(action.max_leverage_schedule)
+                    # Sector cap strength: scale group caps if provided
+                    if np.isfinite(action.sector_cap_strength) and action.sector_cap_strength >= 0:
+                        max_group_gross_day = float(max_group_gross_day) * float(action.sector_cap_strength)
+                        max_group_net_day = float(max_group_net_day) * float(action.sector_cap_strength)
+                    
+                    # EMIT: POLICY_ACTION
+                    event_bus.emit(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=i,
+                        severity=EventSeverity.INFO,
+                        code=EventCode.POLICY_ACTION,
+                        message=f"Policy selected action {action_idx}",
+                        payload={
+                            "action_idx": int(action_idx),
+                            "base_threshold": float(thr_base_day),
+                            "target_vol": float(target_vol_day),
+                            "max_gross": float(max_gross_day),
+                            "max_net": float(max_net_day),
+                            "turnover_cap": float(turnover_cap_day),
+                            "quantile_blend_weight": float(quantile_blend_weight_day),
+                            "confidence_floor": float(confidence_floor_day),
+                            "sector_cap_strength": float(action.sector_cap_strength),
+                            "max_leverage_schedule": float(action.max_leverage_schedule),
+                        },
+                    )
                 except Exception:
                     pass
 
-            # Quantile forecast blending (Option 1 from spec):
-            # z = (1 - w_q) * z_mamba + w_q * z_quantile
-            if quantile_blend_weight_day > 0 and np.any(np.abs(day_quantile_z) > 1e-9):
-                w_q = float(np.clip(quantile_blend_weight_day, 0.0, 1.0))
-                z = (1.0 - w_q) * z + w_q * day_quantile_z
+            # ─────────────────────────────────────────────────────────────────
+            # LINEAR ALPHA COMBINER or QUANTILE BLENDING
+            # When linear_model_enabled AND model is ready, use learned z_lin blending.
+            # Otherwise (disabled, warmup, or failure), fall back to static quantile blend.
+            # These are MUTUALLY EXCLUSIVE to prevent double-blending.
+            # ─────────────────────────────────────────────────────────────────
+            linear_blend_applied = False
+            
+            if linear_state is not None:
+                # Build feature matrix for linear combiner
+                try:
+                    # Compute corr_hhi for linear builder
+                    # FIX Gap C: Convert cov → corr properly and compute HHI
+                    corr_hhi_for_linear = 0.0
+                    try:
+                        diag_vals = np.sqrt(np.diag(cov))
+                        diag_inv = np.where(diag_vals > 1e-8, 1.0 / diag_vals, 0.0)
+                        corr_mat_linear = (cov * diag_inv[:, None]) * diag_inv[None, :]
+                        from src.portfolio.policy_controller import compute_correlation_hhi
+                        corr_hhi_for_linear = float(compute_correlation_hhi(corr_mat_linear))
+                    except Exception:
+                        pass
+                    
+                    X_day = linear_state.feature_builder.build_day(
+                        i=i,
+                        syms=syms,
+                        z_mamba=z,
+                        sigma_exec=sigma_exec,
+                        day_ctx=day_ctx if role_ctx is not None else None,
+                        day_calib_score=day_calib_score,
+                        day_online_trust=day_online_trust,
+                        day_cboe_panic=day_cboe_panic,
+                        day_cboe_slope=day_cboe_slope,
+                        day_cboe_vrp=day_cboe_vrp,
+                        equity=equity,
+                        turnover=turnover,
+                        costs=costs,
+                        returns_df=returns_df,
+                        corr_hhi=corr_hhi_for_linear,
+                    )
+                    
+                    # Observe this day's features for later maturity processing
+                    linear_state.observe_day(i, X_day, sigma_exec)
+                    
+                    # Compute quality-adaptive blend weight
+                    # Use separate linear_blend_weight (not quantile_blend_weight)
+                    base_weight = float(np.clip(linear_blend_weight_day, 0.0, linear_blend_max))
+                    
+                    if linear_state.is_ready() and base_weight > 0:
+                        # Predict with confidence scaling
+                        if linear_confidence_enabled:
+                            z_lin, confidence = linear_state.predict_z_with_confidence(
+                                X_day, confidence_scaling=True
+                            )
+                        else:
+                            z_lin = linear_state.predict_z(X_day)
+                            confidence = np.ones(len(z_lin))
+                        
+                        # Apply adaptive quality gating
+                        w_L, adaptive_diag = linear_state.compute_adaptive_blend_weight(
+                            base_weight=base_weight,
+                            z_lin=z_lin,
+                            z_mamba=z,
+                            r_squared_threshold=float(cfg.get("linear_r2_threshold", 0.05)),
+                            drift_threshold=float(cfg.get("linear_drift_threshold", 0.15)),
+                            corr_threshold=float(cfg.get("linear_corr_threshold", 0.3)),
+                            sign_disagree_threshold=float(cfg.get("linear_sign_disagree_threshold", 0.4)),
+                            min_stable_updates=int(cfg.get("linear_min_stable_updates", 3)),
+                        )
+                        
+                        if w_L > 1e-6:
+                            z_before_blend = z.copy()
+                            z = (1.0 - w_L) * z + w_L * z_lin  # z_lin already confidence-scaled
+                            linear_blend_applied = True
+                            
+                            # HARD hygiene veto must remain absolute after blend
+                            if 'hygiene_ok' in dir() and isinstance(hygiene_ok, np.ndarray):
+                                z = np.where(hygiene_ok, z, 0.0)
+                            
+                            # Optionally inflate sigma_exec for low-confidence symbols
+                            # This reduces position sizes for uncertain predictions
+                            if linear_confidence_enabled:
+                                # confidence in [0, 1]; inflate sigma when confidence < 1
+                                # sigma_exec_adjusted = sigma_exec / confidence
+                                # (lower confidence → higher sigma → smaller weights)
+                                sigma_exec = sigma_exec / np.clip(confidence, 0.3, 1.0)
+                            
+                            # EMIT: LINEAR_BLEND_APPLIED with adaptive diagnostics
+                            try:
+                                diag = linear_state.get_daily_diagnostics(z_lin, z_before_blend)
+                                event_bus.emit(
+                                    date=str(pd.Timestamp(day))[:10],
+                                    day_idx=i,
+                                    severity=EventSeverity.INFO,
+                                    code=EventCode.LINEAR_BLEND_APPLIED,
+                                    message=f"Linear blend: base={base_weight:.2f} adaptive={w_L:.2f} conf={float(np.mean(confidence)):.2f}",
+                                    payload={
+                                        "base_weight": float(base_weight),
+                                        "adaptive_weight": float(w_L),
+                                        "blend_type": "linear_adaptive",
+                                        "avg_confidence": float(np.mean(confidence)),
+                                        "min_confidence": float(np.min(confidence)),
+                                        "corr_z_lin_z_mamba": float(diag.get("corr_z_lin_z_mamba", 0.0)),
+                                        "sign_disagreement": float(diag.get("sign_disagreement_frac", 0.0)),
+                                        "n_updates": int(diag.get("n_updates", 0)),
+                                        "quality_penalties": adaptive_diag.get("penalties_applied", []),
+                                        "r_squared": float(adaptive_diag.get("current_r_squared", 0.0)),
+                                        "drift": float(adaptive_diag.get("current_drift", 0.0)),
+                                    },
+                                )
+                            except Exception:
+                                pass
+                    # else: linear not ready or w_L=0, fall through to quantile blending
+                except Exception as e:
+                    logger.debug("[phase2.linear] Feature build failed: %s; falling back to quantile", e)
+            
+            # Static quantile blending: ONLY if linear blend was NOT applied
+            # This ensures mutually exclusive blending (no double application)
+            if not linear_blend_applied:
+                # Original quantile blending path
+                # z = (1 - w_q) * z_mamba + w_q * z_quantile
+                if quantile_blend_weight_day > 0 and np.any(np.abs(day_quantile_z) > 1e-9):
+                    w_q = float(np.clip(quantile_blend_weight_day, 0.0, 1.0))
+                    z = (1.0 - w_q) * z + w_q * day_quantile_z
+                    
+                    # EMIT: QUANTILE_BLEND_APPLIED
+                    event_bus.emit(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=i,
+                        severity=EventSeverity.INFO,
+                        code=EventCode.QUANTILE_BLEND_APPLIED,
+                        message=f"Quantile blend applied with weight {w_q:.2f}",
+                        payload={"weight": float(w_q), "blend_type": "quantile"},
+                    )
 
             if np.isfinite(vol_scaler_day) and vol_scaler_day > 0:
                 z = z * float(vol_scaler_day)
 
+            # Policy confidence floor: scale z if calibration is below threshold
+            if np.isfinite(confidence_floor_day) and confidence_floor_day > 0:
+                if day_calib_score < confidence_floor_day:
+                    conf_scale = float(np.clip(day_calib_score / confidence_floor_day, 0.0, 1.0))
+                    z = z * conf_scale
+
             if safety_enabled and (not np.all(np.isfinite(z))):
                 # Data/model integrity issue: go flat.
                 logger.error("Phase2 v2 non-finite z detected; forcing flat (%s)", str(day))
-                w = np.zeros(n_assets, dtype=float)
-                w_mat[i, :] = w
+                
+                # EMIT: NAN_INF_KILLSWITCH
+                n_nan = int(np.sum(np.isnan(z)))
+                n_inf = int(np.sum(np.isinf(z)))
+                event_bus.emit(
+                    date=str(pd.Timestamp(day))[:10],
+                    day_idx=i,
+                    severity=EventSeverity.ERROR,
+                    code=EventCode.NAN_INF_KILLSWITCH,
+                    message=f"NaN/Inf detected in z: {n_nan} NaN, {n_inf} Inf",
+                    payload={"n_nan": n_nan, "n_inf": n_inf, "z_mean": float(np.nanmean(z))},
+                )
+                
+                w_target_flat = np.zeros(n_assets, dtype=float)
+                w_mat[i, :] = w_target_flat
                 r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
                 pnl = float(exec_w @ r_vec)
-                tval = float(np.sum(np.abs(w - prev_w)))
-                turnover[i] = tval
-                cost = float(k_spread * tval + k_impact * (tval ** 1.5))
+                
+                # FIX Gap #2: ALWAYS advance the execution queue
+                if trade_delay_sessions > 1:
+                    _queue.append(w_target_flat.copy())
+                    w_next_hold = np.asarray(_queue.popleft(), dtype=float)
+                else:
+                    w_next_hold = w_target_flat.copy()
+                
+                # Track both intent and exec turnover separately
+                tval_intent = float(np.sum(np.abs(w_target_flat - prev_w)))
+                tval_exec = float(np.sum(np.abs(w_next_hold - exec_w)))
+                turnover_intent[i] = tval_intent
+                turnover_exec[i] = tval_exec
+                turnover[i] = tval_exec
+                
+                # Costs computed on EXECUTED turnover
+                cost = float(k_spread * tval_exec + k_impact * (tval_exec ** 1.5))
                 costs[i] = cost
                 pnl_net = float(pnl - cost)
                 net_ret[i] = pnl_net
                 equity[i] = float((equity[i - 1] if i > 0 else 1.0) * (1.0 + pnl_net))
                 equity_peak = float(max(equity_peak, equity[i]))
                 cov = _ewma_cov_update(cov, r_vec, cov_lam)
-                prev_w = w
+                
+                # Update state for next iteration
+                prev_exec_w = exec_w.copy()
+                exec_w = w_next_hold
+                prev_w = w_target_flat
                 if flat_cooldown_sessions > 0:
                     flat_until_idx = int(min(len(union_oos_index) - 1, i + int(flat_cooldown_sessions)))
                 continue
@@ -3978,22 +7079,672 @@ def evaluate_phase2_stateful_once(
                 except Exception:
                     active_frac[i] = 0.0
 
-            # Covariance-aware sizing.
-            cov_shrunk = _shrink_cov_to_diag(cov, shrink_alpha)
-            cov_shrunk = cov_shrunk + np.eye(n_assets, dtype=float) * 1e-8
-            try:
-                inv = np.linalg.pinv(cov_shrunk)
-            except Exception:
-                inv = np.eye(n_assets, dtype=float)
-            w_raw = inv @ z_thr
+            # ─────────────────────────────────────────────────────────────────
+            # Z-EXPLAINER: Collect data for interpretability
+            # ─────────────────────────────────────────────────────────────────
+            if z_explainer_enabled and z_explainer_buffer is not None:
+                try:
+                    from src.stage_b_stateful.z_explainer import create_explainer_day
+                    
+                    # Compute portfolio state for global features
+                    eq_prev = float(equity[i - 1]) if i > 0 else 1.0
+                    peak_val = float(max(equity_peak, eq_prev))
+                    dd_for_explainer = float(1.0 - (eq_prev / peak_val)) if peak_val > 0 else 0.0
+                    
+                    # Realized vol from recent net returns
+                    rv_lookback = min(20, i)
+                    rv_for_explainer = float(np.std(net_ret[max(0, i - rv_lookback):i]) * np.sqrt(252)) if rv_lookback > 1 else 0.0
+                    
+                    # Correlation HHI from covariance matrix
+                    # FIX Gap C: Convert cov → corr properly (not np.corrcoef which computes corr of rows)
+                    # corr = D^-1/2 * cov * D^-1/2 where D = diag(cov)
+                    try:
+                        diag_vals = np.sqrt(np.diag(cov))
+                        diag_inv = np.where(diag_vals > 1e-8, 1.0 / diag_vals, 0.0)
+                        corr_mat = (cov * diag_inv[:, None]) * diag_inv[None, :]
+                        # Use eigenvalue-based HHI (proper correlation concentration metric)
+                        from src.portfolio.policy_controller import compute_correlation_hhi
+                        corr_hhi_val = float(compute_correlation_hhi(corr_mat))
+                    except Exception:
+                        corr_hhi_val = 0.0
+                    
+                    # Previous turnover and cost
+                    turn_prev = float(turnover[i - 1]) if i > 0 else 0.0
+                    cost_prev_val = float(costs[i - 1]) if i > 0 else 0.0
+                    
+                    # Get overlay values (may have been set earlier in the loop)
+                    _risk_scale_arr = risk_scale if 'risk_scale' in dir() and isinstance(risk_scale, np.ndarray) else np.ones(n_assets)
+                    _regime_mult_arr = regime_mult if 'regime_mult' in dir() and isinstance(regime_mult, np.ndarray) else np.ones(n_assets)
+                    _hygiene_ok_arr = hygiene_ok if 'hygiene_ok' in dir() and isinstance(hygiene_ok, np.ndarray) else np.ones(n_assets, dtype=bool)
+                    _split_stress_arr = split_stress if 'split_stress' in dir() and isinstance(split_stress, np.ndarray) else np.zeros(n_assets)
+                    _split_discount_arr = split_discount if 'split_discount' in dir() and isinstance(split_discount, np.ndarray) else np.ones(n_assets)
+                    _quantile_z_arr = day_quantile_z if 'day_quantile_z' in dir() and isinstance(day_quantile_z, np.ndarray) else np.zeros(n_assets)
+                    
+                    # z_pre_overlay = mu / sigma_exec (before overlays)
+                    z_pre_overlay = np.divide(mu_vec, sigma_exec + 1e-9)
+                    z_pre_overlay = np.clip(z_pre_overlay, -z_clip, z_clip)
+                    
+                    # sigma was clipped (approximation: check if near clip bounds)
+                    sigma_was_clipped = ((sigma_exec <= _sigma_exec_eps * 1.1) | (sigma_exec >= 9.9)).astype(float)
+                    
+                    # z_post_overlay (after overlays, before blend)
+                    z_post_overlay = np.where(_hygiene_ok_arr, z_pre_overlay * _risk_scale_arr * _regime_mult_arr * _split_discount_arr, 0.0)
+                    
+                    # z_post_blend (after quantile blend)
+                    w_q_val = float(quantile_blend_weight_day) if 'quantile_blend_weight_day' in dir() else 0.0
+                    if w_q_val > 0 and np.any(np.abs(_quantile_z_arr) > 1e-9):
+                        z_post_blend = (1.0 - w_q_val) * z_post_overlay + w_q_val * _quantile_z_arr
+                    else:
+                        z_post_blend = z_post_overlay.copy()
+                    
+                    # z_post_scale (after vol_scaler)
+                    vol_scaler_val = float(vol_scaler_day) if 'vol_scaler_day' in dir() else 1.0
+                    z_post_scale = z_post_blend * vol_scaler_val
+                    
+                    explainer_day = create_explainer_day(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=i,
+                        symbols=list(syms),
+                        mu_raw=mu_vec,
+                        sigma_exec=sigma_exec,
+                        sigma_was_clipped=sigma_was_clipped,
+                        z_pre_overlay=z_pre_overlay,
+                        risk_scale=_risk_scale_arr,
+                        regime_multiplier=_regime_mult_arr,
+                        hygiene_ok=_hygiene_ok_arr.astype(float),
+                        split_stress=_split_stress_arr,
+                        split_discount=_split_discount_arr if isinstance(_split_discount_arr, np.ndarray) else np.full(n_assets, _split_discount_arr),
+                        quantile_z=_quantile_z_arr,
+                        quantile_blend_weight=w_q_val,
+                        z_post_overlay=z_post_overlay,
+                        z_post_blend=z_post_blend,
+                        z_post_scale=z_post_scale,
+                        z_final=z_thr,  # TARGET: post-threshold z
+                        day_calib_score=day_calib_score if 'day_calib_score' in dir() else 1.0,
+                        online_trust_score=day_online_trust if 'day_online_trust' in dir() else 1.0,
+                        cboe_panic=day_cboe_panic if 'day_cboe_panic' in dir() else 0.0,
+                        cboe_slope=day_cboe_slope if 'day_cboe_slope' in dir() else 0.0,
+                        cboe_vrp=day_cboe_vrp if 'day_cboe_vrp' in dir() else 0.0,
+                        vol_scaler=vol_scaler_val,
+                        portfolio_drawdown=dd_for_explainer,
+                        portfolio_realized_vol=rv_for_explainer,
+                        corr_hhi=corr_hhi_val,
+                        turnover_prev=turn_prev,
+                        cost_prev=cost_prev_val,
+                        equity_level=eq_prev,
+                        market_regime=int(market_regime),
+                    )
+                    z_explainer_buffer.add(explainer_day)
+                    
+                    # ─────────────────────────────────────────────────────────
+                    # STEP 7: VALIDATION COMPANION (sanity check z_final vs fwd returns)
+                    # ─────────────────────────────────────────────────────────
+                    if z_validation_companion is not None:
+                        try:
+                            # Use realized returns from H days ago
+                            matured_idx = i - horizon
+                            if matured_idx >= 0 and matured_idx < len(fwd_ret_mat):
+                                realized_ret = fwd_ret_mat[matured_idx, :]
+                                
+                                # We need the z_final from matured_idx (the prediction day)
+                                # stored in z_mat if it's available
+                                if matured_idx < len(z_mat):
+                                    z_final_matured = z_mat[matured_idx, :]
+                                    
+                                    # Build features for matured predictions
+                                    # We use today's global context but matured z_final
+                                    # This is approximate but captures regime/stress context
+                                    for j in range(n_assets):
+                                        if np.isfinite(realized_ret[j]) and np.isfinite(z_final_matured[j]):
+                                            # Build feature vector matching explainer_day structure
+                                            per_sym_vec = np.array([
+                                                float(z_mat[matured_idx, j]) if matured_idx < len(z_mat) else 0.0,  # z_pre_overlay approx
+                                                float(mu_mat[matured_idx, j]) if matured_idx < len(mu_mat) else 0.0,
+                                                float(sigma_mat[matured_idx, j]) if matured_idx < len(sigma_mat) else 0.0,
+                                                0.0,  # sigma_was_clipped
+                                                1.0,  # risk_scale
+                                                1.0,  # regime_multiplier
+                                                1.0,  # hygiene_ok
+                                                0.0,  # split_stress
+                                                1.0,  # split_discount
+                                                0.0,  # quantile_z
+                                                0.0,  # quantile_blend_weight
+                                            ], dtype=np.float32)
+                                            
+                                            global_vec = np.array([
+                                                day_calib_score if 'day_calib_score' in dir() else 1.0,
+                                                day_online_trust if 'day_online_trust' in dir() else 1.0,
+                                                day_cboe_panic if 'day_cboe_panic' in dir() else 0.0,
+                                                day_cboe_slope if 'day_cboe_slope' in dir() else 0.0,
+                                                day_cboe_vrp if 'day_cboe_vrp' in dir() else 0.0,
+                                                vol_scaler_val,
+                                                dd_for_explainer,
+                                                rv_for_explainer,
+                                                corr_hhi_val,
+                                                turn_prev,
+                                                cost_prev_val,
+                                                eq_prev,
+                                                float(market_regime),
+                                            ], dtype=np.float32)
+                                            
+                                            features = np.concatenate([per_sym_vec, global_vec])
+                                            z_validation_companion.add_sample(
+                                                features=features,
+                                                z_final=float(z_final_matured[j]),
+                                                fwd_return=float(realized_ret[j]),
+                                                date=str(pd.Timestamp(day))[:10],
+                                                symbol=syms[j],
+                                            )
+                            
+                            # Refit if it's time
+                            if z_validation_companion.should_refit(i):
+                                z_validation_companion.refit(day_idx=i)
+                        except Exception as e:
+                            logger.debug("[phase2.z_validation] update error: %s", e)
+                    
+                    # ─────────────────────────────────────────────────────────
+                    # ROLLING SURROGATE: Add to buffer, refit, explain
+                    # ─────────────────────────────────────────────────────────
+                    if z_surrogate is not None:
+                        # Add day to rolling buffer
+                        z_surrogate.add_day(explainer_day)
+                        
+                        # Refit if it's time (every K days)
+                        if z_surrogate.should_refit(i):
+                            z_surrogate.refit(day_idx=i)
+                        
+                        # Generate explanation (purely observational)
+                        if z_surrogate.is_fitted:
+                            # Determine top traded symbols from current weights
+                            traded_syms = None
+                            if 'prev_w' in dir() and prev_w is not None:
+                                top_weight_idx = np.argsort(np.abs(prev_w))[::-1][:z_surrogate.top_n_symbols]
+                                traded_syms = [syms[j] for j in top_weight_idx if np.abs(prev_w[j]) > 1e-6]
+                            
+                            daily_explanation = z_surrogate.explain_day(
+                                day=explainer_day,
+                                traded_symbols=traded_syms,
+                            )
+                            
+                            # Log explanation (minimum daily output)
+                            explanation_log = {
+                                "date": daily_explanation.date,
+                                "day_idx": daily_explanation.day_idx,
+                                "fidelity": {
+                                    "correlation": float(daily_explanation.fidelity.correlation),
+                                    "directional_agreement": float(daily_explanation.fidelity.directional_agreement),
+                                    "r2_score": float(daily_explanation.fidelity.r2_score),
+                                    "is_reliable": bool(daily_explanation.fidelity.is_reliable),
+                                },
+                                "explanation_suppressed": daily_explanation.explanation_suppressed,
+                                "suppression_reason": daily_explanation.suppression_reason,
+                            }
+                            
+                            if not daily_explanation.explanation_suppressed:
+                                # Add global drivers
+                                explanation_log["global_drivers"] = [
+                                    {"feature": f, "mean_abs_contrib": round(v, 5)}
+                                    for f, v in daily_explanation.global_drivers[:10]
+                                ]
+                                
+                                # Add top symbol contributions
+                                explanation_log["top_symbols"] = []
+                                for sc in daily_explanation.symbol_contributions[:5]:
+                                    sym_log = {
+                                        "symbol": sc.symbol,
+                                        "z_final": round(sc.z_final, 4),
+                                        "z_predicted": round(sc.z_predicted, 4),
+                                        "top_positive": [
+                                            {"feature": f, "value": round(v, 4), "beta": round(b, 4), "contrib": round(c, 4)}
+                                            for f, v, b, c in sc.top_positive[:3]
+                                        ],
+                                        "top_negative": [
+                                            {"feature": f, "value": round(v, 4), "beta": round(b, 4), "contrib": round(c, 4)}
+                                            for f, v, b, c in sc.top_negative[:3]
+                                        ],
+                                    }
+                                    explanation_log["top_symbols"].append(sym_log)
+                                
+                                # ─────────────────────────────────────────────────
+                                # STEP 6: Generate human-readable reason codes
+                                # ─────────────────────────────────────────────────
+                                try:
+                                    from src.stage_b_stateful.z_explainer import (
+                                        generate_portfolio_reason_code,
+                                        generate_symbol_reason_codes,
+                                    )
+                                    
+                                    # Compute portfolio exposures
+                                    net_exp = float(np.sum(prev_w)) if 'prev_w' in dir() and prev_w is not None else 0.0
+                                    gross_exp = float(np.sum(np.abs(prev_w))) if 'prev_w' in dir() and prev_w is not None else 0.0
+                                    
+                                    # Portfolio reason code
+                                    portfolio_rc = generate_portfolio_reason_code(
+                                        explanation=daily_explanation,
+                                        net_exposure=net_exp,
+                                        gross_exposure=gross_exp,
+                                    )
+                                    
+                                    # Symbol reason codes
+                                    symbol_rcs = generate_symbol_reason_codes(
+                                        explanation=daily_explanation,
+                                        max_symbols=5,
+                                    )
+                                    
+                                    # Add reason codes to log
+                                    explanation_log["reason_codes"] = {
+                                        "portfolio": {
+                                            "direction": portfolio_rc.direction,
+                                            "drivers": portfolio_rc.drivers[:3],
+                                            "narrative": portfolio_rc.to_narrative(),
+                                            "confidence": portfolio_rc.confidence,
+                                        },
+                                        "symbols": [
+                                            {
+                                                "symbol": rc.symbol,
+                                                "direction": rc.direction,
+                                                "drivers": rc.drivers[:3],
+                                                "narrative": rc.to_narrative(),
+                                                "confidence": rc.confidence,
+                                            }
+                                            for rc in symbol_rcs[:5]
+                                        ],
+                                    }
+                                except Exception as e:
+                                    logger.debug("[phase2.z_explainer] reason_codes error: %s", e)
+                                
+                                # ─────────────────────────────────────────────────
+                                # STEP 7: Add validation companion metrics to log
+                                # ─────────────────────────────────────────────────
+                                if z_validation_companion is not None and z_validation_companion.is_fitted:
+                                    try:
+                                        vf = z_validation_companion.last_fidelity
+                                        explanation_log["validation_companion"] = {
+                                            "accuracy": round(vf.accuracy, 4),
+                                            "auc_roc": round(vf.auc_roc, 4),
+                                            "precision_long": round(vf.precision_long, 4),
+                                            "precision_short": round(vf.precision_short, 4),
+                                            "is_reliable": vf.is_reliable,
+                                            "z_final_coefficient": round(z_validation_companion.get_z_final_coefficient(), 4),
+                                            "z_final_is_predictive": abs(z_validation_companion.get_z_final_coefficient()) > 0.1,
+                                        }
+                                    except Exception as e:
+                                        logger.debug("[phase2.z_explainer] validation_companion log error: %s", e)
+                            
+                            z_explainer_logs.append(explanation_log)
+                            
+                            # Log to console (DEBUG level to avoid spam)
+                            if not daily_explanation.explanation_suppressed:
+                                logger.debug(
+                                    "[phase2.z_explainer] Day %d: corr=%.3f dir_agree=%.1f%% | Top driver: %s",
+                                    i, daily_explanation.fidelity.correlation,
+                                    daily_explanation.fidelity.directional_agreement * 100,
+                                    daily_explanation.global_drivers[0][0] if daily_explanation.global_drivers else "N/A"
+                                )
+                            else:
+                                logger.debug(
+                                    "[phase2.z_explainer] Day %d: SUPPRESSED - %s",
+                                    i, daily_explanation.suppression_reason
+                                )
+                except Exception as e:
+                    logger.debug("[phase2.z_explainer] collection error: %s", e)
 
-            if safety_enabled and (not np.all(np.isfinite(w_raw))):
-                logger.error("Phase2 v2 non-finite w_raw detected; forcing flat (%s)", str(day))
-                w_raw = np.zeros(n_assets, dtype=float)
+            # ─────────────────────────────────────────────────────────────────
+            # POINT 2: OUTPUT SANITY CHECKS (after z finalized, before optimizer)
+            # Check sigma collapse, z saturation, mu constant, sign flip rate
+            # ─────────────────────────────────────────────────────────────────
+            output_sanity_fallback = False
+            if risk_latch_enabled and risk_latch is not None:
+                try:
+                    output_sanity_mode = risk_latch.check_output_sanity(
+                        mu_vec=mu_vec,
+                        sigma_vec=sigma_vec,
+                        z_vec=z_thr,
+                        z_prev=_prev_z_for_flip,
+                        z_clip=z_clip,
+                    )
+                    
+                    # Update prev z for next iteration
+                    _prev_z_for_flip = z_thr.copy()
+                    
+                    # If triggered, resolve and handle
+                    if output_sanity_mode >= RiskLatchMode.SAFE_FALLBACK:
+                        output_state = risk_latch.resolve()
+                        
+                        # Check if we should flatten OR hold fallback
+                        if output_state.should_flatten() or output_state.should_hold_fallback():
+                            output_sanity_fallback = True
+                            
+                            # Determine action taken for logging
+                            if output_state.should_hold_fallback():
+                                action_taken = "SAFE_FALLBACK_HOLD"
+                                exposure_scale_log = 1.0 if output_state.last_good_weights is not None else 0.0
+                            else:
+                                action_taken = "FLATTEN"
+                                exposure_scale_log = 0.0
+                            
+                            # ─────────────────────────────────────────────────────
+                            # LEDGER: Log output sanity fail event
+                            # ─────────────────────────────────────────────────────
+                            if risk_events_ledger is not None:
+                                try:
+                                    risk_events_ledger.add_event(
+                                        date=str(pd.Timestamp(day))[:10],
+                                        day_idx=i,
+                                        event_type="OUTPUT_SANITY_FAIL",
+                                        threshold="sigma stable AND z < clip AND mu varying",
+                                        threshold_crossed=True,
+                                        action_taken=action_taken,
+                                        exposure_scale=exposure_scale_log,
+                                        trigger_reason=(
+                                            output_state.primary_reason.name
+                                            if output_state.primary_reason
+                                            else "unknown"
+                                        ),
+                                        details={
+                                            "sigma_min": float(np.min(sigma_vec)) if sigma_vec is not None else None,
+                                            "sigma_max": float(np.max(sigma_vec)) if sigma_vec is not None else None,
+                                            "z_abs_max": float(np.max(np.abs(z_thr))) if z_thr is not None else None,
+                                            "mu_std": float(np.std(mu_vec)) if mu_vec is not None else None,
+                                        },
+                                    )
+                                except Exception as le:
+                                    logger.debug("[phase2.ledger] Failed to log event: %s", le)
+                            
+                            # EMIT: RISK_LATCH event
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.RISK_LATCH_SAFE_FALLBACK,
+                                message=f"Output sanity {output_state.mode.name}: {output_state.primary_reason.name if output_state.primary_reason else 'unknown'}",
+                                payload=output_state.to_dict(),
+                            )
+                            
+                            # Apply safe fallback or flatten
+                            w = output_state.get_effective_weights(
+                                np.zeros(n_assets, dtype=float),
+                                n_assets,
+                            )
+                            w_mat[i, :] = w
+                            
+                            # Handle PnL and execution queue
+                            r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+                            pnl = float(exec_w @ r_vec)
+                            
+                            if trade_delay_sessions > 1:
+                                _queue.append(w.copy())
+                                w_next = np.asarray(_queue.popleft(), dtype=float)
+                            else:
+                                w_next = w.copy()
+                            
+                            tval_intent = float(np.sum(np.abs(w - prev_w)))
+                            tval_exec = float(np.sum(np.abs(w_next - exec_w)))
+                            turnover_intent[i] = tval_intent
+                            turnover_exec[i] = tval_exec
+                            turnover[i] = tval_exec
+                            
+                            cost = float(k_spread * tval_exec + k_impact * (tval_exec ** 1.5))
+                            costs[i] = cost
+                            pnl_net = float(pnl - cost)
+                            net_ret[i] = pnl_net
+                            equity[i] = float((equity[i - 1] if i > 0 else 1.0) * (1.0 + pnl_net))
+                            equity_peak = float(max(equity_peak, equity[i]))
+                            cov = _ewma_cov_update(cov, r_vec, cov_lam)
+                            
+                            prev_exec_w = exec_w.copy()
+                            exec_w = w_next
+                            prev_w = w
+                            
+                            if risk_latch is not None:
+                                risk_latch.end_session(None)
+                            continue
+                        
+                        elif output_sanity_mode == RiskLatchMode.THROTTLE:
+                            # Apply throttle scale to z
+                            output_state = risk_latch.resolve()
+                            throttle_scale = float(output_state.exposure_scale)
+                            z_thr = z_thr * throttle_scale
+                            
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.INFO,
+                                code=EventCode.RISK_LATCH_THROTTLE,
+                                message=f"Output sanity THROTTLE: scale={throttle_scale:.2f}",
+                                payload={"scale": throttle_scale, "reason": output_state.primary_reason.name if output_state.primary_reason else "unknown"},
+                            )
+                except Exception as e:
+                    logger.debug("[phase2.risk_latch] Output sanity check error: %s", e)
 
-            w = _apply_basic_constraints(w_raw, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
-            w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol_day)
-            w = _apply_basic_constraints(w, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+            # ─────────────────────────────────────────────────────────────────
+            # Workstream-7: Robust Portfolio Optimizer path
+            # ─────────────────────────────────────────────────────────────────
+            if use_robust_optimizer and robust_optimizer is not None:
+                try:
+                    from src.portfolio.robust_optimizer import (
+                        PredictionBundle,
+                        CovarianceModel,
+                        PortfolioConstraints,
+                        build_sector_adjacency,
+                    )
+                    
+                    # Get sigma reliability from Mamba calibration tracker
+                    sigma_reliability = np.ones(n_assets, dtype=float)
+                    if mamba_calib_snapshot is not None:
+                        # Use overall calibration score as reliability for all assets
+                        # (Future: per-symbol reliability from multi-task calibration)
+                        calib_score = float(mamba_calib_snapshot.calibration_overall)
+                        calib_score = float(np.clip(calib_score, 0.0, 1.0))
+                        sigma_reliability = np.full(n_assets, calib_score, dtype=float)
+                    
+                    # FIX Gap #4: Robust optimizer expects mu as RETURN predictions, not z-scores
+                    # Use thresholded mu (apply same thresholding to preserve signal sparsity)
+                    # mu_vec is the raw return prediction from Mamba, z_thr is dimensionless
+                    mu_for_robust = np.zeros_like(mu_vec)
+                    for j in range(n_assets):
+                        # Apply same threshold logic but on mu scale
+                        if abs(z_thr[j]) > 0:  # Signal passed threshold
+                            mu_for_robust[j] = mu_vec[j]  # Use actual return prediction
+                        # else: leave as 0 (filtered out)
+                    
+                    # Build prediction bundle from current day's Mamba output
+                    pred_bundle = PredictionBundle(
+                        mu=mu_for_robust,  # FIX: Use thresholded mu (return scale), not z_thr
+                        sigma=sigma_vec,  # Model-predicted sigma (from Mamba)
+                        sigma_reliability=sigma_reliability,
+                        p_up=None,
+                        rho=None,
+                    )
+                    
+                    # Build covariance model
+                    # Use sector map for graph shrinkage if available
+                    adjacency = None
+                    sector_ids = None
+                    if robust_use_graph_shrinkage and group_by_symbol:
+                        try:
+                            # Convert group_by_symbol to sector_ids array
+                            sector_labels = [group_by_symbol.get(s, 0) for s in syms]
+                            sector_ids = np.array(sector_labels, dtype=int)
+                            adjacency = build_sector_adjacency(sector_ids)
+                        except Exception:
+                            adjacency = None
+                    
+                    cov_model = CovarianceModel(
+                        cov=cov.copy(),
+                        sector_ids=sector_ids,
+                        adjacency=adjacency,
+                    )
+                    
+                    # Build constraints from config
+                    # Compute current drawdown for throttling
+                    eq_prev_for_dd = float(equity[i - 1]) if i > 0 else 1.0
+                    peak_for_dd = float(max(equity_peak, eq_prev_for_dd))
+                    current_dd = float(1.0 - (eq_prev_for_dd / peak_for_dd)) if peak_for_dd > 0 else 0.0
+                    
+                    portfolio_constraints = PortfolioConstraints(
+                        max_gross=float(max_gross_day),
+                        max_net=float(max_net_day),
+                        max_name=float(max_name_day),
+                        min_name=-float(max_name_day),
+                        target_vol_annual=float(target_vol_day),
+                        max_vol_annual=float(target_vol_day) * 2.0,
+                        cvar_alpha=float(robust_cvar_alpha),
+                        cvar_limit=robust_cvar_limit_f,
+                        turnover_cap=float(turnover_cap_day) if turnover_cap_day > 0 else None,
+                        turnover_penalty=float(robust_lambda_turnover),
+                        beta_neutral=bool(beta_neutral),
+                        max_beta_exposure=float(beta_cap) if beta_cap > 0 else 0.1,
+                        max_sector_exposure=float(max_group_gross) if max_group_gross > 0 else 0.3,
+                        current_drawdown=float(current_dd),
+                        drawdown_throttle=float(dd_throttle_1) if dd_throttle_1 > 0 else 0.10,
+                        drawdown_gross_mult=float(dd_gross_mult_1) if dd_gross_mult_1 > 0 else 0.5,
+                        mu_sigma_cap=float(robust_mu_sigma_cap),
+                        reliability_min=float(robust_reliability_min),
+                    )
+                    
+                    # Get historical returns for CVaR estimation
+                    hist_returns = None
+                    if robust_cvar_constraint and i >= 60:
+                        hist_returns = returns_df.iloc[max(0, i - 252):i].to_numpy(dtype=float)
+                    
+                    # Run optimizer
+                    opt_result = robust_optimizer.optimize(
+                        predictions=pred_bundle,
+                        cov_model=cov_model,
+                        constraints=portfolio_constraints,
+                        prev_weights=prev_w,
+                        historical_returns=hist_returns,
+                    )
+                    
+                    w = opt_result.weights
+                    # Ensure cov_shrunk is defined for downstream overlays/vol-targeting
+                    cov_shrunk = _shrink_cov_to_diag(cov, shrink_alpha)
+                    
+                    # EMIT: OPTIMIZER_SUCCESS
+                    event_bus.emit(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=i,
+                        severity=EventSeverity.INFO,
+                        code=EventCode.OPTIMIZER_SUCCESS,
+                        message="Robust optimizer succeeded",
+                        payload={
+                            "optimizer_path": "robust",
+                            "status": str(getattr(opt_result, "status", "unknown")),
+                            "iterations": int(getattr(opt_result, "iterations", 0)),
+                        },
+                    )
+                    
+                    # Skip the standard path since optimizer already applied vol target and constraints
+                    # Continue directly to overlays
+                    
+                except Exception as e:
+                    logger.warning("[phase2.robust_optimizer] Optimization failed: %s; falling back to standard", e)
+                    # EMIT: OPTIMIZER_FALLBACK
+                    event_bus.emit(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=i,
+                        severity=EventSeverity.WARNING,
+                        code=EventCode.OPTIMIZER_FALLBACK,
+                        message=f"Robust optimizer failed, falling back to MV: {e}",
+                        payload={"error": str(e)},
+                    )
+                    # Fall back to standard path
+                    cov_shrunk = _shrink_cov_to_diag(cov, shrink_alpha)
+                    cov_shrunk = cov_shrunk + np.eye(n_assets, dtype=float) * 1e-8
+                    try:
+                        inv = np.linalg.pinv(cov_shrunk)
+                    except Exception:
+                        inv = np.eye(n_assets, dtype=float)
+                    w_raw = inv @ z_thr
+                    if safety_enabled and (not np.all(np.isfinite(w_raw))):
+                        logger.error("Phase2 v2 non-finite w_raw detected; forcing flat (%s)", str(day))
+                        w_raw = np.zeros(n_assets, dtype=float)
+                    w = _apply_basic_constraints(w_raw, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+                    w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol_day)
+                    w = _apply_basic_constraints(w, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+            else:
+                # Standard covariance-aware sizing (original path)
+                cov_shrunk = _shrink_cov_to_diag(cov, shrink_alpha)
+                cov_shrunk = cov_shrunk + np.eye(n_assets, dtype=float) * 1e-8
+                try:
+                    inv = np.linalg.pinv(cov_shrunk)
+                except Exception:
+                    inv = np.eye(n_assets, dtype=float)
+                w_raw = inv @ z_thr
+
+                if safety_enabled and (not np.all(np.isfinite(w_raw))):
+                    logger.error("Phase2 v2 non-finite w_raw detected; forcing flat (%s)", str(day))
+                    w_raw = np.zeros(n_assets, dtype=float)
+
+                w = _apply_basic_constraints(w_raw, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+                w = _apply_vol_target(w, cov_shrunk, target_vol_annual=target_vol_day)
+                w = _apply_basic_constraints(w, max_name=max_name_day, max_gross=max_gross_day, max_net=max_net_day)
+
+            # ----------------------------
+            # STRESS OVERLAY: On-the-fly scenario stress tests
+            # Applied after optimizer, before final safety overlays.
+            # ----------------------------
+            stress_triggered = False
+            stress_result_log: Optional[Dict[str, Any]] = None
+            
+            if stress_overlay_enabled and stress_overlay is not None:
+                try:
+                    # Compute corr_hhi for stress overlay (if not already computed)
+                    corr_hhi_stress = 0.0
+                    try:
+                        diag_vals = np.sqrt(np.diag(cov))
+                        diag_inv = np.where(diag_vals > 1e-8, 1.0 / diag_vals, 0.0)
+                        corr_mat_stress = (cov * diag_inv[:, None]) * diag_inv[None, :]
+                        corr_triu_stress = corr_mat_stress[np.triu_indices_from(corr_mat_stress, k=1)]
+                        corr_hhi_stress = float(np.sum(corr_triu_stress ** 2)) if len(corr_triu_stress) > 0 else 0.0
+                    except Exception:
+                        corr_hhi_stress = 0.0
+                    
+                    # Get previous/current realized vol for "vol rising" detection
+                    # rv_prev is tracked by stress_overlay._prev_vol internally
+                    # We pass current rv which was computed earlier
+                    rv_for_stress = _rolling_realized_vol(net_ret[:i], window=int(vol_window)) if i > 0 else 0.0
+                    rv_prev_stress = _rolling_realized_vol(net_ret[:max(0, i - 1)], window=int(vol_window)) if i > 1 else 0.0
+                    
+                    # Build sector weights if group_by_symbol available
+                    sector_weights_stress: Optional[Dict[str, float]] = None
+                    if group_by_symbol is not None:
+                        sector_weights_stress = {}
+                        for j, sym in enumerate(syms):
+                            sector = group_by_symbol.get(sym, "unknown")
+                            sector_weights_stress[sector] = sector_weights_stress.get(sector, 0.0) + abs(float(w[j]))
+                    
+                    # Apply stress overlay
+                    w, stress_result = stress_overlay.apply(
+                        w=w,
+                        cov=cov_shrunk if 'cov_shrunk' in dir() and cov_shrunk is not None else cov,
+                        vol_prev=rv_prev_stress,
+                        vol_curr=rv_for_stress,
+                        corr_hhi=corr_hhi_stress,
+                        sector_weights=sector_weights_stress,
+                        symbols=syms,
+                        group_by_symbol=group_by_symbol,
+                    )
+                    
+                    stress_triggered = stress_result.triggered
+                    stress_result_log = stress_result.to_dict()
+                    
+                    if stress_triggered:
+                        # Emit structured event
+                        if emit_events:
+                            emit_event({
+                                "event": "phase2.stress_overlay",
+                                "day_idx": int(i),
+                                "date": str(day) if day is not None else None,
+                                "stress_result": stress_result_log,
+                            })
+                        logger.info(
+                            "[phase2.stress_overlay] Day %d: scale=%.2f | %s",
+                            i, stress_result.final_scale, " | ".join(stress_result.messages)
+                        )
+                except Exception as e:
+                    logger.warning("[phase2.stress_overlay] Error applying stress overlay: %s", e)
 
             # ----------------------------
             # Deterministic HF-grade overlays
@@ -4009,45 +7760,174 @@ def evaluate_phase2_stateful_once(
                 equity_peak = float(max(equity_peak, eq_prev))
                 dd = float(1.0 - (eq_prev / equity_peak)) if equity_peak > 0 else 0.0
                 overlay_dd[i] = float(dd)
-
-                # Hard kill-switch on deep drawdown.
-                if np.isfinite(dd_kill) and dd_kill > 0 and dd >= dd_kill:
-                    logger.warning("Phase2 v2 DD kill-switch triggered (dd=%.4f >= %.4f); flattening", dd, dd_kill)
-                    w = np.zeros(n_assets, dtype=float)
-                    flattened = 1.0
-                else:
-                    # Drawdown throttles (reduce gross).
-                    gross_scale = 1.0
-                    if np.isfinite(dd_throttle_2) and dd_throttle_2 > 0 and dd >= dd_throttle_2:
-                        gross_scale = float(np.clip(dd_gross_mult_2, 0.0, 1.0))
-                    elif np.isfinite(dd_throttle_1) and dd_throttle_1 > 0 and dd >= dd_throttle_1:
-                        gross_scale = float(np.clip(dd_gross_mult_1, 0.0, 1.0))
-                    if gross_scale < 1.0:
-                        w = w * gross_scale
-                    dd_scale = float(gross_scale)
-                overlay_dd_gross_scale[i] = float(dd_scale)
-
-                # Realized vol throttle/kill (annualized).
+                
+                # Realized vol (computed early for risk latch)
                 rv = _rolling_realized_vol(net_ret[:i], window=int(vol_window)) if i > 0 else 0.0
                 overlay_rv[i] = float(rv)
-                if np.isfinite(rv) and rv > 0 and np.isfinite(target_vol) and target_vol > 0:
-                    if np.isfinite(vol_kill_mult) and vol_kill_mult > 0 and rv >= float(vol_kill_mult) * float(target_vol_day):
-                        logger.warning(
-                            "Phase2 v2 vol kill-switch triggered (rv=%.3f >= %.3f); flattening",
-                            rv,
-                            float(vol_kill_mult) * float(target_vol_day),
+                
+                # ─────────────────────────────────────────────────────────────
+                # RISK LATCH: Check all conditions (replaces individual kill-switches)
+                # ─────────────────────────────────────────────────────────────
+                risk_latch_override = False
+                if risk_latch_enabled and risk_latch is not None:
+                    # Check NaN/Inf in predictions
+                    risk_latch.check_nan_inf([mu_vec, sigma_vec, z_thr, w], ["mu", "sigma", "z_thr", "w"])
+                    
+                    # Check drawdown conditions
+                    risk_latch.check_drawdown(dd)
+                    
+                    # Check volatility conditions
+                    risk_latch.check_volatility(rv)
+                    
+                    # Check single-day crash
+                    if i > 0:
+                        daily_ret = float(net_ret[i - 1])
+                        risk_latch.check_daily_return(daily_ret)
+                    
+                    # Check model health (calibration)
+                    calib_score = 1.0
+                    if mamba_calib_snapshot is not None:
+                        calib_score = float(mamba_calib_snapshot.calibration_overall)
+                    risk_latch.check_model_health(calib_score, z_thr)
+                    
+                    # Check CBOE panic (if available)
+                    if 'day_cboe_panic' in dir() and np.isfinite(day_cboe_panic):
+                        vix_approx = 20.0 * (1.0 + float(day_cboe_panic))  # Rough VIX estimate
+                        risk_latch.check_cboe_panic(vix_approx, float(day_cboe_panic))
+                    
+                    # Check correlation HHI
+                    try:
+                        diag_vals = np.sqrt(np.diag(cov))
+                        diag_inv = np.where(diag_vals > 1e-8, 1.0 / diag_vals, 0.0)
+                        corr_mat = (cov * diag_inv[:, None]) * diag_inv[None, :]
+                        corr_triu = corr_mat[np.triu_indices_from(corr_mat, k=1)]
+                        corr_hhi_check = float(np.sum(corr_triu ** 2)) if len(corr_triu) > 0 else 0.0
+                        risk_latch.check_correlation_hhi(corr_hhi_check)
+                    except Exception:
+                        pass
+                    
+                    # Resolve to final state
+                    latch_state = risk_latch.resolve()
+                    
+                    # Apply risk latch override
+                    if latch_state.mode >= RiskLatchMode.FLATTEN:
+                        # FLATTEN or higher: force weights to zero
+                        w = np.zeros(n_assets, dtype=float)
+                        flattened = 1.0
+                        risk_latch_override = True
+                        
+                        # EMIT: RISK_LATCH_FLATTEN
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.CRITICAL,
+                            code=EventCode.RISK_LATCH_FLATTEN,
+                            message=f"Risk latch: {latch_state.mode.name} due to {latch_state.primary_reason.name if latch_state.primary_reason else 'unknown'}",
+                            payload=latch_state.to_dict(),
+                        )
+                    
+                    elif latch_state.mode == RiskLatchMode.THROTTLE:
+                        # THROTTLE: scale exposure
+                        w = w * latch_state.exposure_scale
+                        dd_scale = min(dd_scale, latch_state.exposure_scale)
+                        
+                        # EMIT: RISK_LATCH_THROTTLE
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.WARNING,
+                            code=EventCode.RISK_LATCH_THROTTLE,
+                            message=f"Risk latch throttle: scale={latch_state.exposure_scale:.2f}",
+                            payload=latch_state.to_dict(),
+                        )
+
+                # Legacy kill-switches (only if risk_latch didn't override)
+                if not risk_latch_override:
+                    # Hard kill-switch on deep drawdown.
+                    if np.isfinite(dd_kill) and dd_kill > 0 and dd >= dd_kill:
+                        logger.warning("Phase2 v2 DD kill-switch triggered (dd=%.4f >= %.4f); flattening", dd, dd_kill)
+                        # EMIT: DD_KILL
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.CRITICAL,
+                            code=EventCode.DD_KILL,
+                            message=f"DD kill-switch triggered: dd={dd:.4f} >= {dd_kill:.4f}",
+                            payload={"dd": float(dd), "dd_kill": float(dd_kill), "equity_peak": float(equity_peak)},
                         )
                         w = np.zeros(n_assets, dtype=float)
                         flattened = 1.0
-                    elif np.isfinite(vol_throttle_mult) and vol_throttle_mult > 0 and rv >= float(vol_throttle_mult) * float(target_vol_day):
-                        # Scale down to bring realized vol back toward the throttle limit.
-                        scale = float((float(vol_throttle_mult) * float(target_vol_day)) / (rv + 1e-12))
-                        vol_scale = float(np.clip(scale, 0.0, 1.0))
-                        w = w * float(vol_scale)
+                    else:
+                        # Drawdown throttles (reduce gross).
+                        gross_scale = 1.0
+                        if np.isfinite(dd_throttle_2) and dd_throttle_2 > 0 and dd >= dd_throttle_2:
+                            gross_scale = float(np.clip(dd_gross_mult_2, 0.0, 1.0))
+                            # EMIT: DD_THROTTLE
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.DD_THROTTLE,
+                                message=f"DD throttle tier-2: dd={dd:.4f}, scale={gross_scale:.2f}",
+                                payload={"dd": float(dd), "tier": 2, "gross_scale": float(gross_scale)},
+                            )
+                        elif np.isfinite(dd_throttle_1) and dd_throttle_1 > 0 and dd >= dd_throttle_1:
+                            gross_scale = float(np.clip(dd_gross_mult_1, 0.0, 1.0))
+                            # EMIT: DD_THROTTLE
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.DD_THROTTLE,
+                                message=f"DD throttle tier-1: dd={dd:.4f}, scale={gross_scale:.2f}",
+                                payload={"dd": float(dd), "tier": 1, "gross_scale": float(gross_scale)},
+                            )
+                        if gross_scale < 1.0:
+                            w = w * gross_scale
+                        dd_scale = float(gross_scale)
+                    
+                    # Realized vol throttle/kill (annualized) - rv already computed above.
+                    if np.isfinite(rv) and rv > 0 and np.isfinite(target_vol) and target_vol > 0:
+                        if np.isfinite(vol_kill_mult) and vol_kill_mult > 0 and rv >= float(vol_kill_mult) * float(target_vol_day):
+                            logger.warning(
+                                "Phase2 v2 vol kill-switch triggered (rv=%.3f >= %.3f); flattening",
+                                rv,
+                                float(vol_kill_mult) * float(target_vol_day),
+                            )
+                            # EMIT: VOL_KILL
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.CRITICAL,
+                                code=EventCode.VOL_KILL,
+                                message=f"Vol kill-switch triggered: rv={rv:.3f} >= {float(vol_kill_mult) * float(target_vol_day):.3f}",
+                                payload={"rv": float(rv), "target_vol": float(target_vol_day), "vol_kill_mult": float(vol_kill_mult)},
+                            )
+                            w = np.zeros(n_assets, dtype=float)
+                            flattened = 1.0
+                        elif np.isfinite(vol_throttle_mult) and vol_throttle_mult > 0 and rv >= float(vol_throttle_mult) * float(target_vol_day):
+                            # Scale down to bring realized vol back toward the throttle limit.
+                            scale = float((float(vol_throttle_mult) * float(target_vol_day)) / (rv + 1e-12))
+                            # EMIT: VOL_THROTTLE
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.VOL_THROTTLE,
+                                message=f"Vol throttle applied: rv={rv:.3f}, scale={scale:.2f}",
+                                payload={"rv": float(rv), "target_vol": float(target_vol_day), "scale": float(scale)},
+                            )
+                            vol_scale = float(np.clip(scale, 0.0, 1.0))
+                            w = w * float(vol_scale)
+                
+                overlay_dd_gross_scale[i] = float(dd_scale)
                 overlay_vol_scale[i] = float(vol_scale)
 
-                # Optional beta neutrality / beta exposure cap.
-                if beta_neutral or (np.isfinite(beta_cap) and beta_cap > 0):
+                # Optional beta neutralization / beta exposure cap.
+                # Apply if: (1) deprecated beta_neutral flag is True, OR
+                #           (2) beta_cap is set (>= 0 means cap constraint active)
+                # Note: beta_cap = 0 → full neutralization, beta_cap > 0 → capped exposure
+                if beta_neutral or (np.isfinite(beta_cap) and beta_cap >= 0):
                     look = int(max(5, min(int(beta_lookback), i)))
                     if look >= 5:
                         win = returns_df.iloc[max(0, i - look) : i].to_numpy(dtype=float)
@@ -4061,8 +7941,8 @@ def evaluate_phase2_stateful_once(
                     w,
                     symbols=syms,
                     group_by_symbol=group_by_symbol,
-                    max_group_gross=max_group_gross,
-                    max_group_net=max_group_net,
+                    max_group_gross=max_group_gross_day,
+                    max_group_net=max_group_net_day,
                 )
 
                 # Optional exponential weight smoothing.
@@ -4127,6 +8007,15 @@ def evaluate_phase2_stateful_once(
                             len(dropped),
                             ",".join(dropped[:25]) + ("..." if len(dropped) > 25 else ""),
                         )
+                        # EMIT: REGISTRY_GATE
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.WARNING,
+                            code=EventCode.REGISTRY_GATE,
+                            message=f"Registry gate zeroed {len(dropped)} ineligible weights",
+                            payload={"n_dropped": len(dropped), "dropped_syms": dropped[:10]},
+                        )
                 w = np.where(_eligible_mask, w, 0.0)
 
             # Re-apply core constraints after overlays.
@@ -4148,28 +8037,194 @@ def evaluate_phase2_stateful_once(
                 corr_abs_mu_sigma_daily[i] = float(sh.get("corr_abs_mu_sigma", float("nan")))
 
             # Realized PnL for day uses previous weights (weights set at close for next day).
-            r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Choose return source based on exec_price_mode
+            # ─────────────────────────────────────────────────────────────────────
+            if exec_price_mode == "open_to_open" and open_returns_df is not None:
+                try:
+                    r_vec = open_returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+                except Exception:
+                    r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+            else:
+                r_vec = returns_df.loc[pd.Timestamp(day)].to_numpy(dtype=float)
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # FAST CRASH TRIGGER B: Gap/Overnight Shock (pre-trade)
+            # Detect dangerous gaps at open that may invalidate yesterday's positions.
+            # ─────────────────────────────────────────────────────────────────────
+            gap_shock_triggered = False
+            if risk_latch_enabled and risk_latch is not None and i > 0:
+                try:
+                    # Get per-asset rolling vol for gap detection
+                    rolling_vol_gap = None
+                    if i >= 20:
+                        # Compute rolling 20-day vol (annualized)
+                        ret_window = returns_df.iloc[max(0, i - 20):i].to_numpy(dtype=float)
+                        rolling_vol_gap = np.std(ret_window, axis=0) * np.sqrt(252.0)
+                    
+                    gap_shock_triggered = risk_latch.check_gap_shock(
+                        r_vec=r_vec,
+                        rolling_vol=rolling_vol_gap,
+                        prev_weights=prev_exec_w,  # Yesterday's executed weights
+                        symbols=syms,
+                    )
+                    
+                    if gap_shock_triggered:
+                        # Resolve immediately to get action
+                        gap_state = risk_latch.resolve()
+                        if gap_state.mode >= RiskLatchMode.FLATTEN:
+                            # Force flatten for today
+                            w = np.zeros(n_assets, dtype=float)
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.CRITICAL,
+                                code=EventCode.RISK_LATCH_FLATTEN,
+                                message=f"GAP SHOCK → FLATTEN: {gap_state.all_triggers[-1].message if gap_state.all_triggers else 'Gap detected'}",
+                                payload=gap_state.to_dict(),
+                            )
+                        elif gap_state.mode == RiskLatchMode.THROTTLE:
+                            # Scale down weights
+                            w = w * gap_state.exposure_scale
+                            event_bus.emit(
+                                date=str(pd.Timestamp(day))[:10],
+                                day_idx=i,
+                                severity=EventSeverity.WARNING,
+                                code=EventCode.RISK_LATCH_THROTTLE,
+                                message=f"GAP SHOCK → THROTTLE: scale={gap_state.exposure_scale:.2f}",
+                                payload=gap_state.to_dict(),
+                            )
+                except Exception as e:
+                    logger.debug("[phase2.risk_latch.gap_shock] Error: %s", e)
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Update ExecutionContext with daily ADV data
+            # ─────────────────────────────────────────────────────────────────────
+            if capital_usd_f > 0:
+                exec_ctx.capital_usd = float(capital_usd_f)
+                try:
+                    adv_vec_exec = np.full(n_assets, 10_000_000.0, dtype=float)
+                    for j, sym in enumerate(syms):
+                        adv_s = adv_usd_by_sym.get(str(sym).upper())
+                        if adv_s is not None and not adv_s.empty:
+                            try:
+                                adv_val = float(pd.to_numeric(adv_s.reindex([pd.Timestamp(day)]).iloc[0], errors="coerce"))
+                                if np.isfinite(adv_val) and adv_val > 0:
+                                    adv_vec_exec[j] = adv_val
+                            except Exception:
+                                pass
+                    exec_ctx.adv_usd = adv_vec_exec
+                except Exception:
+                    pass
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Apply borrow constraints if enabled
+            # ─────────────────────────────────────────────────────────────────────
+            if exec_per_name_borrow:
+                w = _apply_borrow_constraints(
+                    w,
+                    exec_ctx,
+                    htb_threshold_bps=exec_htb_threshold_bps,
+                    htb_max_short_weight=exec_htb_max_short_weight,
+                )
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Apply corporate action constraints if enabled
+            # ─────────────────────────────────────────────────────────────────────
+            if exec_halted_to_flat or exec_reduce_short_on_ex_div:
+                w = _apply_corporate_action_constraints(
+                    w,
+                    exec_ctx,
+                    reduce_on_ex_div=exec_reduce_short_on_ex_div,
+                    ex_div_reduction_mult=exec_ex_div_reduction_mult,
+                )
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Apply liquidity participation constraint
+            # ─────────────────────────────────────────────────────────────────────
+            if exec_enable_partial_fills and capital_usd_f > 0:
+                w, residual_out = _apply_liquidity_participation_constraint(
+                    w,
+                    prev_w,
+                    exec_ctx,
+                    max_participation_rate=exec_participation_rate,
+                )
+                # Carry residual to next day
+                exec_ctx.partial_fill_residual = residual_out
+            
             pnl = float(exec_w @ r_vec)
-            tval = float(np.sum(np.abs(w - prev_w)))
-            turnover[i] = tval
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # DIAGNOSTIC FIX: Track BOTH intent and executed turnover separately
+            # - turnover_intent: optimizer target diff (for policy enforcement)
+            # - turnover_exec: execution queue diff (for cost computation)
+            # This fixes the blind spot where costs were attributed to intent but PnL came from exec
+            # ─────────────────────────────────────────────────────────────────────
+            tval_intent = float(np.sum(np.abs(w - prev_w)))
+            tval_exec = float(np.sum(np.abs(exec_w - prev_exec_w)))
+            turnover_intent[i] = tval_intent
+            turnover_exec[i] = tval_exec
+            turnover[i] = tval_exec  # Legacy: points to exec turnover for backwards compat
 
-            if safety_enabled and np.isfinite(kill_on_turnover_gt) and kill_on_turnover_gt > 0 and tval >= kill_on_turnover_gt:
-                logger.warning("Phase2 v2 turnover kill-switch triggered (t=%.3f >= %.3f); flattening", tval, kill_on_turnover_gt)
+            # Turnover kill-switch operates on INTENT (policy control of optimizer output)
+            if safety_enabled and np.isfinite(kill_on_turnover_gt) and kill_on_turnover_gt > 0 and tval_intent >= kill_on_turnover_gt:
+                logger.warning("Phase2 v2 turnover kill-switch triggered (intent=%.3f >= %.3f); flattening", tval_intent, kill_on_turnover_gt)
+                # EMIT: TURNOVER_KILL
+                event_bus.emit(
+                    date=str(pd.Timestamp(day))[:10],
+                    day_idx=i,
+                    severity=EventSeverity.CRITICAL,
+                    code=EventCode.TURNOVER_KILL,
+                    message=f"Turnover kill-switch triggered: intent={tval_intent:.3f} >= {kill_on_turnover_gt:.3f}",
+                    payload={
+                        "turnover_intent": float(tval_intent),
+                        "turnover_exec": float(tval_exec),
+                        "kill_threshold": float(kill_on_turnover_gt),
+                        "policy_action_idx": int(policy_action_history[i]) if policy_action_history[i] is not None else None,
+                    },
+                )
                 w = np.zeros(n_assets, dtype=float)
                 w_mat[i, :] = w
                 try:
                     overlay_flattened[i] = 1.0
                 except Exception:
                     pass
-                tval = float(np.sum(np.abs(w - prev_w)))
-                turnover[i] = tval
+                # Re-compute intent turnover after flattening
+                tval_intent = float(np.sum(np.abs(w - prev_w)))
+                turnover_intent[i] = tval_intent
                 if flat_cooldown_sessions > 0:
                     flat_until_idx = int(min(len(union_oos_index) - 1, i + int(flat_cooldown_sessions)))
-            cost = float(k_spread * tval + k_impact * (tval ** 1.5))
-            # Optional borrow fee for shorts (annual bps applied daily on short notional).
-            if safety_enabled and np.isfinite(borrow_fee_bps_annual) and borrow_fee_bps_annual > 0:
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Compute cost with asset-aware slippage or legacy
+            # CRITICAL FIX: Costs are computed on EXECUTED turnover, not intent
+            # ─────────────────────────────────────────────────────────────────────
+            if exec_asset_aware_slippage and capital_usd_f > 0:
+                # Per-asset slippage model using EXECUTED weight changes
+                delta_w_exec = exec_w - prev_exec_w
+                slippage_per_asset = _compute_asset_aware_slippage(
+                    delta_w_exec,
+                    exec_ctx,
+                    impact_exponent=exec_impact_exponent,
+                    impact_scale=exec_impact_scale,
+                )
+                cost = float(np.sum(slippage_per_asset))
+            else:
+                # Legacy aggregate model using EXECUTED turnover
+                cost = float(k_spread * tval_exec + k_impact * (tval_exec ** 1.5))
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # EXECUTION REALISM: Per-name borrow cost or legacy flat rate
+            # ─────────────────────────────────────────────────────────────────────
+            if exec_per_name_borrow:
+                # Per-name borrow fees
+                borrow_cost = _compute_per_asset_borrow_cost(exec_w, exec_ctx)
+                cost += borrow_cost
+            elif safety_enabled and np.isfinite(borrow_fee_bps_annual) and borrow_fee_bps_annual > 0:
+                # Legacy flat rate
                 short_notional = float(np.sum(np.maximum(-exec_w, 0.0)))
                 cost += float((borrow_fee_bps_annual / 1e4) / 252.0) * short_notional
+            
             costs[i] = cost
             pnl_net = float(pnl - cost)
             net_ret[i] = pnl_net
@@ -4178,25 +8233,120 @@ def evaluate_phase2_stateful_once(
             else:
                 equity[i] = float(equity[i - 1] * (1.0 + pnl_net))
 
+            # ─────────────────────────────────────────────────────────────────────
+            # FAST CRASH TRIGGER A: 1-Day Loss Kill → EMERGENCY_STOP
+            # Called RIGHT AFTER computing pnl_net, BEFORE policy update so policy
+            # can learn from the event. Sets cooldown for N sessions.
+            # ─────────────────────────────────────────────────────────────────────
+            if risk_latch_enabled and risk_latch is not None and i > 0:
+                try:
+                    equity_prev = float(equity[i - 1])
+                    equity_today = float(equity[i])
+                    
+                    one_day_kill = risk_latch.check_one_day_loss_kill(
+                        pnl_net_today=pnl_net,
+                        equity_today=equity_today,
+                        equity_prev=equity_prev,
+                    )
+                    
+                    if one_day_kill:
+                        # EMERGENCY_STOP triggered - set cooldown
+                        emergency_state = risk_latch.resolve()
+                        flat_until_idx = int(min(
+                            len(union_oos_index) - 1,
+                            i + risk_latch.thresholds.emergency_cooldown_sessions
+                        ))
+                        
+                        # ─────────────────────────────────────────────────────────
+                        # LEDGER: Log 1-day loss kill event
+                        # ─────────────────────────────────────────────────────────
+                        if risk_events_ledger is not None:
+                            try:
+                                risk_events_ledger.add_event(
+                                    date=str(pd.Timestamp(day))[:10],
+                                    day_idx=i,
+                                    event_type="ONE_DAY_LOSS_KILL",
+                                    threshold=f"Loss > {risk_latch.thresholds.one_day_loss_kill * 100:.1f}%",
+                                    threshold_value=float(risk_latch.thresholds.one_day_loss_kill),
+                                    observed_value=abs(pnl_net),
+                                    threshold_crossed=True,
+                                    action_taken="EMERGENCY_STOP",
+                                    exposure_scale=0.0,
+                                    emergency_remaining=int(risk_latch.thresholds.emergency_cooldown_sessions),
+                                    trigger_reason="ONE_DAY_LOSS_KILL",
+                                    details={
+                                        "pnl_net": float(pnl_net),
+                                        "equity_prev": float(equity_prev),
+                                        "equity_today": float(equity_today),
+                                        "flat_until_idx": int(flat_until_idx),
+                                    },
+                                )
+                            except Exception as le:
+                                logger.debug("[phase2.ledger] Failed to log event: %s", le)
+                        
+                        # EMIT: RISK_LATCH_EMERGENCY
+                        event_bus.emit(
+                            date=str(pd.Timestamp(day))[:10],
+                            day_idx=i,
+                            severity=EventSeverity.CRITICAL,
+                            code=EventCode.RISK_LATCH_EMERGENCY,
+                            message=f"1-DAY LOSS KILL: {pnl_net:.2%} loss → EMERGENCY_STOP, flat until day {flat_until_idx}",
+                            payload={
+                                "pnl_net": float(pnl_net),
+                                "equity_prev": float(equity_prev),
+                                "equity_today": float(equity_today),
+                                "flat_until_idx": int(flat_until_idx),
+                                "cooldown_sessions": int(risk_latch.thresholds.emergency_cooldown_sessions),
+                                **emergency_state.to_dict(),
+                            },
+                        )
+                        
+                        logger.warning(
+                            "[phase2.risk_latch] 1-DAY LOSS KILL: pnl=%.2f%%, equity %.4f→%.4f, flat until day %d",
+                            pnl_net * 100, equity_prev, equity_today, flat_until_idx,
+                        )
+                except Exception as e:
+                    logger.debug("[phase2.risk_latch.1day_kill] Error: %s", e)
+
             # Policy update (delayed reward over a rolling window).
+            # FIX Gap #3: Action at time t affects holdings at t+(delay-1), so we need to
+            # shift attribution by (delay-1) when delay > 1. Otherwise the bandit learns noise.
             if policy is not None and policy_reward_window > 1:
                 try:
                     window = int(max(2, policy_reward_window))
-                    start_idx = int(i - window + 1)
+                    # Adjust start_idx for execution delay: action at t affects holdings at t+(delay-1)
+                    # So reward attribution should be shifted back by (delay-1)
+                    delay_shift = int(max(0, trade_delay_sessions - 1))
+                    start_idx = int(i - window + 1 - delay_shift)
+                    
                     if start_idx >= 0:
                         action_idx = policy_action_history[start_idx]
                         state_vec = policy_state_history[start_idx]
                         if action_idx is not None and state_vec is not None:
-                            reward = _policy_reward_from_window(
-                                net_returns=net_ret,
-                                turnover=turnover,
-                                equity=equity,
-                                start=start_idx,
-                                end=i,
-                                lambda_turnover=policy_reward_lambda_turn,
-                                lambda_drawdown=policy_reward_lambda_dd,
-                            )
-                            policy.update(action_index=int(action_idx), x=state_vec, reward=float(reward))
+                            # Reward window also shifted to align with when action's effects materialize
+                            reward_start = int(start_idx + delay_shift)
+                            reward_end = int(min(i, len(net_ret) - 1))
+                            
+                            if reward_end > reward_start:
+                                reward = _policy_reward_from_window(
+                                    net_returns=net_ret,
+                                    turnover=turnover,
+                                    equity=equity,
+                                    start=reward_start,
+                                    end=reward_end,
+                                    lambda_turnover=policy_reward_lambda_turn,
+                                    lambda_drawdown=policy_reward_lambda_dd,
+                                )
+                                policy.update(action_index=int(action_idx), x=state_vec, reward=float(reward))
+                                
+                                # Update trace with delayed reward
+                                if trace_enabled and start_idx < len(daily_traces):
+                                    try:
+                                        daily_traces[start_idx].reward = float(reward)
+                                        daily_traces[start_idx].reward_window_start = int(reward_start)
+                                        daily_traces[start_idx].reward_window_end = int(reward_end)
+                                    except Exception:
+                                        pass
                 except Exception:
                     pass
 
@@ -4210,7 +8360,202 @@ def evaluate_phase2_stateful_once(
             else:
                 exec_w = w
 
+            # ─────────────────────────────────────────────────────────────────────
+            # DAILY TRACE INSTRUMENTATION: Capture full signal chain
+            # ─────────────────────────────────────────────────────────────────────
+            if trace_enabled:
+                try:
+                    # Compute current drawdown
+                    eq_for_dd = float(equity[i])
+                    peak_for_trace = float(equity_peak)
+                    dd_for_trace = float((peak_for_trace - eq_for_dd) / peak_for_trace) if peak_for_trace > 0 else 0.0
+                    
+                    # Compute realized volatility (rolling 20d)
+                    rv_window = 20
+                    rv_start = max(0, i - rv_window + 1)
+                    rv_for_trace = float(np.std(net_ret[rv_start:i+1]) * np.sqrt(252.0)) if i >= rv_start else 0.0
+                    
+                    # Compute split costs (based on EXECUTED turnover for accuracy)
+                    cost_spread_trace = 0.0
+                    cost_impact_trace = 0.0
+                    cost_borrow_trace = 0.0
+                    if exec_asset_aware_slippage and capital_usd_f > 0:
+                        delta_w_exec_trace = exec_w - prev_exec_w
+                        slippage_trace = _compute_asset_aware_slippage(
+                            delta_w_exec_trace, exec_ctx,
+                            impact_exponent=exec_impact_exponent,
+                            impact_scale=exec_impact_scale,
+                        )
+                        # Approximate split: spread = 50% of slippage, impact = 50%
+                        cost_spread_trace = float(np.sum(slippage_trace)) * 0.5
+                        cost_impact_trace = float(np.sum(slippage_trace)) * 0.5
+                    else:
+                        cost_spread_trace = float(k_spread * tval_exec)
+                        cost_impact_trace = float(k_impact * (tval_exec ** 1.5))
+                    
+                    if exec_per_name_borrow:
+                        cost_borrow_trace = _compute_per_asset_borrow_cost(exec_w, exec_ctx)
+                    elif safety_enabled and np.isfinite(borrow_fee_bps_annual) and borrow_fee_bps_annual > 0:
+                        short_not_trace = float(np.sum(np.maximum(-exec_w, 0.0)))
+                        cost_borrow_trace = float((borrow_fee_bps_annual / 1e4) / 252.0) * short_not_trace
+                    
+                    # Eligible/universe mask summary
+                    n_elig_trace = int(np.sum(_eligible_mask)) if _eligible_mask is not None else n_assets
+                    n_univ_trace = int(np.sum(_universe_mask)) if _universe_mask is not None else n_assets
+                    
+                    # Dropped/added symbols tracking
+                    dropped_trace: List[str] = []
+                    added_trace: List[str] = []
+                    if _eligible_mask is not None:
+                        curr_elig_set = set(s for j, s in enumerate(syms) if _eligible_mask[j])
+                        if _prev_eligible_set is not None:
+                            dropped_trace = sorted(list(_prev_eligible_set - curr_elig_set))[:5]
+                            added_trace = sorted(list(curr_elig_set - _prev_eligible_set))[:5]
+                        _prev_eligible_set = curr_elig_set
+                    
+                    # Get z vectors at various stages (need to preserve them earlier)
+                    z_raw_trace = np.divide(mu_vec, sigma_exec + 1e-9)
+                    z_raw_trace = np.clip(z_raw_trace, -z_clip, z_clip)
+                    
+                    # Policy knobs
+                    policy_knobs_trace = {
+                        "base_threshold": float(thr_base_day),
+                        "regime_mult_bull": float(thr_bull_day),
+                        "regime_mult_bear": float(thr_bear_day),
+                        "regime_mult_crisis": float(thr_crisis_day),
+                        "target_vol": float(target_vol_day),
+                        "turnover_cap": float(turnover_cap_day),
+                        "max_gross": float(max_gross_day),
+                        "max_net": float(max_net_day),
+                        "max_name": float(max_name_day),
+                        "weight_smoothing_alpha": float(weight_smoothing_alpha_day),
+                        "vol_scaler": float(vol_scaler_day),
+                        "quantile_blend_weight": float(quantile_blend_weight_day),
+                    }
+                    
+                    # Constraints used
+                    constraints_trace = {
+                        "max_gross": float(max_gross_day),
+                        "max_net": float(max_net_day),
+                        "max_name": float(max_name_day),
+                        "target_vol": float(target_vol_day),
+                        "turnover_cap": float(turnover_cap_day),
+                        "beta_neutral": float(beta_neutral),
+                        "group_max_gross": float(max_group_gross),
+                        "group_max_net": float(max_group_net),
+                    }
+                    
+                    # Optimizer path
+                    optimizer_path_trace = "robust" if (use_robust_optimizer and robust_optimizer is not None) else "mv_fallback"
+                    
+                    # Determine if throttles triggered
+                    dd_throttle_flag = (dd_for_trace >= dd_throttle_1) if np.isfinite(dd_throttle_1) else False
+                    vol_throttle_flag = (rv_for_trace >= vol_throttle_mult * target_vol_day) if np.isfinite(vol_throttle_mult) else False
+                    kill_flag = (dd_for_trace >= dd_kill) if np.isfinite(dd_kill) else False
+                    flattened_flag = bool(overlay_flattened[i] > 0.5) if i < len(overlay_flattened) else False
+                    
+                    # Build trace payload
+                    trace = DailyTracePayload(
+                        date=str(pd.Timestamp(day))[:10],
+                        day_idx=int(i),
+                        horizon=int(horizon),
+                        
+                        # Masks
+                        n_eligible=n_elig_trace,
+                        n_universe=n_univ_trace,
+                        n_total=n_assets,
+                        dropped_syms=dropped_trace,
+                        added_syms=added_trace,
+                        
+                        # Returns
+                        **{f"r_vec_{k}": v for k, v in _summarize_vector(r_vec).items()},
+                        
+                        # Model outputs
+                        **{f"mu_vec_{k}": v for k, v in _summarize_vector(mu_vec).items()},
+                        mu_top_k=_top_k_by_abs(mu_vec, syms, k=5),
+                        **{f"sigma_raw_{k}": v for k, v in _summarize_vector(sigma_vec).items()},
+                        **{f"sigma_exec_{k}": v for k, v in _summarize_vector(sigma_exec).items()},
+                        sigma_exec_n_clipped=int(np.sum((sigma_ema < sigma_exec) | (sigma_ema > sigma_exec))),
+                        
+                        # Signal chain
+                        **{f"z_raw_{k}": v for k, v in _summarize_vector(z_raw_trace).items()},
+                        z_after_role_overlays_mean=float(np.mean(z)) if z is not None else 0.0,
+                        z_after_role_overlays_std=float(np.std(z)) if z is not None else 0.0,
+                        z_after_quantile_blend_mean=float(np.mean(z)) if z is not None else 0.0,
+                        z_after_quantile_blend_std=float(np.std(z)) if z is not None else 0.0,
+                        quantile_blend_weight=float(quantile_blend_weight_day),
+                        z_thr_mean=float(np.mean(z_thr)) if z_thr is not None else 0.0,
+                        z_thr_std=float(np.std(z_thr)) if z_thr is not None else 0.0,
+                        z_thr_n_zeroed=int(np.sum(np.abs(z_thr) < 1e-12)) if z_thr is not None else 0,
+                        
+                        # Policy
+                        policy_state_vec=policy_state_history[i].tolist() if policy_state_history[i] is not None else None,
+                        policy_action_idx=policy_action_history[i],
+                        policy_knobs=policy_knobs_trace,
+                        
+                        # Optimizer
+                        optimizer_path=optimizer_path_trace,
+                        optimizer_status="success",
+                        optimizer_iterations=0,
+                        constraints_used=constraints_trace,
+                        w_target_gross=float(np.sum(np.abs(w))),
+                        w_target_net=float(np.sum(w)),
+                        w_target_n_nonzero=int(np.sum(np.abs(w) > 1e-12)),
+                        w_target_max_abs=float(np.max(np.abs(w))) if len(w) else 0.0,
+                        
+                        # Safety
+                        w_after_safety_gross=float(np.sum(np.abs(w))),
+                        w_after_safety_net=float(np.sum(w)),
+                        dd_current=dd_for_trace,
+                        rv_current=rv_for_trace,
+                        turnover_intent=float(tval_intent),
+                        dd_throttle_triggered=dd_throttle_flag,
+                        vol_throttle_triggered=vol_throttle_flag,
+                        kill_triggered=kill_flag,
+                        flattened=flattened_flag,
+                        
+                        # Execution
+                        exec_w_gross=float(np.sum(np.abs(exec_w))),
+                        exec_w_net=float(np.sum(exec_w)),
+                        prev_exec_w_gross=float(np.sum(np.abs(prev_exec_w))),
+                        prev_exec_w_net=float(np.sum(prev_exec_w)),
+                        turnover_exec=float(tval_exec),  # Use pre-computed exec turnover
+                        
+                        pnl_gross=float(pnl),
+                        cost_spread=cost_spread_trace,
+                        cost_impact=cost_impact_trace,
+                        cost_borrow=cost_borrow_trace,
+                        cost_total=float(cost),
+                        pnl_net=float(pnl_net),
+                        
+                        equity=float(equity[i]),
+                        drawdown=dd_for_trace,
+                        equity_peak=float(equity_peak),
+                        
+                        # Reward (will be filled in later if available)
+                        reward=None,
+                        reward_window_start=None,
+                        reward_window_end=None,
+                    )
+                    daily_traces.append(trace)
+                    
+                except Exception as e:
+                    logger.debug("[phase2.trace] Failed to capture trace for day %s: %s", day, e)
+
+            # Update state for next iteration
+            prev_exec_w = exec_w.copy()
             prev_w = w
+            
+            # ─────────────────────────────────────────────────────────────
+            # RISK LATCH: End session - store final weights for recovery
+            # ─────────────────────────────────────────────────────────────
+            if risk_latch_enabled and risk_latch is not None:
+                try:
+                    # Only store good weights if not flattened
+                    good_w = w.copy() if flattened < 0.5 else None
+                    risk_latch.end_session(good_weights=good_w)
+                except Exception as e:
+                    logger.debug("[phase2.risk_latch] end_session error: %s", e)
 
             # Fold-level reporting/pruning (maturity-gated).
             # Only evaluate metrics on a matured prefix to avoid lookahead bias.
@@ -4497,6 +8842,9 @@ def evaluate_phase2_stateful_once(
             "sharpe": float(_annualized_sharpe(port_net)),
             "max_drawdown": float(_max_drawdown_from_equity(equity_curve)),
             "turnover": float(port_turn.mean() if len(port_turn) else 0.0),
+            "turnover_intent": float(np.mean(turnover_intent) if len(turnover_intent) else 0.0),
+            "turnover_exec": float(np.mean(turnover_exec) if len(turnover_exec) else 0.0),
+            "turnover_drift": float(np.mean(np.abs(turnover_intent - turnover_exec)) if len(turnover_intent) else 0.0),
             "flat_rate": float(flat_rate_full),
             "realized_vol": float(realized_vol),
             "target_vol": float(target_vol),
@@ -4507,6 +8855,8 @@ def evaluate_phase2_stateful_once(
             {
                 "net_return": port_net,
                 "turnover": port_turn,
+                "turnover_intent": pd.Series(turnover_intent, index=union_oos_index, name="turnover_intent"),
+                "turnover_exec": pd.Series(turnover_exec, index=union_oos_index, name="turnover_exec"),
                 "cost": port_cost,
                 "active_frac": port_active_frac,
                 "flat_flag": port_flat_flag,
@@ -4534,6 +8884,71 @@ def evaluate_phase2_stateful_once(
         equity_by_symbol: Dict[str, pd.DataFrame] = {}
         per_symbol_metrics: Dict[str, Dict[str, float]] = {}
         w_df = pd.DataFrame(w_mat, index=union_oos_index, columns=syms)
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # GAP #8: Compute per-symbol calibration stats from accumulated data
+        # ─────────────────────────────────────────────────────────────────────
+        per_sym_calib: Dict[str, Dict[str, float]] = {}
+        if per_symbol_calib_enabled and len(_per_sym_mu_acc) >= 10:
+            try:
+                # Stack accumulators: [n_matured_days, n_assets]
+                mu_stack = np.vstack(_per_sym_mu_acc)
+                sigma_stack = np.vstack(_per_sym_sigma_acc)
+                realized_stack = np.vstack(_per_sym_realized_acc)
+                
+                for j, sym in enumerate(syms):
+                    mu_j = mu_stack[:, j]
+                    sigma_j = sigma_stack[:, j]
+                    real_j = realized_stack[:, j]
+                    
+                    # Mask valid (non-NaN) observations
+                    valid = np.isfinite(mu_j) & np.isfinite(sigma_j) & np.isfinite(real_j)
+                    n_valid = int(np.sum(valid))
+                    
+                    if n_valid < 5:
+                        per_sym_calib[sym] = {
+                            "calib_n_obs": n_valid,
+                            "calib_dir_acc": float("nan"),
+                            "calib_corr": float("nan"),
+                            "calib_coverage_1std": float("nan"),
+                            "calib_sigma_ratio": float("nan"),
+                        }
+                        continue
+                    
+                    mu_v = mu_j[valid]
+                    sigma_v = sigma_j[valid]
+                    real_v = real_j[valid]
+                    
+                    # Directional accuracy: P(sign(μ) == sign(realized))
+                    dir_acc = float(np.mean((mu_v > 0) == (real_v > 0)))
+                    
+                    # Correlation: Corr(μ, realized)
+                    try:
+                        corr = float(np.corrcoef(mu_v, real_v)[0, 1])
+                        if not np.isfinite(corr):
+                            corr = 0.0
+                    except Exception:
+                        corr = 0.0
+                    
+                    # Sigma coverage: fraction within ±1σ
+                    z_scores = np.abs(real_v - mu_v) / (sigma_v + 1e-12)
+                    cov_1std = float(np.mean(z_scores <= 1.0))
+                    
+                    # Sigma calibration ratio: mean(σ²) / mean((r - μ)²)
+                    mean_sigma_sq = float(np.mean(np.square(sigma_v)))
+                    mean_sq_err = float(np.mean(np.square(real_v - mu_v)))
+                    sigma_ratio = mean_sigma_sq / (mean_sq_err + 1e-12) if mean_sq_err > 1e-12 else 1.0
+                    
+                    per_sym_calib[sym] = {
+                        "calib_n_obs": n_valid,
+                        "calib_dir_acc": dir_acc,
+                        "calib_corr": corr,
+                        "calib_coverage_1std": cov_1std,
+                        "calib_sigma_ratio": sigma_ratio,
+                    }
+            except Exception as e:
+                logger.debug("[phase2.per_sym_calib] computation error: %s", e)
+        
         for j, sym in enumerate(syms):
             r = returns_df[sym].reindex(union_oos_index).fillna(0.0)
             w_sym = w_df[sym].fillna(0.0)
@@ -4546,10 +8961,18 @@ def evaluate_phase2_stateful_once(
                 }
             )
             equity_by_symbol[sym] = eq
-            per_symbol_metrics[sym] = {
+            
+            # Base metrics
+            base_metrics = {
                 "avg_abs_weight": float(w_sym.abs().mean() if len(w_sym) else 0.0),
                 "avg_return": float(r.mean() if len(r) else 0.0),
             }
+            
+            # Merge per-symbol calibration stats (GAP #8)
+            if sym in per_sym_calib:
+                base_metrics.update(per_sym_calib[sym])
+            
+            per_symbol_metrics[sym] = base_metrics
 
         if trial is not None:
             try:
@@ -4865,6 +9288,175 @@ def evaluate_phase2_stateful_once(
             # Artifact writes must never break evaluation.
             pass
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Persist Mamba calibration governance state (with horizon-aware key).
+        # ─────────────────────────────────────────────────────────────────────
+        try:
+            if mamba_calib_tracker is not None:
+                calib_state = mamba_calib_tracker.serialize()
+                save_mamba_calibration_state(governance_state_key, calib_state)
+                logger.info("[phase2.governance] 💾 Saved Mamba calibration state: %s", governance_state_key)
+        except Exception as e:
+            logger.warning("[phase2.governance] Failed to persist calibration state: %s", e)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # DAILY TRACE INSTRUMENTATION: Persist traces if enabled
+        # ─────────────────────────────────────────────────────────────────────
+        if trace_enabled and trace_persist and daily_traces:
+            try:
+                import gzip
+                if trace_persist_path:
+                    trace_path = Path(trace_persist_path)
+                else:
+                    trace_dir = Path("cache/debugging")
+                    trace_dir.mkdir(parents=True, exist_ok=True)
+                    ts_str = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+                    sym_hash = hashlib.sha256(",".join(sorted(syms)).encode()).hexdigest()[:8]
+                    trace_path = trace_dir / f"daily_traces_h{horizon}_{sym_hash}_{ts_str}.json.gz"
+                
+                trace_dicts = [t.to_dict() for t in daily_traces]
+                with gzip.open(trace_path, "wt", encoding="utf-8") as f:
+                    json.dump(trace_dicts, f, indent=2, default=str)
+                logger.info("[phase2.trace] 💾 Saved %d daily traces to: %s", len(daily_traces), trace_path)
+            except Exception as e:
+                logger.warning("[phase2.trace] Failed to persist traces: %s", e)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # STRUCTURED EVENTS: Persist events and generate summary
+        # ─────────────────────────────────────────────────────────────────────
+        event_summary_str = None
+        if events_enabled:
+            try:
+                event_summary_str = event_bus.generate_summary()
+                logger.info("[phase2.events]\n%s", event_summary_str)
+                
+                if events_persist and event_bus.events:
+                    event_dir = Path("cache/debugging")
+                    event_dir.mkdir(parents=True, exist_ok=True)
+                    ts_str = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+                    sym_hash = hashlib.sha256(",".join(sorted(syms)).encode()).hexdigest()[:8]
+                    event_path = event_dir / f"events_h{horizon}_{sym_hash}_{ts_str}.json.gz"
+                    
+                    event_dicts = event_bus.to_list()
+                    with gzip.open(event_path, "wt", encoding="utf-8") as f:
+                        json.dump({
+                            "events": event_dicts,
+                            "summary": event_summary_str,
+                            "counts_by_code": event_bus.count_by_code(),
+                        }, f, indent=2, default=str)
+                    logger.info("[phase2.events] 💾 Saved %d events to: %s", len(event_bus.events), event_path)
+            except Exception as e:
+                logger.warning("[phase2.events] Failed to process events: %s", e)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Z-EXPLAINER: Fit interpretable model on accumulated data
+        # ─────────────────────────────────────────────────────────────────────
+        z_explainer_report: Optional[Dict[str, Any]] = None
+        if z_explainer_enabled and z_explainer_buffer is not None and len(z_explainer_buffer) > 20:
+            try:
+                from src.stage_b_stateful.z_explainer import (
+                    LinearZExplainer,
+                    generate_explanation_report,
+                )
+                
+                # Build feature matrix
+                X, y, index = z_explainer_buffer.build_feature_matrix()
+                
+                if len(y) >= 50:
+                    # Fit linear explainer
+                    explainer = LinearZExplainer(regularization=0.1)
+                    explainer.fit(X, y, standardize=True)
+                    
+                    # Generate report
+                    z_explainer_report = generate_explanation_report(
+                        explainer=explainer,
+                        buffer=z_explainer_buffer,
+                        top_k_features=15,
+                        top_k_samples=25,
+                    )
+                    
+                    # Log top features
+                    top_features = z_explainer_report.get("feature_importance", [])[:5]
+                    if top_features:
+                        logger.info(
+                            "[phase2.z_explainer] R²=%.3f | Top features: %s",
+                            explainer.r2_score,
+                            ", ".join(f"{f['feature']}={f['coefficient']:.3f}" for f in top_features)
+                        )
+                    
+                    # Save report to diagnostics
+                    if diagnostics_enabled:
+                        try:
+                            import json
+                            from pathlib import Path
+                            output_dir = Path("cache/debugging")
+                            output_dir.mkdir(parents=True, exist_ok=True)
+                            report_path = output_dir / f"z_explainer_report_{run_id if 'run_id' in dir() else 'latest'}.json"
+                            with open(report_path, "w") as f:
+                                json.dump(z_explainer_report, f, indent=2, default=str)
+                            logger.info("[phase2.z_explainer] 📊 Saved report to: %s", report_path)
+                        except Exception as e:
+                            logger.debug("[phase2.z_explainer] Failed to save report: %s", e)
+                else:
+                    logger.info("[phase2.z_explainer] Insufficient samples for fitting: %d", len(y))
+            except Exception as e:
+                logger.warning("[phase2.z_explainer] Failed to fit explainer: %s", e)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # DIAGNOSTICS ARTIFACTS: Write structured outputs for dashboard
+        # ─────────────────────────────────────────────────────────────────────
+        diagnostics_enabled = bool(cfg.get("phase2_diagnostics_enabled", True))
+        if diagnostics_enabled:
+            try:
+                from src.stage_b_stateful.diagnostics_writer import (
+                    generate_run_id,
+                    write_all_diagnostics,
+                )
+                
+                # Generate unique run ID
+                trial_num = trial.number if trial is not None else None
+                run_id = generate_run_id(syms, int(horizon), trial_num)
+                
+                # Write all artifacts
+                bundle = write_all_diagnostics(
+                    run_id=run_id,
+                    traces=[t.to_dict() for t in daily_traces] if daily_traces else None,
+                    events=event_bus.to_list() if events_enabled else None,
+                    event_counts=event_bus.count_by_code() if events_enabled else None,
+                    portfolio_metrics=portfolio_metrics,
+                    symbols=syms,
+                    horizon=int(horizon),
+                    config=dict(cfg) if cfg else None,
+                    z_explainer_logs=z_explainer_logs if z_explainer_logs else None,
+                )
+                logger.info("[phase2.diagnostics] 📊 Wrote diagnostics bundle: run_id=%s", run_id)
+                
+                # Store run_id in trial for reference
+                if trial is not None:
+                    try:
+                        trial.set_user_attr("phase2_diagnostics_run_id", run_id)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("[phase2.diagnostics] Failed to write diagnostics: %s", e)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # LINEAR ALPHA COMBINER: Save state for persistence
+        # ─────────────────────────────────────────────────────────────────────
+        if linear_state is not None and linear_state.is_ready():
+            try:
+                save_linear_combiner_state(
+                    linear_state.to_dict(),
+                    horizon=int(horizon),
+                    symbols=syms,
+                )
+                logger.info(
+                    "[phase2.linear] Saved state: n_updates=%d, R²=%.3f",
+                    linear_state._n_updates, linear_state.model.r_squared_
+                )
+            except Exception as e:
+                logger.warning("[phase2.linear] Failed to save state: %s", e)
+
         if device.type == "cuda":
             try:
                 del model
@@ -4879,6 +9471,46 @@ def evaluate_phase2_stateful_once(
             except Exception:
                 pass
 
+        # ─────────────────────────────────────────────────────────────────────
+        # RISK EVENTS LEDGER: Flush and generate run summary
+        # ─────────────────────────────────────────────────────────────────────
+        if risk_events_ledger is not None:
+            try:
+                # Add final session end marker
+                risk_events_ledger.add_event(
+                    date=str(pd.Timestamp(union_oos_index[-1]))[:10] if len(union_oos_index) > 0 else "unknown",
+                    day_idx=len(union_oos_index) - 1,
+                    event_type="RUN_END",
+                    action_taken="NONE",
+                    details={
+                        "total_days": len(union_oos_index),
+                        "final_score": float(score),
+                        "final_sharpe": float(portfolio_metrics.get("sharpe", 0.0)),
+                        "final_max_dd": float(portfolio_metrics.get("max_drawdown", 0.0)),
+                    },
+                )
+                
+                # Flush all remaining events
+                flushed = risk_events_ledger.flush()
+                
+                # Get summary
+                ledger_summary = risk_events_ledger.get_summary()
+                logger.info(
+                    "[phase2.risk_events_ledger] 📋 Flushed %d events to %s | Total: %d events, Types: %d, Actions: %d",
+                    flushed,
+                    risk_events_ledger.path,
+                    ledger_summary.get("total_events", 0),
+                    len(ledger_summary.get("events_by_type", {})),
+                    len(ledger_summary.get("events_by_action", {})),
+                )
+                
+                # Store summary in portfolio_metrics for downstream access
+                portfolio_metrics["risk_events_summary"] = ledger_summary
+                portfolio_metrics["risk_events_path"] = str(risk_events_ledger.path)
+                
+            except Exception as e:
+                logger.warning("[phase2.risk_events_ledger] Failed to flush/summarize: %s", e)
+
         return Phase2Result(
             objective=float(score),
             per_symbol_metrics=per_symbol_metrics,
@@ -4886,6 +9518,10 @@ def evaluate_phase2_stateful_once(
             preds_by_symbol=preds_by_symbol,
             equity_by_symbol=equity_by_symbol,
             portfolio_equity=portfolio_equity,
+            daily_traces=daily_traces if trace_enabled else None,
+            events=event_bus.to_list() if events_enabled else None,
+            event_summary=event_summary_str,
+            z_explainer_logs=z_explainer_logs if z_explainer_logs else None,
         )
 
     # ------------------------------------------------------------------
@@ -4894,63 +9530,183 @@ def evaluate_phase2_stateful_once(
     if bool(cfg.get("phase2_require_v2", False)):
         raise ValueError("phase2_require_v2=True but phase2_engine is not v2")
 
-    if prepared.gpu_store_train is not None and device.type == "cuda":
-        pooled_seq = WindowedSequenceData(store=prepared.gpu_store_train, seq_len=seq_len, samples=samples, timestamps=ts)
-    else:
-        # CPU fallback (keeps legacy behavior)
-        pooled_seq = _build_pooled_sequence_cpu(
+    # ─────────────────────────────────────────────────────────────────────
+    # Multi-Horizon Training Branch (Workstream 6)
+    # ─────────────────────────────────────────────────────────────────────
+    multi_horizon_mode = bool(cfg.get("multi_horizon_mode", DEFAULT_MULTI_HORIZON_MODE))
+    multi_horizon_set = list(cfg.get("multi_horizon_set", DEFAULT_MULTI_HORIZON_SET))
+    multi_horizon_primary = int(cfg.get("multi_horizon_primary", DEFAULT_MULTI_HORIZON_PRIMARY))
+    
+    if multi_horizon_mode:
+        logger.info(
+            f"[MH] Multi-horizon training ENABLED: horizons={multi_horizon_set}, primary={multi_horizon_primary}"
+        )
+        
+        # Build multi-horizon sequence data
+        mh_seq_data = _build_pooled_multi_horizon_sequence_data(
             symbols=syms,
+            horizons=multi_horizon_set,
             seq_len=seq_len,
             prepared=prepared,
+            pipelines_by=prepared.pipelines_by,
+            panels_by=prepared.trackc_aligned_by,
+            train_pos_by=prepared.train_pos_by,
+            label_type=str(getattr(prepared, "label_id", "base")),
         )
+        
+        # Train/val split
+        n_train = mh_seq_data.n_samples
+        train_fraction = float(np.clip(float(cfg.get("train_fraction", 0.9)), 0.5, 0.95))
+        split = int(n_train * train_fraction)
+        train_idx = np.arange(split)
+        holdout_idx = np.arange(split, n_train)
+        if len(holdout_idx) < 5:
+            raise ValueError("train holdout too small for multi-horizon")
+        
+        # Map single-horizon cfg keys to multi-horizon keys
+        cfg_train = dict(cfg)
+        cfg_train["mh_d_model"] = cfg_train.get("mamba_d_model", 128)
+        cfg_train["mh_n_layers"] = cfg_train.get("mamba_n_layers", 4)
+        cfg_train["mh_dropout"] = cfg_train.get("mamba_dropout", 0.1)
+        cfg_train["mh_batch_size"] = cfg_train.get("mamba_batch_size", 32)
+        cfg_train["mh_max_epochs"] = cfg_train.get("mamba_max_epochs", 10)
+        cfg_train["mh_learning_rate"] = cfg_train.get("mamba_learning_rate", 1e-4)
+        cfg_train["mh_weight_decay"] = cfg_train.get("mamba_weight_decay", 1e-4)
+        cfg_train["mh_grad_clip"] = cfg_train.get("mamba_grad_clip", 1.0)
+        cfg_train["mh_head_hidden_dim"] = cfg_train.get("mamba_head_hidden_dim", 64)
+        cfg_train["mh_head_num_layers"] = cfg_train.get("mamba_head_num_layers", 2)
+        
+        if deterministic_enabled:
+            cfg_train["torch_deterministic"] = True
+            cfg_train["torch_disable_tf32"] = True
+            cfg_train["torch_seed"] = int(seed)
+        
+        train_result = train_multi_horizon_mamba(
+            mh_seq_data, train_idx, holdout_idx, cfg_train, device=device, return_model=True
+        )
+        mh_model = train_result.get("model")
+        if mh_model is None:
+            raise ValueError("multi-horizon training failed: no model")
+        
+        logger.info(f"[MH] Training complete. Using primary horizon={multi_horizon_primary} for inference.")
+        
+        _cuda_mem_snapshot("after_mh_train")
+        
+        # Standardize full Track-C per symbol using pooled scaler stats.
+        features_std_by = dict(prepared.features_std_full_by)
+        index_by = dict(prepared.index_by)
+        union_oos_index = prepared.union_oos_index
+        burnin_end_ts = pd.to_datetime(oos_start) - pd.Timedelta(days=1)
+        
+        # Multi-horizon inference: use only primary horizon for downstream
+        preds_by_symbol, sigma_by_symbol = _stateful_predict_multi_horizon_primary(
+            model=mh_model,
+            device=device,
+            primary_horizon=multi_horizon_primary,
+            features_std_by_symbol=features_std_by,
+            index_by_symbol=index_by,
+            union_oos_index=union_oos_index,
+            burnin_end_ts=pd.Timestamp(burnin_end_ts),
+            seq_len=seq_len,
+        )
+        
+        _cuda_mem_snapshot("after_mh_stateful_predict")
+        
+        # Model reference for downstream (use the multi-horizon model)
+        model = mh_model
+        
+    else:
+        # ─────────────────────────────────────────────────────────────────
+        # Single-Horizon Training (existing behavior unchanged)
+        # ─────────────────────────────────────────────────────────────────
+        if prepared.gpu_store_train is not None and device.type == "cuda":
+            pooled_seq = WindowedSequenceData(store=prepared.gpu_store_train, seq_len=seq_len, samples=samples, timestamps=ts)
+        else:
+            # CPU fallback (keeps legacy behavior)
+            pooled_seq = _build_pooled_sequence_cpu(
+                symbols=syms,
+                seq_len=seq_len,
+                prepared=prepared,
+            )
 
-    n_train = int(len(pooled_seq))
-    try:
-        train_fraction = float(cfg.get("train_fraction", 0.9))
-    except Exception:
-        train_fraction = 0.9
-    train_fraction = float(np.clip(train_fraction, 0.5, 0.95))
-    split = int(n_train * train_fraction)
-    train_idx = np.arange(split)
-    holdout_idx = np.arange(split, n_train)
-    if len(holdout_idx) < 5:
-        raise ValueError("train holdout too small")
+        n_train = int(len(pooled_seq))
+        try:
+            train_fraction = float(cfg.get("train_fraction", 0.9))
+        except Exception:
+            train_fraction = 0.9
+        train_fraction = float(np.clip(train_fraction, 0.5, 0.95))
+        split = int(n_train * train_fraction)
+        train_idx = np.arange(split)
+        holdout_idx = np.arange(split, n_train)
+        if len(holdout_idx) < 5:
+            raise ValueError("train holdout too small")
 
-    cfg_train = dict(cfg)
-    if deterministic_enabled:
-        cfg_train["torch_deterministic"] = True
-        cfg_train["torch_disable_tf32"] = True
-        cfg_train["torch_seed"] = int(seed)
+        cfg_train = dict(cfg)
+        if deterministic_enabled:
+            cfg_train["torch_deterministic"] = True
+            cfg_train["torch_disable_tf32"] = True
+            cfg_train["torch_seed"] = int(seed)
 
-    train_result = train_mamba_fold(pooled_seq, train_idx, holdout_idx, cfg_train, device=device, return_model=True)
-    model = train_result.get("model")
-    if model is None:
-        raise ValueError("training failed: no model")
+        train_result = train_mamba_fold(pooled_seq, train_idx, holdout_idx, cfg_train, device=device, return_model=True)
+        model = train_result.get("model")
+        if model is None:
+            raise ValueError("training failed: no model")
 
-    _cuda_mem_snapshot("after_train")
+        _cuda_mem_snapshot("after_train")
 
-    # Standardize full Track-C per symbol using pooled scaler stats.
-    features_std_by = dict(prepared.features_std_full_by)
-    index_by = dict(prepared.index_by)
+        # Standardize full Track-C per symbol using pooled scaler stats.
+        features_std_by = dict(prepared.features_std_full_by)
+        index_by = dict(prepared.index_by)
 
-    # Build union OOS index (fixed, shared across symbols) and batched stateful inference.
-    union_oos_index = prepared.union_oos_index
+        # Build union OOS index (fixed, shared across symbols) and batched stateful inference.
+        union_oos_index = prepared.union_oos_index
 
-    burnin_end_ts = pd.to_datetime(oos_start) - pd.Timedelta(days=1)
-    preds_by_symbol = _stateful_predict_batched_across_symbols(
-        model=model,
-        device=device,
-        features_std_by_symbol=features_std_by,
-        index_by_symbol=index_by,
-        union_oos_index=union_oos_index,
-        burnin_end_ts=pd.Timestamp(burnin_end_ts),
-        seq_len=seq_len,
-    )
+        burnin_end_ts = pd.to_datetime(oos_start) - pd.Timedelta(days=1)
+        
+        # Use distributional inference for true mu + sigma when model supports it
+        head_type = str(cfg.get("mamba_head_type", "linear")).lower()
+        sigma_by_symbol: Optional[Dict[str, pd.Series]] = None
+        
+        if head_type in ("gaussian", "uncertainty", "gaussian_nll"):
+            try:
+                preds_by_symbol, sigma_by_symbol = _stateful_predict_batched_mu_sigma(
+                    model=model,
+                    device=device,
+                    features_std_by_symbol=features_std_by,
+                    index_by_symbol=index_by,
+                    union_oos_index=union_oos_index,
+                    burnin_end_ts=pd.Timestamp(burnin_end_ts),
+                    seq_len=seq_len,
+                    sigma_floor=float(cfg.get("phase2_sigma_floor_base", 1e-6)),
+                    sigma_cap=float(cfg.get("phase2_sigma_cap", 10.0)),
+                )
+            except Exception as e:
+                logger.warning(f"Distributional inference failed, falling back to scalar: {e}")
+                preds_by_symbol = _stateful_predict_batched_across_symbols(
+                    model=model,
+                    device=device,
+                    features_std_by_symbol=features_std_by,
+                    index_by_symbol=index_by,
+                    union_oos_index=union_oos_index,
+                    burnin_end_ts=pd.Timestamp(burnin_end_ts),
+                    seq_len=seq_len,
+                )
+        else:
+            preds_by_symbol = _stateful_predict_batched_across_symbols(
+                model=model,
+                device=device,
+                features_std_by_symbol=features_std_by,
+                index_by_symbol=index_by,
+                union_oos_index=union_oos_index,
+                burnin_end_ts=pd.Timestamp(burnin_end_ts),
+                seq_len=seq_len,
+            )
 
-    _cuda_mem_snapshot("after_stateful_predict")
+        _cuda_mem_snapshot("after_stateful_predict")
 
     def _backtest_all(
         preds_by_symbol_local: Mapping[str, pd.Series],
+        sigma_by_symbol_local: Optional[Dict[str, pd.Series]] = None,
     ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, float]]]:
         per_symbol_metrics_local: Dict[str, Dict[str, float]] = {}
         equity_by_symbol_local: Dict[str, pd.DataFrame] = {}
@@ -4975,12 +9731,28 @@ def evaluate_phase2_stateful_once(
             preds_df["actual_return"] = actual_returns
             preds_df["mu_hat"] = preds.astype(float)
 
+            # Compute sigma_proxy as fallback for missing/invalid model sigma
             sigma_proxy = actual_returns.abs().rolling(window=max(5, int(horizon))).std().fillna(0.02).clip(lower=1e-4)
-            denom = sigma_proxy.replace(0.0, np.nan).fillna(0.02)
+            
+            # Use true model sigma if available from distributional inference
+            if sigma_by_symbol_local is not None and sym in sigma_by_symbol_local:
+                model_sigma = sigma_by_symbol_local[sym].reindex(preds.index)
+                # Use model sigma where valid, proxy as fallback
+                sigma_hat = model_sigma.where(model_sigma.notna() & np.isfinite(model_sigma), sigma_proxy)
+                preds_df["sigma_source"] = np.where(
+                    model_sigma.notna() & np.isfinite(model_sigma), 
+                    "model", 
+                    "proxy"
+                )
+            else:
+                sigma_hat = sigma_proxy
+                preds_df["sigma_source"] = "proxy"
+            
+            denom = sigma_hat.replace(0.0, np.nan).fillna(0.02)
             logits = (preds / denom).clip(-8, 8)
             probs = 1.0 / (1.0 + np.exp(-logits))
             preds_df["p_up"] = probs.clip(0.0, 1.0)
-            preds_df["sigma_hat"] = sigma_proxy
+            preds_df["sigma_hat"] = sigma_hat
             preds_df["rho"] = (preds_df["p_up"] - 0.5).abs().mul(2.0).clip(0.0, 1.0)
             preds_df["drift_flag"] = 0.0
 
@@ -5057,7 +9829,7 @@ def evaluate_phase2_stateful_once(
 
         return score_local, portfolio_metrics_local, portfolio_equity_local
 
-    equity_by_symbol, per_symbol_metrics = _backtest_all(preds_by_symbol)
+    equity_by_symbol, per_symbol_metrics = _backtest_all(preds_by_symbol, sigma_by_symbol)
     
     # Re-aggregate portfolio with vol underutilization penalty
     score, portfolio_metrics, portfolio_equity = _aggregate_portfolio(equity_by_symbol)
@@ -5861,6 +10633,372 @@ def _build_window_samples_for_seq_len(
     return samples, np.asarray(ts_list, dtype=object)
 
 
+# =============================================================================
+# CROSS-SECTION MAMBA TRAINING (Level 2)
+# =============================================================================
+
+def _build_cross_section_data_from_prepared(
+    *,
+    symbols: Sequence[str],
+    seq_len: int,
+    prepared: "Phase2PreparedData",
+    adjacency_by_date: Optional[Dict[pd.Timestamp, np.ndarray]] = None,
+    min_symbols_per_sample: int = 10,
+) -> Optional[CrossSectionSequenceData]:
+    """Build CrossSectionSequenceData from Phase2PreparedData.
+    
+    Converts per-symbol aligned Track-C into [B, T, N, F] format for cross-section training.
+    """
+    syms = [str(s).upper() for s in symbols]
+    label_col = _phase2_label_column(str(getattr(prepared, "label_id", "base")))
+    
+    # Collect per-symbol data
+    X_by_symbol: Dict[str, np.ndarray] = {}
+    y_by_symbol: Dict[str, np.ndarray] = {}
+    ts_by_symbol: Dict[str, np.ndarray] = {}
+    
+    for sym in syms:
+        if sym not in prepared.trackc_aligned_by:
+            continue
+        trackc = prepared.trackc_aligned_by[sym]
+        labels = prepared.labels_by.get(sym)
+        if labels is None or label_col not in labels.columns:
+            continue
+        
+        # Get feature matrix
+        X = trackc.values.astype(np.float32)
+        y = labels[label_col].values.astype(np.float32)
+        ts = trackc.index.values
+        
+        if len(X) >= seq_len + 1:
+            X_by_symbol[sym] = X
+            y_by_symbol[sym] = y
+            ts_by_symbol[sym] = ts
+    
+    if len(X_by_symbol) < min_symbols_per_sample:
+        logger.warning(f"[CS-Mamba] Only {len(X_by_symbol)} symbols have enough data (need {min_symbols_per_sample})")
+        return None
+    
+    return build_cross_section_data(
+        X_by_symbol=X_by_symbol,
+        y_by_symbol=y_by_symbol,
+        ts_by_symbol=ts_by_symbol,
+        seq_len=seq_len,
+        universe_symbols=list(X_by_symbol.keys()),
+        min_symbols_per_sample=min_symbols_per_sample,
+        adjacency_by_date=adjacency_by_date,
+        scaler_stats=prepared.scaler_stats,
+    )
+
+
+def _train_cross_section_mamba_phase2(
+    *,
+    symbols: Sequence[str],
+    prepared: "Phase2PreparedData",
+    cfg: Mapping[str, Any],
+    device: "torch.device",
+    adjacency_by_date: Optional[Dict[pd.Timestamp, np.ndarray]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Train CrossSectionMamba model in Phase2 context.
+    
+    Returns dict with 'model', 'symbol_order', 'metrics' or None if data insufficient.
+    """
+    seq_len = int(cfg.get("mamba_seq_len", 128))
+    min_symbols = int(cfg.get("cs_min_symbols_per_sample", 10))
+    
+    cs_data = _build_cross_section_data_from_prepared(
+        symbols=symbols,
+        seq_len=seq_len,
+        prepared=prepared,
+        adjacency_by_date=adjacency_by_date,
+        min_symbols_per_sample=min_symbols,
+    )
+    
+    if cs_data is None:
+        logger.warning("[CS-Mamba] Insufficient data for cross-section training")
+        return None
+    
+    logger.info(f"[CS-Mamba] Built cross-section data: {len(cs_data)} samples, "
+                f"N={cs_data.universe_size}, T={cs_data.seq_len}, F={cs_data.feature_dim}")
+    
+    # Estimate VRAM
+    vram_est = compute_vram_requirements(
+        B=int(cfg.get("cs_batch_size", 16)),
+        T=cs_data.seq_len,
+        N=cs_data.universe_size,
+        F=cs_data.feature_dim,
+        d_model=int(cfg.get("cs_d_model", 128)),
+        n_layers=int(cfg.get("cs_n_temporal_layers", 4)),
+    )
+    logger.info(f"[CS-Mamba] VRAM estimate: {vram_est['total_with_reserve_gb']:.2f} GB")
+    
+    # Split data
+    n_samples = len(cs_data)
+    try:
+        train_fraction = float(cfg.get("train_fraction", 0.9))
+    except Exception:
+        train_fraction = 0.9
+    train_fraction = float(np.clip(train_fraction, 0.5, 0.95))
+    
+    split = int(n_samples * train_fraction)
+    train_idx = np.arange(split)
+    val_idx = np.arange(split, n_samples)
+    
+    if len(val_idx) < 5:
+        logger.warning("[CS-Mamba] Validation set too small")
+        return None
+    
+    # Train
+    try:
+        result = train_cross_section_mamba(
+            cs_data=cs_data,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            cfg=cfg,
+            device=device,
+            return_model=True,
+        )
+        result["cs_data"] = cs_data
+        return result
+    except Exception as e:
+        logger.error(f"[CS-Mamba] Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _predict_cross_section_phase2(
+    *,
+    model: "CrossSectionMamba",
+    symbols: List[str],
+    prepared: "Phase2PreparedData",
+    union_oos_index: pd.DatetimeIndex,
+    seq_len: int,
+    device: "torch.device",
+    adjacency_by_date: Optional[Dict[pd.Timestamp, np.ndarray]] = None,
+) -> Tuple[Dict[str, pd.Series], Dict[str, pd.Series]]:
+    """Run cross-section inference to get per-symbol predictions.
+    
+    Returns:
+        preds_by_symbol: Dict[symbol] -> pd.Series of mu predictions
+        sigma_by_symbol: Dict[symbol] -> pd.Series of sigma predictions
+    """
+    import torch
+    
+    preds_by_symbol: Dict[str, pd.Series] = {}
+    sigma_by_symbol: Dict[str, pd.Series] = {}
+    
+    # Build inference buffer
+    F = prepared.trackc_aligned_by[symbols[0]].shape[1] if symbols else 0
+    buffer = CrossSectionInferenceBuffer(
+        symbols=symbols,
+        seq_len=seq_len,
+        feature_dim=F,
+        device=device,
+    )
+    
+    # Build features dict for warm-up
+    features_by = {s: prepared.features_std_full_by.get(s) for s in symbols if s in prepared.features_std_full_by}
+    
+    # Initialize results
+    for sym in symbols:
+        preds_by_symbol[sym] = pd.Series(index=union_oos_index, dtype=float)
+        sigma_by_symbol[sym] = pd.Series(index=union_oos_index, dtype=float)
+    
+    # Get all available dates across symbols
+    all_dates: set = set()
+    for sym, feats in features_by.items():
+        if feats is not None:
+            idx = prepared.index_by.get(sym)
+            if idx is not None:
+                all_dates.update(pd.DatetimeIndex(idx).normalize())
+    
+    sorted_dates = sorted(all_dates)
+    oos_dates = set(union_oos_index.normalize())
+    
+    # Roll through time
+    model.eval()
+    for date in sorted_dates:
+        # Update buffer for each symbol
+        for sym in symbols:
+            idx = prepared.index_by.get(sym)
+            feats = features_by.get(sym)
+            if idx is None or feats is None:
+                continue
+            
+            # Find row for this date
+            idx_norm = pd.DatetimeIndex(idx).normalize()
+            match = idx_norm == date
+            if match.any():
+                row_idx = np.where(match)[0][0]
+                feat_vec = torch.from_numpy(feats[row_idx]).float().to(device)
+                buffer.update(sym, feat_vec)
+        
+        # Predict if this is an OOS date
+        if date in oos_dates:
+            adj = None
+            if adjacency_by_date is not None and date in adjacency_by_date:
+                adj = torch.from_numpy(adjacency_by_date[date]).float().to(device)
+            
+            predictions = buffer.predict(model, adjacency=adj)
+            
+            for sym, (mu, sigma) in predictions.items():
+                if sym in preds_by_symbol:
+                    # Find matching OOS timestamp
+                    oos_match = union_oos_index.normalize() == date
+                    if oos_match.any():
+                        oos_ts = union_oos_index[oos_match][0]
+                        preds_by_symbol[sym].loc[oos_ts] = mu
+                        sigma_by_symbol[sym].loc[oos_ts] = sigma
+    
+    return preds_by_symbol, sigma_by_symbol
+
+
+# ---------------------------------------------------------------------------
+# Multi-Horizon Training Helpers (Workstream 6)
+# ---------------------------------------------------------------------------
+
+def _build_multi_horizon_labels_for_symbol(
+    pipe: "StageBPipeline",
+    panel: pd.DataFrame,
+    horizons: List[int],
+    label_type: str = "base",
+) -> Dict[int, pd.Series]:
+    """Build forward-return labels for multiple horizons using existing pipeline.
+    
+    Args:
+        pipe: StageBPipeline for the symbol
+        panel: Track-C panel with DatetimeIndex
+        horizons: List of horizon days (e.g. [5, 21, 63, 126])
+        label_type: 'base' for forward_return, 'voladj' for forward_return_voladj
+        
+    Returns:
+        Dict mapping horizon -> pd.Series of forward returns aligned to panel index
+    """
+    label_col = _phase2_label_column(label_type)
+    labels_by_horizon = {}
+    
+    for h in horizons:
+        try:
+            labels_df = pipe._construct_labels(int(h), panel.index)
+            labels_by_horizon[h] = labels_df[label_col].reindex(panel.index)
+        except Exception as e:
+            logger.warning(f"[MH] Failed to build labels for horizon {h}: {e}")
+            labels_by_horizon[h] = pd.Series(np.nan, index=panel.index)
+    
+    return labels_by_horizon
+
+
+def _build_pooled_multi_horizon_sequence_data(
+    *,
+    symbols: Sequence[str],
+    horizons: List[int],
+    seq_len: int,
+    prepared: "Phase2PreparedData",
+    pipelines_by: Dict[str, "StageBPipeline"],
+    panels_by: Dict[str, pd.DataFrame],
+    train_pos_by: Dict[str, np.ndarray],
+    label_type: str = "base",
+) -> MultiHorizonSequenceData:
+    """Build pooled MultiHorizonSequenceData from Phase-2 prepared artifacts.
+    
+    Combines all symbols into a single dataset with per-horizon targets.
+    
+    Args:
+        symbols: List of symbols
+        horizons: List of horizon days [5, 21, 63, 126]
+        seq_len: Sequence length
+        prepared: Phase2PreparedData with scaler_stats, trackc_aligned_by, etc.
+        pipelines_by: Dict[symbol] -> StageBPipeline for label construction
+        panels_by: Dict[symbol] -> Track-C panel
+        train_pos_by: Dict[symbol] -> training position indices
+        label_type: 'base' or 'voladj'
+        
+    Returns:
+        MultiHorizonSequenceData with pooled sequences and per-horizon targets
+    """
+    syms = [str(s).upper() for s in symbols]
+    
+    # Collect per-symbol multi-horizon data
+    all_sequences = []
+    all_targets = {h: [] for h in horizons}
+    all_timestamps = []
+    
+    for sym in syms:
+        # Build multi-horizon labels
+        mh_labels = _build_multi_horizon_labels_for_symbol(
+            pipe=pipelines_by[sym],
+            panel=panels_by[sym],
+            horizons=horizons,
+            label_type=label_type,
+        )
+        
+        # Get Track-C and scaler stats
+        track_c = prepared.trackc_aligned_by[sym]
+        train_pos = train_pos_by[sym]
+        post_w = prepared.post_std_feature_weights_by_symbol.get(sym)
+        
+        # Standardize features
+        features_std = _standardize_features_like_build_sequence_data(
+            track_c,
+            prepared.scaler_stats,
+            post_standardization_feature_weights=post_w,
+        )
+        
+        # Build sequences from training positions only
+        train_features = features_std[train_pos]
+        train_index = track_c.index[train_pos]
+        
+        # Extract per-horizon targets at training positions
+        train_targets_by_h = {}
+        for h in horizons:
+            h_labels = mh_labels[h].reindex(train_index)
+            train_targets_by_h[h] = h_labels.values.astype(np.float32)
+        
+        # Build sliding-window sequences
+        T_train = len(train_features)
+        n_samples = T_train - seq_len + 1
+        if n_samples <= 0:
+            logger.warning(f"[MH] Symbol {sym} has insufficient training data for seq_len={seq_len}")
+            continue
+            
+        for i in range(n_samples):
+            # Sequence: [i, i+seq_len)
+            seq = train_features[i:i + seq_len]
+            all_sequences.append(seq)
+            
+            # Target at end of sequence (t = i + seq_len - 1)
+            t = i + seq_len - 1
+            for h in horizons:
+                target_val = train_targets_by_h[h][t] if t < len(train_targets_by_h[h]) else np.nan
+                all_targets[h].append(target_val)
+            
+            # Timestamp at end of sequence
+            ts_val = train_index[t] if t < len(train_index) else train_index[-1]
+            all_timestamps.append((sym, ts_val))
+    
+    if not all_sequences:
+        raise ValueError("[MH] No valid sequences built across symbols")
+    
+    # Stack into arrays
+    sequences = np.stack(all_sequences, axis=0).astype(np.float32)
+    targets = {h: np.array(all_targets[h], dtype=np.float32) for h in horizons}
+    timestamps = np.array(all_timestamps, dtype=object)
+    
+    logger.info(
+        f"[MH] Built pooled MultiHorizonSequenceData: "
+        f"{sequences.shape[0]} samples, {len(horizons)} horizons, {len(syms)} symbols"
+    )
+    
+    return MultiHorizonSequenceData(
+        sequences=sequences,
+        targets=targets,
+        timestamps=timestamps,
+        symbol="POOLED",
+        horizons=horizons,
+    )
+
+
 def _build_pooled_sequence_cpu(
     *,
     symbols: Sequence[str],
@@ -6296,6 +11434,81 @@ def run_phase2_stateful_optuna(
             "phase2_max_adv_frac_name",
             "phase2_max_turnover_adv_frac",
             "phase2_borrow_fee_bps_annual",
+            # Execution realism (Workstream: Backtest Realism)
+            "phase2_exec_price_mode",
+            "phase2_exec_participation_rate",
+            "phase2_exec_enable_partial_fills",
+            "phase2_exec_asset_aware_slippage",
+            "phase2_exec_impact_exponent",
+            "phase2_exec_impact_scale",
+            "phase2_exec_default_spread_bps",
+            "phase2_exec_per_name_borrow",
+            "phase2_exec_htb_threshold_bps",
+            "phase2_exec_htb_max_short_weight",
+            "phase2_exec_halted_to_flat",
+            "phase2_exec_reduce_short_on_ex_div",
+            "phase2_exec_ex_div_reduction_mult",
+            # Daily trace instrumentation
+            "phase2_trace_enabled",
+            "phase2_trace_persist",
+            "phase2_trace_persist_path",
+            # Structured event bus
+            "phase2_events_enabled",
+            "phase2_events_persist",
+            # Diagnostics artifacts
+            "phase2_diagnostics_enabled",
+            # Per-symbol calibration (GAP #8)
+            "phase2_per_symbol_calib",
+            # Z-Explainer for interpretability
+            "phase2_z_explainer",
+            "phase2_z_explainer_window",
+            "phase2_z_explainer_max_window",
+            "phase2_z_explainer_refit_interval",
+            "phase2_z_explainer_regularization",
+            "phase2_z_explainer_min_samples",
+            "phase2_z_explainer_top_symbols",
+            "phase2_z_explainer_top_features",
+            # Z-Explainer validation companion (Step 7)
+            "phase2_z_explainer_validation",
+            "phase2_z_explainer_validation_refit",
+            "phase2_z_explainer_validation_min_samples",
+            # Risk Latch (Unified state machine)
+            "phase2_risk_latch_enabled",
+            "phase2_risk_latch_max_dd_kill",
+            "phase2_risk_latch_max_vol_kill",
+            "phase2_risk_latch_throttle_min_scale",
+            "phase2_risk_latch_dd_throttle_start",
+            "phase2_risk_latch_vol_throttle_mult",
+            "phase2_risk_latch_panic_vix",
+            "phase2_risk_latch_min_calib",
+            "phase2_risk_latch_latch_sessions",
+            "phase2_risk_latch_corr_hhi_kill",
+            "phase2_risk_latch_single_day_crash",
+            # Fast crash triggers (1-day loss kill, gap shock)
+            "phase2_kill_1day_loss_pct",
+            "phase2_emergency_cooldown_sessions",
+            "phase2_gap_shock_mult",
+            "phase2_gap_shock_min_pct",
+            "phase2_gap_shock_n_symbols",
+            "phase2_gap_shock_portfolio_pct",
+            "phase2_gap_shock_mode",
+            "phase2_gap_shock_throttle_scale",
+            # Stress Overlay (scenario stress tests)
+            "phase2_stress_enabled",
+            "phase2_stress_k_sigma",
+            "phase2_stress_loss_throttle",
+            "phase2_stress_loss_flatten",
+            "phase2_stress_shock_scale",
+            "phase2_stress_corr_hhi_throttle",
+            "phase2_stress_corr_hhi_flatten",
+            "phase2_stress_corr_scale",
+            "phase2_stress_sector_max",
+            "phase2_stress_sector_scale",
+            "phase2_stress_min_scale",
+            # Intraday Monitor
+            "phase2_intraday_monitor_enabled",
+            "phase2_intraday_snapshot_path",
+            "phase2_intraday_snapshot_max_age",
             # Mamba training
             "mamba_seq_len",
             "mamba_d_model",
@@ -6322,6 +11535,29 @@ def run_phase2_stateful_optuna(
             "mamba_head_hidden_dim",
             "mamba_head_num_layers",
             "mamba_head_dropout",
+            "phase2_regime_feature_index",
+            "phase2_regime_loss_alpha",
+            "phase2_sigma_floor_base",
+            "phase2_sigma_floor_stress",
+            "phase2_sigma_floor_strength",
+            "phase2_anchor_l2",
+            "phase2_sigma_cs_strength",
+            # Workstream-7 Robust Portfolio Optimizer
+            "phase2_use_robust_optimizer",
+            "phase2_robust_lambda_var",
+            "phase2_robust_lambda_turnover",
+            "phase2_robust_lambda_tail",
+            "phase2_robust_use_predicted_sigma",
+            "phase2_robust_predicted_sigma_blend",
+            "phase2_robust_covariance_method",
+            "phase2_robust_cvar_constraint",
+            "phase2_robust_cvar_alpha",
+            "phase2_robust_cvar_limit",
+            "phase2_robust_uncertainty_caps",
+            "phase2_robust_mu_sigma_cap",
+            "phase2_robust_reliability_min",
+            "phase2_robust_n_factors",
+            "phase2_robust_use_graph_shrinkage",
         }
 
         def _matches_family_pattern(k: str) -> bool:
@@ -6668,6 +11904,71 @@ def run_phase2_stateful_optuna(
             cfg_local["track_b_weight"] = float(w_b)
             # Phase2: remove hard cap on total Track-C dims.
             cfg_local["max_total_dims"] = 0
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # Phase 2.4: Label Type Optuna Parameter
+            # Search between raw forward_return vs volatility-adjusted return
+            # ─────────────────────────────────────────────────────────────────────
+            label_type_searchable = bool(getattr(opt_cfg, "label_type_searchable", False))
+            if label_type_searchable:
+                sampled_label_id = trial.suggest_categorical(
+                    "phase2_label_id", 
+                    ["base", "voladj"]  # base=forward_return, voladj=forward_return_voladj
+                )
+                cfg_local["phase2_label_id"] = str(sampled_label_id)
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # Phase 2.2: Info-Weighted Loss
+            # Weight samples by microstructure-derived importance
+            # ─────────────────────────────────────────────────────────────────────
+            info_weighted_loss_searchable = bool(getattr(opt_cfg, "info_weighted_loss_searchable", False))
+            if info_weighted_loss_searchable:
+                use_info_weighted = trial.suggest_categorical(
+                    "mamba_use_info_weighted_loss",
+                    [False, True]
+                )
+                cfg_local["mamba_use_info_weighted_loss"] = bool(use_info_weighted)
+            
+            # ─────────────────────────────────────────────────────────────────────
+            # Phase 2.3: dt_days Feature
+            # Add time-delta as input feature for irregular sampling awareness
+            # ─────────────────────────────────────────────────────────────────────
+            dt_days_feature_searchable = bool(getattr(opt_cfg, "dt_days_feature_searchable", False))
+            if dt_days_feature_searchable:
+                include_dt_days = trial.suggest_categorical(
+                    "include_dt_days_feature",
+                    [False, True]
+                )
+                cfg_local["include_dt_days_feature"] = bool(include_dt_days)
+
+            # ─────────────────────────────────────────────────────────────────────
+            # Phase 2.6: Multi-Horizon Training (Workstream 6)
+            # Train on multiple horizons simultaneously for shared representation
+            # learning and implicit regime smoothing. At inference, only the
+            # primary horizon is used for downstream portfolio/policy.
+            # ─────────────────────────────────────────────────────────────────────
+            multi_horizon_searchable = bool(getattr(opt_cfg, "multi_horizon_searchable", False))
+            if multi_horizon_searchable:
+                use_multi_horizon = trial.suggest_categorical(
+                    "multi_horizon_mode",
+                    [False, True]
+                )
+                cfg_local["multi_horizon_mode"] = bool(use_multi_horizon)
+            else:
+                # Use default from cfg or global default
+                cfg_local["multi_horizon_mode"] = bool(cfg_local.get(
+                    "multi_horizon_mode", 
+                    DEFAULT_MULTI_HORIZON_MODE
+                ))
+            
+            # Multi-horizon set and primary are FIXED (not Optuna-tuned initially)
+            # to avoid combinatorial explosion.
+            cfg_local["multi_horizon_set"] = list(cfg_local.get(
+                "multi_horizon_set", DEFAULT_MULTI_HORIZON_SET
+            ))
+            cfg_local["multi_horizon_primary"] = int(cfg_local.get(
+                "multi_horizon_primary", DEFAULT_MULTI_HORIZON_PRIMARY
+            ))
 
             # Persist the 3-pillar configuration used for Track-C dimensionality selection.
             # (Not sampled; governance-level knobs.)
@@ -6788,6 +12089,50 @@ def run_phase2_stateful_optuna(
             except Exception:
                 pass
 
+            # Regime-weighted Gaussian NLL + uncertainty regularizers.
+            cfg_local["phase2_regime_feature_index"] = int(
+                (runtime_overrides or {}).get("phase2_regime_feature_index", -1)
+            )
+            cfg_local["phase2_regime_loss_alpha"] = float(
+                trial.suggest_float("phase2_regime_loss_alpha", 0.0, 1.0)
+            )
+            cfg_local["phase2_sigma_floor_base"] = float(
+                trial.suggest_float("phase2_sigma_floor_base", 1e-6, 1e-3)
+            )
+            cfg_local["phase2_sigma_floor_stress"] = float(
+                trial.suggest_float("phase2_sigma_floor_stress", 1e-6, 1e-2)
+            )
+            cfg_local["phase2_sigma_floor_strength"] = float(
+                trial.suggest_float("phase2_sigma_floor_strength", 0.0, 1e-2)
+            )
+            cfg_local["phase2_anchor_l2"] = float(
+                trial.suggest_float("phase2_anchor_l2", 0.0, 1e-4)
+            )
+            cfg_local["phase2_sigma_cs_strength"] = float(
+                trial.suggest_float("phase2_sigma_cs_strength", 0.0, 1e-3)
+            )
+
+            # ─────────────────────────────────────────────────────────────────────
+            # Calibration-Gated Learning Thresholds (Optuna-tuned with constraints)
+            # ─────────────────────────────────────────────────────────────────────
+            # calib_freeze_threshold: FIXED - governance level, not model-sensitive
+            cfg_local["calib_freeze_threshold"] = 0.3
+            # trust_freeze_threshold: FIXED - governance level
+            cfg_local["trust_freeze_threshold"] = 0.3
+
+            # calib_decay_threshold: Optuna-tuned in narrow band [0.5, 0.75]
+            # CONSTRAINT: must be > calib_freeze_threshold (enforced below)
+            calib_decay_raw = float(trial.suggest_float("calib_decay_threshold", 0.5, 0.75))
+            calib_freeze = float(cfg_local["calib_freeze_threshold"])
+            # Hard enforce: calib_decay > calib_freeze
+            calib_decay_threshold = max(calib_decay_raw, calib_freeze + 0.05)
+            cfg_local["calib_decay_threshold"] = float(calib_decay_threshold)
+
+            # overconfidence_penalty_lambda: Optuna-tuned on log scale [1e-3, 3e-1]
+            cfg_local["overconfidence_penalty_lambda"] = float(
+                trial.suggest_float("overconfidence_penalty_lambda", 1e-3, 3e-1, log=True)
+            )
+
             # Walk-forward portfolio engine knobs (Phase-2 v2).
             # NOTE: update cadence is fixed to U=prune_update_sessions; we do not tune it.
             cfg_local["phase2_engine"] = str(trial.suggest_categorical("phase2_engine", ["v2"]))
@@ -6843,12 +12188,15 @@ def run_phase2_stateful_optuna(
             else:
                 cfg_local["phase2_enable_group_caps"] = False
 
-            # Beta neutralization (loosened: soft guardrail, not hard choke)
+            # Beta neutralization: HARD neutralization with optional cap
+            # NOTE: Implementation ALWAYS neutralizes first, then allows capped exposure.
+            # This is NOT a "soft guardrail" - it's full neutralization + optional cap.
             beta_enabled = bool(trial.suggest_categorical("phase2_enable_beta_neutral", [False, True]))
             cfg_local["phase2_enable_beta_neutral"] = bool(beta_enabled)
             if beta_enabled:
-                cfg_local["phase2_beta_neutral"] = True
+                cfg_local["phase2_beta_neutral"] = True  # DEPRECATED flag
                 # Hedge fund best practice: 0.25-0.35 allows partial beta participation
+                # 0.0 = full market neutral, 0.3 = up to ±30% beta exposure allowed
                 cfg_local["phase2_beta_max_abs_exposure"] = float(trial.suggest_float("phase2_beta_max_abs_exposure", 0.15, 0.40))
                 cfg_local["phase2_beta_lookback_days"] = int(trial.suggest_categorical("phase2_beta_lookback_days", [63, 126, 252]))
 
@@ -6863,6 +12211,84 @@ def run_phase2_stateful_optuna(
                     cfg_local["phase2_borrow_fee_bps_annual"] = float(trial.suggest_float("phase2_borrow_fee_bps_annual", 0.0, 300.0))
             else:
                 cfg_local["phase2_enable_liquidity_constraints"] = False
+
+            # ─────────────────────────────────────────────────────────────────────
+            # Policy Controller v2 (Workstream 8) - Contextual Bandit Knobs
+            # ─────────────────────────────────────────────────────────────────────
+            policy_enabled = bool(trial.suggest_categorical("phase2_policy_enabled", [False, True]))
+            cfg_local["phase2_policy_enabled"] = bool(policy_enabled)
+            if policy_enabled:
+                # Exploration annealing (half-life in sessions)
+                cfg_local["phase2_policy_exploration_half_life"] = int(
+                    trial.suggest_categorical("phase2_policy_exploration_half_life", [42, 63, 126, 252])
+                )
+                # Exploration floor (fraction of initial noise)
+                cfg_local["phase2_policy_exploration_floor"] = float(
+                    trial.suggest_float("phase2_policy_exploration_floor", 0.05, 0.30)
+                )
+                # Lin-TS prior variance
+                cfg_local["phase2_policy_ts_prior_var"] = float(
+                    trial.suggest_float("phase2_policy_ts_prior_var", 0.5, 2.0)
+                )
+                # Lin-TS noise variance (initial)
+                cfg_local["phase2_policy_ts_noise_var"] = float(
+                    trial.suggest_float("phase2_policy_ts_noise_var", 0.5, 2.0)
+                )
+                # Warmup days (random action selection)
+                cfg_local["phase2_policy_warmup_days"] = int(
+                    trial.suggest_categorical("phase2_policy_warmup_days", [10, 20, 42])
+                )
+                # Reward function penalty weights
+                cfg_local["phase2_policy_reward_lambda_turn"] = float(
+                    trial.suggest_float("phase2_policy_reward_lambda_turn", 0.05, 0.5, log=True)
+                )
+                cfg_local["phase2_policy_reward_lambda_dd"] = float(
+                    trial.suggest_float("phase2_policy_reward_lambda_dd", 0.2, 1.0)
+                )
+                # Reward window (sessions over which to compute reward)
+                cfg_local["phase2_policy_reward_window"] = int(
+                    trial.suggest_categorical("phase2_policy_reward_window", [5, 10, 21])
+                )
+            else:
+                # Defaults when policy disabled
+                cfg_local["phase2_policy_exploration_half_life"] = 63
+                cfg_local["phase2_policy_exploration_floor"] = 0.15
+                cfg_local["phase2_policy_ts_prior_var"] = 1.0
+                cfg_local["phase2_policy_ts_noise_var"] = 1.0
+                cfg_local["phase2_policy_warmup_days"] = 20
+                cfg_local["phase2_policy_reward_lambda_turn"] = 0.2
+                cfg_local["phase2_policy_reward_lambda_dd"] = 0.5
+                cfg_local["phase2_policy_reward_window"] = 10
+
+            # ─────────────────────────────────────────────────────────────────────
+            # Linear Alpha Combiner (Workstream: z_lin blending)
+            # Ridge-regularized linear model that blends with Mamba z-scores
+            # ─────────────────────────────────────────────────────────────────────
+            linear_enabled = bool(trial.suggest_categorical("phase2_linear_model_enabled", [False, True]))
+            cfg_local["phase2_linear_model_enabled"] = bool(linear_enabled)
+            if linear_enabled:
+                cfg_local["phase2_linear_ridge_lambda"] = float(
+                    trial.suggest_float("phase2_linear_ridge_lambda", 1.0, 100.0, log=True)
+                )
+                cfg_local["phase2_linear_blend_max"] = float(
+                    trial.suggest_float("phase2_linear_blend_max", 0.20, 0.50)
+                )
+                cfg_local["phase2_linear_window"] = int(
+                    trial.suggest_categorical("phase2_linear_window", [63, 126, 189, 252])
+                )
+                cfg_local["phase2_linear_min_samples"] = int(
+                    trial.suggest_categorical("phase2_linear_min_samples", [42, 63, 84])
+                )
+            else:
+                # Defaults when disabled (won't affect loop since model is off)
+                cfg_local["phase2_linear_ridge_lambda"] = 10.0
+                cfg_local["phase2_linear_blend_max"] = 0.5
+                cfg_local["phase2_linear_window"] = 126
+                cfg_local["phase2_linear_min_samples"] = 63
+
+            # Fixed governance (not sampled)
+            cfg_local["phase2_linear_update_interval"] = 21
+            cfg_local["phase2_linear_max_window"] = 252
 
             # Strict audit: sampled params must be consumed (or explicitly helper-only).
             _audit_phase2_trial_params(mode_local="full", trial=trial, cfg_local=cfg_local)
@@ -7052,6 +12478,13 @@ def run_phase2_stateful_optuna(
                     "phase2_k_spread",
                     "phase2_k_impact",
                     "phase2_z_clip",
+                    "phase2_regime_feature_index",
+                    "phase2_regime_loss_alpha",
+                    "phase2_sigma_floor_base",
+                    "phase2_sigma_floor_stress",
+                    "phase2_sigma_floor_strength",
+                    "phase2_anchor_l2",
+                    "phase2_sigma_cs_strength",
                     # Optional overlays (conditionally active)
                     "phase2_enable_turnover_overlay",
                     "phase2_turnover_cap",

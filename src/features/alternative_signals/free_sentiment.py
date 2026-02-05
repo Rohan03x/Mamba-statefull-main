@@ -97,13 +97,15 @@ def _get_google_trends(symbol: str, date_range: pd.DatetimeIndex) -> pd.Series:
     Returns weekly search interest (0-100) for the ticker/company name.
     100% free API - no credentials required.
     """
+    # Import centralized cache paths
+    try:
+        from src.cache_paths import GOOGLE_TRENDS_CACHE_ROOT
+    except ImportError:
+        GOOGLE_TRENDS_CACHE_ROOT = Path(__file__).resolve().parents[3] / 'cache' / 'shared' / 'google_trends'
 
     def _cache_path() -> Path:
-        # Repo root = .../src/features/alternative_signals/free_sentiment.py -> parents[3]
-        root = Path(__file__).resolve().parents[3]
-        cache_dir = root / 'data_cache' / 'google_trends'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / f"{symbol.lower()}.parquet"
+        GOOGLE_TRENDS_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        return GOOGLE_TRENDS_CACHE_ROOT / f"{symbol.lower()}.parquet"
 
     def _read_cache() -> Optional[pd.Series]:
         try:

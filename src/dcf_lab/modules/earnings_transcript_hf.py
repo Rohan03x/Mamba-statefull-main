@@ -72,9 +72,16 @@ except Exception:  # pragma: no cover - analyzer is optional
 
 LOGGER = logging.getLogger(__name__)
 
-_ROOT = Path(__file__).resolve().parents[3]
-_TRANSCRIPT_CACHE = _ROOT / "data_cache" / "earnings_transcripts"
-_HF_INFERENCE_CACHE = _ROOT / "data_cache" / "hf_transcript_inference"
+# Import centralized cache paths
+try:
+    from src.cache_paths import EARNINGS_TRANSCRIPTS_CACHE_ROOT, HF_TRANSCRIPT_INFERENCE_CACHE_ROOT
+    _TRANSCRIPT_CACHE = EARNINGS_TRANSCRIPTS_CACHE_ROOT
+    _HF_INFERENCE_CACHE = HF_TRANSCRIPT_INFERENCE_CACHE_ROOT
+except ImportError:
+    _ROOT = Path(__file__).resolve().parents[3]
+    _TRANSCRIPT_CACHE = _ROOT / "cache" / "shared" / "earnings_transcripts"
+    _HF_INFERENCE_CACHE = _ROOT / "cache" / "shared" / "hf_transcript_inference"
+
 _FILENAME_DATE = re.compile(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})")
 _QUARTER_PATTERN = re.compile(r"[Qq]([1-4])[^0-9]*(20\d{2})")
 

@@ -96,7 +96,13 @@ try:
 except Exception:  # pragma: no cover
     yf = None  # type: ignore
 
-DATA_CACHE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data_cache')
+# Use centralized cache paths
+try:
+    from src.cache_paths import SHARED_CACHE_ROOT, GDELT_CACHE_ROOT
+    DATA_CACHE = str(SHARED_CACHE_ROOT)
+except ImportError:
+    DATA_CACHE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'cache', 'shared')
+
 NY_TZ = 'America/New_York'
 os.makedirs(DATA_CACHE, exist_ok=True)
 

@@ -240,7 +240,8 @@ def fetch(
     essential_correlations = [
         ('SPY', 20),      # Fast S&P 500 beta
         ('SPY', 60),      # Medium S&P 500 beta
-        ('QQQ', 20),      # Tech/growth exposure
+        ('QQQ', 20),      # Tech/growth exposure (fast)
+        ('QQQ', 60),      # Tech/growth exposure (medium) - REQUIRED for CORR_SPREAD_20_60_QQQ
         ('VXX', 20),      # Volatility/fear (regime-critical)
     ]
     

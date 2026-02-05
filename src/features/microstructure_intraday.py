@@ -257,9 +257,13 @@ class _TempLoggerLevel:
 
 
 def _ensure_cache_dir() -> str:
-    # repo root is three levels up from this file (src/features -> src -> repo)
-    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    root = os.path.join(root_dir, 'data_cache', 'microstructure')
+    # Use centralized cache path
+    try:
+        from src.cache_paths import SHARED_CACHE_ROOT
+        root = str(SHARED_CACHE_ROOT / 'microstructure')
+    except ImportError:
+        root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        root = os.path.join(root_dir, 'cache', 'shared', 'microstructure')
     root = os.path.abspath(root)
     os.makedirs(root, exist_ok=True)
     return root
